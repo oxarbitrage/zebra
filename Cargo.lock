@@ -2124,6 +2124,17 @@ version = "0.1.0"
 [[package]]
 name = "zebra-consensus"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "pin-project",
+ "proptest",
+ "proptest-derive",
+ "rand",
+ "rand_core",
+ "tokio",
+ "tower",
+ "zebra-chain",
+]
 
 [[package]]
 name = "zebra-network"
