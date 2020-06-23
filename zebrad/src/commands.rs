@@ -20,9 +20,29 @@ use std::path::PathBuf;
 /// Zebrad Configuration Filename
 pub const CONFIG_FILE: &str = "zebrad.toml";
 
+#[derive(Command, Debug, Options, Runnable)]
+pub struct ZebradCmd {
+    /// Path to the configuration file
+    #[options(short = "c", help = "path to configuration file")]
+    pub config: Option<PathBuf>,
+
+    /// Obtain help about the current command
+    #[options(short = "h", help = "print help message")]
+    pub help: bool,
+
+    /// Increase verbosity setting
+    #[options(short = "v", help = "be verbose")]
+    pub verbose: bool,
+
+    // The `command` option will delegate option parsing to the command type,
+    // starting at the first free argument.
+    #[options(command)]
+    command: Option<ZebradSubCmd>,
+}
+
 /// Zebrad Subcommands
 #[derive(Command, Debug, Options, Runnable)]
-pub enum ZebradCmd {
+pub enum ZebradSubCmd {
     /// The `generate` subcommand
     #[options(help = "generate a skeleton configuration")]
     Generate(GenerateCmd),
