@@ -10,7 +10,7 @@
 //! Inserting a block into the service will create a mapping in each tree for that block.
 #![doc(html_logo_url = "https://www.zfnd.org/images/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_state")]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 #![allow(clippy::try_err)]
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
