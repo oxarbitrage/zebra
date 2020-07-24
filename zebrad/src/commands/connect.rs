@@ -1,22 +1,18 @@
 //! `connect` subcommand - test stub for talking to zcashd
 
 use crate::{components::tokio::TokioComponent, prelude::*};
+
 use abscissa_core::{Command, Options, Runnable};
-use color_eyre::Report;
-use eyre::{eyre, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures::{
     prelude::*,
     stream::{FuturesUnordered, StreamExt},
 };
 use std::collections::BTreeSet;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
-use zebra_chain::{block::BlockHeaderHash, types::BlockHeight};
 
-// genesis
-static GENESIS: BlockHeaderHash = BlockHeaderHash([
-    8, 206, 61, 151, 49, 176, 0, 192, 131, 56, 69, 92, 138, 74, 107, 208, 93, 161, 110, 38, 177,
-    29, 170, 27, 145, 113, 132, 236, 232, 15, 4, 0,
-]);
+use zebra_chain::{block::BlockHeaderHash, types::BlockHeight};
+use zebra_consensus::parameters;
 
 /// `connect` subcommand
 #[derive(Command, Debug, Options)]
@@ -34,6 +30,9 @@ impl Runnable for ConnectCmd {
     fn run(&self) {
         info!(connect.addr = ?self.addr);
 
+        let network = app_config().network.network;
+        let genesis_hash = parameters::genesis_hash(network);
+
         let rt = app_writer()
             .state_mut()
             .components
@@ -44,7 +43,7 @@ impl Runnable for ConnectCmd {
 
         let result = rt
             .expect("runtime should not already be taken")
-            .block_on(self.connect());
+            .block_on(self.connect(genesis_hash));
 
         match result {
             Ok(()) => {}
@@ -57,7 +56,7 @@ impl Runnable for ConnectCmd {
 }
 
 impl ConnectCmd {
-    async fn connect(&self) -> Result<(), Report> {
+    async fn connect(&self, genesis_hash: BlockHeaderHash) -> Result<(), Report> {
         info!(?self, "begin tower-based peer handling test stub");
 
         // The service that our node uses to respond to requests by peers
@@ -71,7 +70,7 @@ impl ConnectCmd {
 
         let mut config = app_config().network.clone();
         // Use a different listen addr so that we don't conflict with another local node.
-        config.listen_addr = "127.0.0.1:38233".parse()?;
+        config.listen_addr = "0.0.0.0:38233".parse()?;
         // Connect only to the specified peer.
         config.initial_mainnet_peers.insert(self.addr.to_string());
 
@@ -86,7 +85,7 @@ impl ConnectCmd {
             retry_peer_set,
             peer_set,
             state,
-            tip: GENESIS,
+            tip: genesis_hash,
             block_requests: FuturesUnordered::new(),
             requested_block_heights: 0,
             downloaded_block_heights,

@@ -2,7 +2,6 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
-    sync::Once,
     task::{Context, Poll},
     time::Duration,
 };
@@ -85,31 +84,9 @@ impl Drop for Ed25519Verifier {
 
 // =============== testing code ========
 
-static LOGGER_INIT: Once = Once::new();
-
-fn install_tracing() {
-    use tracing_error::ErrorLayer;
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    LOGGER_INIT.call_once(|| {
-        let fmt_layer = fmt::layer().with_target(false);
-        let filter_layer = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new("info"))
-            .unwrap();
-
-        tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(fmt_layer)
-            .with(ErrorLayer::default())
-            .init();
-    })
-}
-
-async fn sign_and_verify<V>(mut verifier: V, n: usize)
+async fn sign_and_verify<V>(mut verifier: V, n: usize) -> Result<(), V::Error>
 where
     V: Service<Ed25519Item, Response = ()>,
-    <V as Service<Ed25519Item>>::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     let mut results = FuturesUnordered::new();
     for i in 0..n {
@@ -119,21 +96,21 @@ where
         let msg = b"BatchVerifyTest";
         let sig = sk.sign(&msg[..]);
 
-        verifier.ready_and().await.map_err(|e| e.into()).unwrap();
+        verifier.ready_and().await?;
         results.push(span.in_scope(|| verifier.call((vk_bytes, sig, msg).into())))
     }
 
     while let Some(result) = results.next().await {
-        let result = result.map_err(|e| e.into());
-        tracing::trace!(?result);
-        assert!(result.is_ok());
+        result?;
     }
+
+    Ok(())
 }
 
 #[tokio::test]
 async fn batch_flushes_on_max_items() {
     use tokio::time::timeout;
-    install_tracing();
+    zebra_test::init();
 
     // Use a very long max_latency and a short timeout to check that
     // flushing is happening based on hitting max_items.
@@ -142,13 +119,13 @@ async fn batch_flushes_on_max_items() {
         timeout(Duration::from_secs(1), sign_and_verify(verifier, 100))
             .await
             .is_ok()
-    )
+    );
 }
 
 #[tokio::test]
 async fn batch_flushes_on_max_latency() {
     use tokio::time::timeout;
-    install_tracing();
+    zebra_test::init();
 
     // Use a very high max_items and a short timeout to check that
     // flushing is happening based on hitting max_latency.
@@ -157,5 +134,5 @@ async fn batch_flushes_on_max_latency() {
         timeout(Duration::from_secs(1), sign_and_verify(verifier, 10))
             .await
             .is_ok()
-    )
+    );
 }

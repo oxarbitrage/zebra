@@ -1,6 +1,6 @@
 [workspace]
 members = [
-        "tower-batch",
+        "zebrad",
         "zebra-chain",
         "zebra-network",
         "zebra-state",
@@ -8,8 +8,10 @@ members = [
         "zebra-consensus",
         "zebra-rpc",
         "zebra-client",
-        "zebra-test-vectors",
-        "zebrad",
+        "zebra-test",
+        "zebra-utils",
+        "tower-batch",
+        "tower-fallback",
 ]
 
 [profile.dev]
@@ -19,4 +21,4 @@ panic = "abort"
 panic = "abort"
 
 [patch.crates-io]
-abscissa_core = { git = "https://github.com/yaahc/abscissa.git", branch = "develop" }
+abscissa_core = { git = "https://github.com/yaahc/abscissa.git", rev = "41d342a9344e38442b2211b07f28a89505892a21" }

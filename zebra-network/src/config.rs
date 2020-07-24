@@ -9,7 +9,7 @@ use zebra_chain::Network;
 
 /// Configuration for networking code.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// The address on which this node should listen for connections.
     pub listen_addr: SocketAddr,
@@ -31,6 +31,9 @@ pub struct Config {
     /// The outgoing request buffer size for the peer set.
     pub peerset_request_buffer_size: usize,
 
+    /// The initial target size for the peer set.
+    pub peerset_initial_target_size: usize,
+
     // Note: due to the way this is rendered by the toml
     // serializer, the Duration fields should come last.
     /// The default RTT estimate for peer responses, used in load-balancing.
@@ -44,9 +47,6 @@ pub struct Config {
 
     /// How frequently we attempt to connect to a new peer.
     pub new_peer_interval: Duration,
-
-    /// The initial target size for the peer set.
-    pub peerset_initial_target_size: usize,
 }
 
 impl Config {
@@ -89,7 +89,7 @@ impl Default for Config {
         .collect();
 
         Config {
-            listen_addr: "127.0.0.1:8233"
+            listen_addr: "0.0.0.0:8233"
                 .parse()
                 .expect("Hardcoded address should be parseable"),
             user_agent: crate::constants::USER_AGENT.to_owned(),

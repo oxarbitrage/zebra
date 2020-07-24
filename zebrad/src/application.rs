@@ -79,14 +79,20 @@ impl Application for ZebradApp {
         &mut self.state
     }
 
+    /// Returns the framework components used by this application.
     fn framework_components(
         &mut self,
         command: &Self::Cmd,
     ) -> Result<Vec<Box<dyn Component<Self>>>, FrameworkError> {
-        let terminal = Terminal::new(self.term_colors(command));
-        let tracing = self.tracing_component(command);
+        color_eyre::install().unwrap();
 
-        Ok(vec![Box::new(terminal), Box::new(tracing)])
+        let terminal = Terminal::new(self.term_colors(command));
+        if ZebradApp::command_is_server(&command) {
+            let tracing = self.tracing_component(command);
+            Ok(vec![Box::new(terminal), Box::new(tracing)])
+        } else {
+            Ok(vec![Box::new(terminal)])
+        }
     }
 
     /// Register all components used by this application.
@@ -100,9 +106,12 @@ impl Application for ZebradApp {
         };
 
         let mut components = self.framework_components(command)?;
-        components.push(Box::new(TokioComponent::new()?));
-        components.push(Box::new(TracingEndpoint::new()?));
-        components.push(Box::new(MetricsEndpoint::new()?));
+        // Launch network endpoints for long-running commands
+        if ZebradApp::command_is_server(&command) {
+            components.push(Box::new(TokioComponent::new()?));
+            components.push(Box::new(TracingEndpoint::new()?));
+            components.push(Box::new(MetricsEndpoint::new()?));
+        }
 
         self.state.components.register(components)
     }
@@ -121,12 +130,14 @@ impl Application for ZebradApp {
         self.state.components.after_config(&config)?;
         self.config = Some(config);
 
-        let level = self.level(command);
-        self.state
-            .components
-            .get_downcast_mut::<Tracing>()
-            .expect("Tracing component should be available")
-            .reload_filter(level);
+        if ZebradApp::command_is_server(&command) {
+            let level = self.level(command);
+            self.state
+                .components
+                .get_downcast_mut::<Tracing>()
+                .expect("Tracing component should be available")
+                .reload_filter(level);
+        }
 
         Ok(())
     }
@@ -134,10 +145,29 @@ impl Application for ZebradApp {
 
 impl ZebradApp {
     fn level(&self, command: &EntryPoint<ZebradCmd>) -> String {
-        if let Ok(level) = std::env::var("ZEBRAD_LOG") {
-            level
-        } else if command.verbose {
+        // `None` outputs zebrad usage information to stdout
+        let command_uses_stdout = match &command.command {
+            None => true,
+            Some(c) => c.uses_stdout(),
+        };
+
+        // Allow users to:
+        //  - override all other configs and defaults using the command line
+        //  - see command outputs without spurious log messages, by default
+        //  - override the config file using an environmental variable
+        if command.verbose {
             "debug".to_string()
+        } else if command_uses_stdout {
+            // Tracing sends output to stdout, so we disable info-level logs for
+            // some commands.
+            //
+            // TODO: send tracing output to stderr. This change requires an abscissa
+            //       update, because `abscissa_core::component::Tracing` uses
+            //       `tracing_subscriber::fmt::Formatter`, which has `Stdout` as a
+            //       type parameter. We need `MakeWriter` or a similar type.
+            "warn".to_string()
+        } else if let Ok(level) = std::env::var("ZEBRAD_LOG") {
+            level
         } else if let Some(ZebradConfig {
             tracing:
                 crate::config::TracingSection {
@@ -167,5 +197,17 @@ impl ZebradApp {
             .init();
 
         filter_handle.into()
+    }
+
+    /// Returns true if command is a server command.
+    ///
+    /// Server commands use long-running components such as tracing, metrics,
+    /// and the tokio runtime.
+    fn command_is_server(command: &EntryPoint<ZebradCmd>) -> bool {
+        // `None` outputs zebrad usage information and exits
+        match &command.command {
+            None => false,
+            Some(c) => c.is_server(),
+        }
     }
 }

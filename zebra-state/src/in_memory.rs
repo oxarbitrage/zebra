@@ -12,6 +12,7 @@ use std::{
     task::{Context, Poll},
 };
 use tower::{buffer::Buffer, Service};
+use zebra_chain::block::BlockHeaderHash;
 
 mod block_index;
 
@@ -20,7 +21,11 @@ struct InMemoryState {
     index: block_index::BlockIndex,
 }
 
-type Error = Box<dyn error::Error + Send + Sync + 'static>;
+impl InMemoryState {
+    fn contains(&mut self, _hash: BlockHeaderHash) -> Result<Option<u32>, Error> {
+        todo!()
+    }
+}
 
 impl Service<Request> for InMemoryState {
     type Response = Response;
@@ -33,6 +38,7 @@ impl Service<Request> for InMemoryState {
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
+        tracing::debug!(?req);
         match req {
             Request::AddBlock { block } => {
                 let result = self
@@ -55,10 +61,50 @@ impl Service<Request> for InMemoryState {
                 let result = self
                     .index
                     .get_tip()
+                    .map(|block| block.hash())
                     .map(|hash| Response::Tip { hash })
                     .ok_or_else(|| "zebra-state contains no blocks".into());
 
                 async move { result }.boxed()
+            }
+            Request::GetDepth { hash } => {
+                let res = self.contains(hash);
+
+                async move {
+                    let depth = res?;
+
+                    Ok(Response::Depth(depth))
+                }
+                .boxed()
+            }
+            Request::GetBlockLocator { genesis } => {
+                let tip = self.index.get_tip();
+                let tip = match tip {
+                    Some(tip) => tip,
+                    None => {
+                        return async move {
+                            Ok(Response::BlockLocator {
+                                block_locator: vec![genesis],
+                            })
+                        }
+                        .boxed()
+                    }
+                };
+
+                let tip_height = tip
+                    .coinbase_height()
+                    .expect("tip block will have a coinbase height");
+
+                let block_locator = crate::block_locator_heights(tip_height)
+                    .map(|height| {
+                        self.index
+                            .get(height)
+                            .expect("there should be no holes in the chain")
+                            .hash()
+                    })
+                    .collect();
+
+                async move { Ok(Response::BlockLocator { block_locator }) }.boxed()
             }
         }
     }
@@ -76,3 +122,5 @@ pub fn init() -> impl Service<
        + 'static {
     Buffer::new(InMemoryState::default(), 1)
 }
+
+type Error = Box<dyn error::Error + Send + Sync + 'static>;
