@@ -35,17 +35,17 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
 
     let block0 =
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
-    let hash0: BlockHeaderHash = block0.as_ref().into();
+    let hash0 = block0.hash();
 
     // Make a checkpoint list containing only the genesis block
-    let genesis_checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> =
+    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
         [(block0.coinbase_height().unwrap(), hash0)]
             .iter()
             .cloned()
             .collect();
 
     let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list).map_err(|e| eyre!(e))?;
+        CheckpointVerifier::from_list(genesis_checkpoint_list, None).map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -57,7 +57,7 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Make sure the verifier service is ready
@@ -90,7 +90,7 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     Ok(())
@@ -114,18 +114,18 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         &zebra_test::vectors::BLOCK_MAINNET_1_BYTES[..],
     ] {
         let block = Arc::<Block>::zcash_deserialize(*b)?;
-        let hash: BlockHeaderHash = block.as_ref().into();
+        let hash = block.hash();
         checkpoint_data.push((block.clone(), block.coinbase_height().unwrap(), hash));
     }
 
     // Make a checkpoint list containing all the blocks
-    let checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> = checkpoint_data
+    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
         .iter()
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
     let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list).map_err(|e| eyre!(e))?;
+        CheckpointVerifier::from_list(checkpoint_list, None).map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -137,7 +137,7 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(1)
+        block::Height(1)
     );
 
     // Now verify each block
@@ -184,7 +184,7 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         }
         assert_eq!(
             checkpoint_verifier.checkpoint_list.max_height(),
-            BlockHeight(1)
+            block::Height(1)
         );
     }
 
@@ -198,7 +198,7 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(1)
+        block::Height(1)
     );
 
     Ok(())
@@ -206,11 +206,16 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
 
 #[tokio::test]
 async fn continuous_blockchain_test() -> Result<(), Report> {
-    continuous_blockchain().await
+    continuous_blockchain(None).await?;
+    for height in 0..=10 {
+        continuous_blockchain(Some(block::Height(height))).await?;
+    }
+    Ok(())
 }
 
+/// Test a continuous blockchain, restarting verification at `restart_height`.
 #[spandoc::spandoc]
-async fn continuous_blockchain() -> Result<(), Report> {
+async fn continuous_blockchain(restart_height: Option<block::Height>) -> Result<(), Report> {
     zebra_test::init();
 
     // A continuous blockchain
@@ -229,7 +234,7 @@ async fn continuous_blockchain() -> Result<(), Report> {
         &zebra_test::vectors::BLOCK_MAINNET_10_BYTES[..],
     ] {
         let block = Arc::<Block>::zcash_deserialize(*b)?;
-        let hash: BlockHeaderHash = block.as_ref().into();
+        let hash = block.hash();
         blockchain.push((block.clone(), block.coinbase_height().unwrap(), hash));
     }
 
@@ -238,63 +243,32 @@ async fn continuous_blockchain() -> Result<(), Report> {
     for b in &[
         &zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
         &zebra_test::vectors::BLOCK_MAINNET_5_BYTES[..],
-        &zebra_test::vectors::BLOCK_MAINNET_10_BYTES[..],
+        &zebra_test::vectors::BLOCK_MAINNET_9_BYTES[..],
     ] {
         let block = Arc::<Block>::zcash_deserialize(*b)?;
-        let hash: BlockHeaderHash = block.as_ref().into();
+        let hash = block.hash();
         checkpoints.push((block.clone(), block.coinbase_height().unwrap(), hash));
     }
 
-    // The checkpoint list will contain only block 0, 5 and 10
-    let checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> = checkpoints
+    // The checkpoint list will contain only block 0, 5 and 9
+    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoints
         .iter()
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list).map_err(|e| eyre!(e))?;
+    /// SPANDOC: Verify blocks, restarting at {?restart_height}
+    {
+        let initial_tip = restart_height
+            .map(|block::Height(height)| &blockchain[height as usize].0)
+            .cloned();
+        let mut checkpoint_verifier =
+            CheckpointVerifier::from_list(checkpoint_list, initial_tip).map_err(|e| eyre!(e))?;
 
-    // Setup checks
-    assert_eq!(
-        checkpoint_verifier.previous_checkpoint_height(),
-        BeforeGenesis
-    );
-    assert_eq!(
-        checkpoint_verifier.target_checkpoint_height(),
-        WaitingForBlocks
-    );
-    assert_eq!(
-        checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(10)
-    );
-
-    let mut handles = FuturesUnordered::new();
-
-    // Now verify each block
-    for (block, height, _hash) in blockchain {
-        /// SPANDOC: Make sure the verifier service is ready
-        let ready_verifier_service = checkpoint_verifier
-            .ready_and()
-            .map_err(|e| eyre!(e))
-            .await?;
-
-        /// SPANDOC: Set up the future for block {?height}
-        let verify_future = timeout(
-            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block.clone()),
-        );
-
-        /// SPANDOC: spawn verification future in the background
-        let handle = tokio::spawn(verify_future.in_current_span());
-        handles.push(handle);
-
-        // Execution checks
-        if height < checkpoint_verifier.checkpoint_list.max_height() {
-            assert_eq!(
-                checkpoint_verifier.target_checkpoint_height(),
-                WaitingForBlocks
-            );
-        } else {
+        // Setup checks
+        if restart_height
+            .map(|h| h >= checkpoint_verifier.checkpoint_list.max_height())
+            .unwrap_or(false)
+        {
             assert_eq!(
                 checkpoint_verifier.previous_checkpoint_height(),
                 FinalCheckpoint
@@ -303,26 +277,86 @@ async fn continuous_blockchain() -> Result<(), Report> {
                 checkpoint_verifier.target_checkpoint_height(),
                 FinishedVerifying
             );
+        } else {
+            assert_eq!(
+                checkpoint_verifier.previous_checkpoint_height(),
+                restart_height.map(InitialTip).unwrap_or(BeforeGenesis)
+            );
+            assert_eq!(
+                checkpoint_verifier.target_checkpoint_height(),
+                WaitingForBlocks
+            );
         }
-    }
+        assert_eq!(
+            checkpoint_verifier.checkpoint_list.max_height(),
+            block::Height(9)
+        );
 
-    while let Some(result) = handles.next().await {
-        result??.map_err(|e| eyre!(e))?;
-    }
+        let mut handles = FuturesUnordered::new();
 
-    // Final checks
-    assert_eq!(
-        checkpoint_verifier.previous_checkpoint_height(),
-        FinalCheckpoint
-    );
-    assert_eq!(
-        checkpoint_verifier.target_checkpoint_height(),
-        FinishedVerifying
-    );
-    assert_eq!(
-        checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(10)
-    );
+        // Now verify each block
+        for (block, height, _hash) in blockchain {
+            if let Some(restart_height) = restart_height {
+                if height <= restart_height {
+                    continue;
+                }
+            }
+            if height > checkpoint_verifier.checkpoint_list.max_height() {
+                break;
+            }
+
+            /// SPANDOC: Make sure the verifier service is ready for block {?height}
+            let ready_verifier_service = checkpoint_verifier
+                .ready_and()
+                .map_err(|e| eyre!(e))
+                .await?;
+
+            /// SPANDOC: Set up the future for block {?height}
+            let verify_future = timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                ready_verifier_service.call(block.clone()),
+            );
+
+            /// SPANDOC: spawn verification future in the background for block {?height}
+            let handle = tokio::spawn(verify_future.in_current_span());
+            handles.push(handle);
+
+            // Execution checks
+            if height < checkpoint_verifier.checkpoint_list.max_height() {
+                assert_eq!(
+                    checkpoint_verifier.target_checkpoint_height(),
+                    WaitingForBlocks
+                );
+            } else {
+                assert_eq!(
+                    checkpoint_verifier.previous_checkpoint_height(),
+                    FinalCheckpoint
+                );
+                assert_eq!(
+                    checkpoint_verifier.target_checkpoint_height(),
+                    FinishedVerifying
+                );
+            }
+        }
+
+        while let Some(result) = handles.next().await {
+            result??.map_err(|e| eyre!(e))?;
+        }
+
+        // Final checks
+        assert_eq!(
+            checkpoint_verifier.previous_checkpoint_height(),
+            FinalCheckpoint
+        );
+        assert_eq!(
+            checkpoint_verifier.target_checkpoint_height(),
+            FinishedVerifying
+        );
+        assert_eq!(
+            checkpoint_verifier.checkpoint_list.max_height(),
+            block::Height(9)
+        );
+    }
 
     Ok(())
 }
@@ -342,14 +376,14 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_415000_BYTES[..])?;
 
     // Make a checkpoint list containing only the genesis block
-    let genesis_checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> =
+    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
         [(block0.coinbase_height().unwrap(), block0.as_ref().into())]
             .iter()
             .cloned()
             .collect();
 
     let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list).map_err(|e| eyre!(e))?;
+        CheckpointVerifier::from_list(genesis_checkpoint_list, None).map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -361,7 +395,7 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Make sure the verifier service is ready
@@ -392,7 +426,7 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     Ok(())
@@ -409,7 +443,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
 
     let good_block0 =
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
-    let good_block0_hash: BlockHeaderHash = good_block0.as_ref().into();
+    let good_block0_hash = good_block0.hash();
     // Change the header hash
     let mut bad_block0 = good_block0.clone();
     let mut bad_block0 = Arc::make_mut(&mut bad_block0);
@@ -417,14 +451,14 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     let bad_block0: Arc<Block> = bad_block0.clone().into();
 
     // Make a checkpoint list containing the genesis block checkpoint
-    let genesis_checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> =
+    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
         [(good_block0.coinbase_height().unwrap(), good_block0_hash)]
             .iter()
             .cloned()
             .collect();
 
     let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list).map_err(|e| eyre!(e))?;
+        CheckpointVerifier::from_list(genesis_checkpoint_list, None).map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -436,7 +470,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Make sure the verifier service is ready (1/3)
@@ -463,7 +497,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Make sure the verifier service is ready (2/3)
@@ -490,7 +524,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Make sure the verifier service is ready (3/3)
@@ -523,7 +557,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     // Now, await the bad futures, which should have completed
@@ -546,7 +580,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     /// SPANDOC: Wait for the response for block 0, and expect failure again (2/3)
@@ -567,7 +601,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(0)
+        block::Height(0)
     );
 
     Ok(())
@@ -593,18 +627,18 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         &zebra_test::vectors::BLOCK_MAINNET_434873_BYTES[..],
     ] {
         let block = Arc::<Block>::zcash_deserialize(*b)?;
-        let hash: BlockHeaderHash = block.as_ref().into();
+        let hash = block.hash();
         checkpoint_data.push((block.clone(), block.coinbase_height().unwrap(), hash));
     }
 
     // Make a checkpoint list containing all the blocks
-    let checkpoint_list: BTreeMap<BlockHeight, BlockHeaderHash> = checkpoint_data
+    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
         .iter()
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
     let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list).map_err(|e| eyre!(e))?;
+        CheckpointVerifier::from_list(checkpoint_list, None).map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -616,7 +650,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     );
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
-        BlockHeight(434873)
+        block::Height(434873)
     );
 
     let mut futures = Vec::new();
@@ -639,7 +673,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         // Only continuous checkpoints verify
         assert_eq!(
             checkpoint_verifier.previous_checkpoint_height(),
-            PreviousCheckpoint(BlockHeight(min(height.0, 1)))
+            PreviousCheckpoint(block::Height(min(height.0, 1)))
         );
         assert_eq!(
             checkpoint_verifier.target_checkpoint_height(),
@@ -647,7 +681,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         );
         assert_eq!(
             checkpoint_verifier.checkpoint_list.max_height(),
-            BlockHeight(434873)
+            block::Height(434873)
         );
     }
 
@@ -661,7 +695,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
             .await
             .expect("timeout should not happen");
 
-        if height <= BlockHeight(1) {
+        if height <= block::Height(1) {
             let verify_hash =
                 verify_response.expect("Continuous checkpoints should have succeeded before drop");
             assert_eq!(verify_hash, hash);
@@ -685,10 +719,10 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     let block0 =
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
-    let hash0: BlockHeaderHash = block0.as_ref().into();
+    let hash0 = block0.hash();
 
     // Use the hard-coded checkpoint list
-    let mut checkpoint_verifier = CheckpointVerifier::new(Network::Mainnet);
+    let mut checkpoint_verifier = CheckpointVerifier::new(Network::Mainnet, None);
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -698,8 +732,7 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
         checkpoint_verifier.target_checkpoint_height(),
         WaitingForBlocks
     );
-    // The lists will get bigger over time, so we just pick a recent height
-    assert!(checkpoint_verifier.checkpoint_list.max_height() > BlockHeight(900_000));
+    assert!(checkpoint_verifier.checkpoint_list.max_height() > block::Height(0));
 
     /// SPANDOC: Make sure the verifier service is ready
     let ready_verifier_service = checkpoint_verifier
@@ -723,14 +756,14 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
-        PreviousCheckpoint(BlockHeight(0))
+        PreviousCheckpoint(block::Height(0))
     );
     assert_eq!(
         checkpoint_verifier.target_checkpoint_height(),
         WaitingForBlocks
     );
     // The lists will get bigger over time, so we just pick a recent height
-    assert!(checkpoint_verifier.checkpoint_list.max_height() > BlockHeight(900_000));
+    assert!(checkpoint_verifier.checkpoint_list.max_height() > block::Height(900_000));
 
     Ok(())
 }

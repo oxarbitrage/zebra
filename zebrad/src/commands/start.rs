@@ -19,6 +19,7 @@
 //!    * This task runs in the background and continuously queries the network for
 //!    new blocks to be verified and added to the local state
 
+use crate::components::tokio::RuntimeRun;
 use crate::config::ZebradConfig;
 use crate::{components::tokio::TokioComponent, prelude::*};
 
@@ -40,6 +41,15 @@ impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
         info!(?self, "starting to connect to the network");
 
+        let config = app_config();
+        let state = zebra_state::on_disk::init(config.state.clone(), config.network.network);
+        let verifier = zebra_consensus::chain::init(
+            config.consensus.clone(),
+            config.network.network,
+            state.clone(),
+        )
+        .await;
+
         // The service that our node uses to respond to requests by peers
         let node = Buffer::new(
             service_fn(|req| async move {
@@ -48,10 +58,7 @@ impl StartCmd {
             }),
             1,
         );
-        let config = app_config();
-        let state = zebra_state::on_disk::init(config.state.clone());
         let (peer_set, _address_book) = zebra_network::init(config.network.clone(), node).await;
-        let verifier = zebra_consensus::chain::init(config.network.network, state.clone());
 
         let mut syncer = sync::Syncer::new(config.network.network, peer_set, state, verifier);
 
@@ -62,6 +69,7 @@ impl StartCmd {
 impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
+        info!("Starting zebrad");
         let rt = app_writer()
             .state_mut()
             .components
@@ -70,17 +78,8 @@ impl Runnable for StartCmd {
             .rt
             .take();
 
-        let result = rt
-            .expect("runtime should not already be taken")
-            .block_on(self.start());
-
-        match result {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
-                std::process::exit(1);
-            }
-        }
+        rt.expect("runtime should not already be taken")
+            .run(self.start());
     }
 }
 

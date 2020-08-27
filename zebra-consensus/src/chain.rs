@@ -14,7 +14,8 @@
 #[cfg(test)]
 mod tests;
 
-use crate::checkpoint::CheckpointVerifier;
+use crate::checkpoint::{CheckpointList, CheckpointVerifier};
+use crate::Config;
 
 use futures_util::FutureExt;
 use std::{
@@ -27,32 +28,56 @@ use std::{
 use tower::{buffer::Buffer, Service, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::block::{Block, BlockHeaderHash};
-use zebra_chain::types::BlockHeight;
-use zebra_chain::Network;
+use zebra_chain::block::{self, Block};
+use zebra_chain::parameters::{Network, NetworkUpgrade::Sapling};
 
 /// The maximum expected gap between blocks.
 ///
 /// Used to identify unexpected high blocks.
 const MAX_EXPECTED_BLOCK_GAP: u32 = 100_000;
 
-struct ChainVerifier<BV, S> {
+/// A wrapper type that holds the `ChainVerifier`'s `CheckpointVerifier`, and
+/// its associated state.
+#[derive(Clone)]
+struct ChainCheckpointVerifier {
+    /// The underlying `CheckpointVerifier`, wrapped in a buffer, so we can
+    /// clone and share it with futures.
+    verifier: Buffer<CheckpointVerifier, Arc<Block>>,
+
+    /// The maximum checkpoint height for `checkpoint_verifier`.
+    max_height: block::Height,
+}
+
+/// A service that verifies the chain, using its associated `CheckpointVerifier`
+/// and `BlockVerifier`.
+struct ChainVerifier<BV, S>
+where
+    BV: Service<Arc<Block>, Response = block::Hash, Error = Error> + Send + Clone + 'static,
+    BV::Future: Send + 'static,
+    S: Service<zebra_state::Request, Response = zebra_state::Response, Error = Error>
+        + Send
+        + Clone
+        + 'static,
+    S::Future: Send + 'static,
+{
     /// The underlying `BlockVerifier`, possibly wrapped in other services.
     block_verifier: BV,
 
-    /// The underlying `CheckpointVerifier`, wrapped in a buffer, so we can
-    /// clone and share it with futures.
-    checkpoint_verifier: Buffer<CheckpointVerifier, Arc<Block>>,
-    /// The maximum checkpoint height for `checkpoint_verifier`.
-    max_checkpoint_height: BlockHeight,
+    /// The `ChainVerifier`'s underlying `CheckpointVerifier`, and its
+    /// associated state.
+    ///
+    /// None if all the checkpoints have been verified.
+    checkpoint: Option<ChainCheckpointVerifier>,
 
     /// The underlying `ZebraState`, possibly wrapped in other services.
     state_service: S,
 
-    /// The last block height. Used for debugging.
+    /// The most recent block height that was submitted to the verifier.
     ///
-    /// Not updated for unexpected high blocks.
-    last_block_height: BlockHeight,
+    /// Used for debugging.
+    ///
+    /// Updated before verification: the block at this height might not be valid.
+    last_block_height: Option<block::Height>,
 }
 
 /// The error type for the ChainVerifier Service.
@@ -64,7 +89,7 @@ type Error = Box<dyn error::Error + Send + Sync + 'static>;
 /// After verification, blocks are added to the underlying state service.
 impl<BV, S> Service<Arc<Block>> for ChainVerifier<BV, S>
 where
-    BV: Service<Arc<Block>, Response = BlockHeaderHash, Error = Error> + Send + Clone + 'static,
+    BV: Service<Arc<Block>, Response = block::Hash, Error = Error> + Send + Clone + 'static,
     BV::Future: Send + 'static,
     S: Service<zebra_state::Request, Response = zebra_state::Response, Error = Error>
         + Send
@@ -72,7 +97,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    type Response = BlockHeaderHash;
+    type Response = block::Hash;
     type Error = Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -86,64 +111,64 @@ where
 
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
         // TODO(jlusby): Error = Report, handle errors from state_service.
-        let mut block_verifier = self.block_verifier.clone();
-        let mut checkpoint_verifier = self.checkpoint_verifier.clone();
-        let mut state_service = self.state_service.clone();
-        let max_checkpoint_height = self.max_checkpoint_height;
-
         let span = tracing::debug_span!(
             "block_verify",
             height = ?block.coinbase_height(),
-            hash = ?BlockHeaderHash::from(block.as_ref())
+            hash = ?block.hash()
         );
-        let height = block.coinbase_height();
+        let block_height = block.coinbase_height();
 
-        // Log a warning on unexpected high blocks
-        let is_unexpected_high_block = match height {
-            Some(BlockHeight(height))
-                if (height > self.last_block_height.0 + MAX_EXPECTED_BLOCK_GAP) =>
+        let mut block_verifier = self.block_verifier.clone();
+        let mut state_service = self.state_service.clone();
+        let checkpoint_verifier = self.checkpoint.clone().map(|c| c.verifier);
+        let max_checkpoint_height = self.checkpoint.clone().map(|c| c.max_height);
+
+        // Log an info-level message on unexpected high blocks
+        let is_unexpected_high_block = match (block_height, self.last_block_height) {
+            (Some(block::Height(block_height)), Some(block::Height(last_block_height)))
+                if (block_height > last_block_height + MAX_EXPECTED_BLOCK_GAP) =>
             {
+                self.last_block_height = Some(block::Height(block_height));
                 true
             }
-            Some(height) => {
-                // Update the last height if the block height was expected
-                self.last_block_height = height;
+            (Some(block_height), _) => {
+                self.last_block_height = Some(block_height);
                 false
             }
+            // The other cases are covered by the verifiers
             _ => false,
         };
 
         async move {
-            // TODO(teor): for post-sapling checkpoint blocks, allow callers
+            // TODO(teor): in the post-sapling checkpoint range, allow callers
             //             to use BlockVerifier, CheckpointVerifier, or both.
 
             // Call a verifier based on the block height and checkpoints.
-            match height {
-                Some(height) if (height <= max_checkpoint_height) => {
-                    checkpoint_verifier
-                        .ready_and()
-                        .await?
-                        .call(block.clone())
-                        .await?
+            if is_higher_than_max_checkpoint(block_height, max_checkpoint_height) {
+                // Log a message on early high blocks.
+                // The sync service rejects most of these blocks, but we
+                // still want to know if a large number get through.
+                //
+                // This message can also happen if we keep getting unexpected
+                // low blocks. (We can't distinguish between these cases, until
+                // we've verified the blocks.)
+                if is_unexpected_high_block {
+                    tracing::debug!(?block_height, "unexpected high block, or recent unexpected low blocks");
                 }
-                _ => {
-                    // Temporary trace, for identifying early high blocks.
-                    // We think the downloader or sync service should reject these blocks
-                    if is_unexpected_high_block {
-                        tracing::warn!(?height, "unexpected high block");
-                    }
 
-                    block_verifier
-                        .ready_and()
-                        .await?
-                        .call(block.clone())
-                        .await?
-                }
-            };
-
-            // TODO(teor):
-            //   - handle chain reorgs
-            //   - adjust state_service "unique block height" conditions
+                block_verifier
+                    .ready_and()
+                    .await?
+                    .call(block.clone())
+                    .await?;
+            } else {
+                checkpoint_verifier
+                    .expect("Missing checkpoint verifier: verifier must be Some if max checkpoint height is Some")
+                    .ready_and()
+                    .await?
+                    .call(block.clone())
+                    .await?;
+            }
 
             let add_block = state_service
                 .ready_and()
@@ -160,9 +185,26 @@ where
     }
 }
 
-/// Return a chain verification service, using `network` and the provided state
-/// service. The network is used to create a block verifier and checkpoint
-/// verifier.
+/// Returns true if block_height is higher than the maximum checkpoint
+/// height. Also returns true if there is no maximum checkpoint height.
+///
+/// Returns false if the block does not have a height.
+fn is_higher_than_max_checkpoint(
+    block_height: Option<block::Height>,
+    max_checkpoint_height: Option<block::Height>,
+) -> bool {
+    match (block_height, max_checkpoint_height) {
+        (Some(block_height), Some(max_checkpoint_height)) => block_height > max_checkpoint_height,
+        (_, None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Return a chain verification service, using `config`, `network` and
+/// `state_service`.
+///
+/// Gets the initial tip from the state service, and uses it to create a block
+/// verifier and checkpoint verifier (if needed).
 ///
 /// This function should only be called once for a particular state service. If
 /// you need shared block or checkpoint verfiers, create them yourself, and pass
@@ -171,14 +213,15 @@ where
 // TODO: revise this interface when we generate our own blocks, or validate
 //       mempool transactions. We might want to share the BlockVerifier, and we
 //       might not want to add generated blocks to the state.
-pub fn init<S>(
+pub async fn init<S>(
+    config: Config,
     network: Network,
     state_service: S,
 ) -> impl Service<
     Arc<Block>,
-    Response = BlockHeaderHash,
+    Response = block::Hash,
     Error = Error,
-    Future = impl Future<Output = Result<BlockHeaderHash, Error>>,
+    Future = impl Future<Output = Result<block::Hash, Error>>,
 > + Send
        + Clone
        + 'static
@@ -189,16 +232,27 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    tracing::debug!(?network, "initialising ChainVerifier from network");
+    let initial_tip = zebra_state::current_tip(state_service.clone())
+        .await
+        .expect("State service poll_ready is Ok");
 
     let block_verifier = crate::block::init(state_service.clone());
-    let checkpoint_verifier = CheckpointVerifier::new(network);
+    let checkpoint_list = match config.checkpoint_sync {
+        true => CheckpointList::new(network),
+        false => CheckpointList::new_up_to(network, Sapling),
+    };
 
-    init_from_verifiers(block_verifier, checkpoint_verifier, state_service)
+    init_from_verifiers(
+        network,
+        block_verifier,
+        Some(checkpoint_list),
+        state_service,
+        initial_tip,
+    )
 }
 
-/// Return a chain verification service, using the provided verifier and state
-/// services.
+/// Return a chain verification service, using the provided block verifier,
+/// checkpoint list, and state service.
 ///
 /// The chain verifier holds a state service of type `S`, used as context for
 /// block validation and to which newly verified blocks will be committed. This
@@ -209,24 +263,32 @@ where
 /// verification service.
 ///
 /// This function should only be called once for a particular state service and
-/// verifiers (and the result be shared, cloning if needed). Constructing
+/// block verifier (and the result be shared, cloning if needed). Constructing
 /// multiple services from the same underlying state might cause synchronisation
 /// bugs.
-pub fn init_from_verifiers<BV, S>(
+///
+/// Panics:
+///
+/// Panics if the `checkpoint_list` is None, and the `initial_tip_height` is
+/// below the Sapling network upgrade for `network`. (The `block_verifier` can't
+/// verify all the constraints on pre-Sapling blocks, so they require
+/// checkpoints.)
+pub(crate) fn init_from_verifiers<BV, S>(
+    network: Network,
     block_verifier: BV,
-    // We use an explcit type, so callers can't accidentally swap the verifiers
-    checkpoint_verifier: CheckpointVerifier,
+    checkpoint_list: Option<CheckpointList>,
     state_service: S,
+    initial_tip: Option<Arc<Block>>,
 ) -> impl Service<
     Arc<Block>,
-    Response = BlockHeaderHash,
+    Response = block::Hash,
     Error = Error,
-    Future = impl Future<Output = Result<BlockHeaderHash, Error>>,
+    Future = impl Future<Output = Result<block::Hash, Error>>,
 > + Send
        + Clone
        + 'static
 where
-    BV: Service<Arc<Block>, Response = BlockHeaderHash, Error = Error> + Send + Clone + 'static,
+    BV: Service<Arc<Block>, Response = block::Hash, Error = Error> + Send + Clone + 'static,
     BV::Future: Send + 'static,
     S: Service<zebra_state::Request, Response = zebra_state::Response, Error = Error>
         + Send
@@ -234,25 +296,47 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let max_checkpoint_height = checkpoint_verifier.list().max_height();
-    tracing::debug!(
+    let max_checkpoint_height = checkpoint_list.clone().map(|c| c.max_height());
+    let initial_height = initial_tip.clone().map(|b| b.coinbase_height()).flatten();
+    let initial_hash = initial_tip.clone().map(|b| b.hash());
+
+    tracing::info!(
+        ?network,
         ?max_checkpoint_height,
-        "initialising ChainVerifier with max checkpoint height"
+        ?initial_height,
+        ?initial_hash,
+        "initialising ChainVerifier"
     );
 
-    // Wrap the checkpoint verifier in a buffer, so we can share it
-    let checkpoint_verifier = Buffer::new(checkpoint_verifier, 1);
+    let sapling_activation = Sapling
+        .activation_height(network)
+        .expect("Unexpected network upgrade info: Sapling must have an activation height");
+
+    let checkpoint = match (initial_height, checkpoint_list, max_checkpoint_height) {
+        // If we need to verify pre-Sapling blocks, make sure we have checkpoints for them.
+        (None, None, _) => panic!("We have no checkpoints, and we have no cached blocks: Pre-Sapling blocks must be verified by checkpoints"),
+        (Some(initial_height), None, _) if (initial_height < sapling_activation) => panic!("We have no checkpoints, and we don't have a cached Sapling activation block: Pre-Sapling blocks must be verified by checkpoints"),
+
+        // If we're past the checkpoint range, don't create a checkpoint verifier.
+        (Some(initial_height), _, Some(max_checkpoint_height)) if (initial_height > max_checkpoint_height) => None,
+        // No list, no checkpoint verifier
+        (_, None, _) => None,
+
+        (_, Some(_), None) => panic!("Missing max checkpoint height: height must be Some if verifier is Some"),
+        // We've done all the checks we need to create a checkpoint verifier
+        (_, Some(list), Some(max_height)) => Some(
+            ChainCheckpointVerifier {
+                verifier: Buffer::new(CheckpointVerifier::from_checkpoint_list(list, initial_tip), 1),
+                max_height,
+            }),
+    };
 
     Buffer::new(
         ChainVerifier {
             block_verifier,
-            checkpoint_verifier,
-            max_checkpoint_height,
+            checkpoint,
             state_service,
-            // We haven't actually got the genesis block yet, but that's ok,
-            // because this field is only used for debugging unexpected high
-            // blocks.
-            last_block_height: BlockHeight(0),
+            last_block_height: initial_height,
         },
         1,
     )

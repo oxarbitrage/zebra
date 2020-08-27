@@ -18,7 +18,7 @@ use tower::Service;
 use tracing::{span, Level};
 use tracing_futures::Instrument;
 
-use zebra_chain::types::BlockHeight;
+use zebra_chain::block;
 
 use crate::{
     constants,
@@ -104,14 +104,18 @@ where
         let nonces = self.nonces.clone();
         let internal_service = self.internal_service.clone();
         let timestamp_collector = self.timestamp_collector.clone();
-        let user_agent = self.config.user_agent.clone();
         let network = self.config.network;
 
         let fut = async move {
             debug!("connecting to remote peer");
 
-            let mut stream =
-                Framed::new(tcp_stream, Codec::builder().for_network(network).finish());
+            let mut stream = Framed::new(
+                tcp_stream,
+                Codec::builder()
+                    .for_network(network)
+                    .with_metrics_label(addr.ip().to_string())
+                    .finish(),
+            );
 
             let local_nonce = Nonce::default();
             nonces
@@ -128,12 +132,12 @@ where
                 //       send our configured address to the peer
                 address_from: (PeerServices::NODE_NETWORK, "0.0.0.0:8233".parse().unwrap()),
                 nonce: local_nonce,
-                user_agent,
+                user_agent: constants::USER_AGENT.to_string(),
                 // XXX eventually the `PeerConnector` will need to have a handle
                 // for a service that gets the current block height. Among other
                 // things we need it to reject peers who don't know about the
                 // current protocol epoch.
-                start_height: BlockHeight(0),
+                start_height: block::Height(0),
                 relay: false,
             };
 

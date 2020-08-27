@@ -38,9 +38,10 @@ use std::{
 use tokio::sync::oneshot;
 use tower::Service;
 
-use zebra_chain::block::{Block, BlockHeaderHash};
-use zebra_chain::types::BlockHeight;
-use zebra_chain::Network;
+use zebra_chain::{
+    block::{self, Block},
+    parameters::Network,
+};
 
 /// The inner error type for CheckpointVerifier.
 // TODO(jlusby): Error = Report ?
@@ -52,9 +53,9 @@ struct QueuedBlock {
     /// The block data.
     block: Arc<Block>,
     /// `block`'s cached header hash.
-    hash: BlockHeaderHash,
+    hash: block::Hash,
     /// The transmitting end of the oneshot channel for this block's result.
-    tx: oneshot::Sender<Result<BlockHeaderHash, Error>>,
+    tx: oneshot::Sender<Result<block::Hash, Error>>,
 }
 
 /// A list of unverified blocks at a particular height.
@@ -77,6 +78,10 @@ type QueuedBlockList = Vec<QueuedBlock>;
 /// usage by committing blocks to the disk state. (Or dropping invalid blocks.)
 pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 
+/// We limit the maximum number of blocks in each checkpoint. Each block uses a
+/// constant amount of memory for the supporting data structures and futures.
+pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 2_000;
+
 /// A checkpointing block verifier.
 ///
 /// Verifies blocks using a supplied list of checkpoints. There must be at
@@ -87,6 +92,9 @@ pub struct CheckpointVerifier {
     //
     /// The checkpoint list for this verifier.
     checkpoint_list: CheckpointList,
+
+    /// The hash of the initial tip, if any.
+    initial_tip_hash: Option<block::Hash>,
 
     // Queued Blocks
     //
@@ -100,10 +108,10 @@ pub struct CheckpointVerifier {
     ///
     /// The first checkpoint does not have any ancestors, so it only verifies the
     /// genesis block.
-    queued: BTreeMap<BlockHeight, QueuedBlockList>,
+    queued: BTreeMap<block::Height, QueuedBlockList>,
 
     /// The current progress of this verifier.
-    verifier_progress: Progress<BlockHeight>,
+    verifier_progress: Progress<block::Height>,
 }
 
 /// The CheckpointVerifier implementation.
@@ -111,20 +119,28 @@ pub struct CheckpointVerifier {
 /// Contains non-service utility functions for CheckpointVerifiers.
 impl CheckpointVerifier {
     /// Return a checkpoint verification service for `network`, using the
+    /// hard-coded checkpoint list. If `initial_tip` is Some(_), the
+    /// verifier starts at that initial tip, which does not have to be in the
     /// hard-coded checkpoint list.
     ///
     /// This function should be called only once for a particular network, rather
     /// than constructing multiple verification services for the same network. To
-    /// Clone a CheckpointVerifier, you might need to wrap it in a
+    /// clone a CheckpointVerifier, you might need to wrap it in a
     /// `tower::Buffer` service.
-    pub fn new(network: Network) -> Self {
+    pub fn new(network: Network, initial_tip: Option<Arc<Block>>) -> Self {
         let checkpoint_list = CheckpointList::new(network);
         let max_height = checkpoint_list.max_height();
-        tracing::info!(?max_height, ?network, "initialising CheckpointVerifier");
-        Self::from_checkpoint_list(checkpoint_list)
+        let initial_height = initial_tip.clone().map(|b| b.coinbase_height()).flatten();
+        tracing::info!(
+            ?max_height,
+            ?network,
+            ?initial_height,
+            "initialising CheckpointVerifier"
+        );
+        Self::from_checkpoint_list(checkpoint_list, initial_tip)
     }
 
-    /// Return a checkpoint verification service using `list`.
+    /// Return a checkpoint verification service using `list` and `initial_tip`.
     ///
     /// Assumes that the provided genesis checkpoint is correct.
     ///
@@ -135,50 +151,78 @@ impl CheckpointVerifier {
     // This function is designed for use in tests.
     #[allow(dead_code)]
     pub(crate) fn from_list(
-        list: impl IntoIterator<Item = (BlockHeight, BlockHeaderHash)>,
+        list: impl IntoIterator<Item = (block::Height, block::Hash)>,
+        initial_tip: Option<Arc<Block>>,
     ) -> Result<Self, Error> {
-        Ok(Self::from_checkpoint_list(CheckpointList::from_list(list)?))
+        Ok(Self::from_checkpoint_list(
+            CheckpointList::from_list(list)?,
+            initial_tip,
+        ))
     }
 
-    /// Return a checkpoint verification service using `checkpoint_list`.
+    /// Return a checkpoint verification service using `checkpoint_list` and
+    /// `initial_tip`.
     ///
     /// Callers should prefer `CheckpointVerifier::new`, which uses the
     /// hard-coded checkpoint lists. See `CheckpointVerifier::new` and
     /// `CheckpointList::from_list` for more details.
-    pub(crate) fn from_checkpoint_list(checkpoint_list: CheckpointList) -> Self {
+    pub(crate) fn from_checkpoint_list(
+        checkpoint_list: CheckpointList,
+        initial_tip: Option<Arc<Block>>,
+    ) -> Self {
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
+        let (initial_tip_hash, verifier_progress) = match initial_tip {
+            Some(initial_tip) => {
+                let initial_height = initial_tip
+                    .coinbase_height()
+                    .expect("Bad initial tip: must have coinbase height");
+                if initial_height >= checkpoint_list.max_height() {
+                    (None, Progress::FinalCheckpoint)
+                } else {
+                    (
+                        Some(initial_tip.hash()),
+                        Progress::InitialTip(initial_height),
+                    )
+                }
+            }
+            // We start by verifying the genesis block, by itself
+            None => (None, Progress::BeforeGenesis),
+        };
         CheckpointVerifier {
             checkpoint_list,
+            initial_tip_hash,
             queued: BTreeMap::new(),
-            // We start by verifying the genesis block, by itself
-            verifier_progress: Progress::BeforeGenesis,
+            verifier_progress,
         }
     }
 
+    /// Return the checkpoint list for this verifier.
+    #[allow(dead_code)]
     pub(crate) fn list(&self) -> &CheckpointList {
         &self.checkpoint_list
     }
 
     /// Return the current verifier's progress.
     ///
-    /// If verification has not started yet, returns `BeforeGenesis`.
+    /// If verification has not started yet, returns `BeforeGenesis`,
+    /// or `InitialTip(height)` if there were cached verified blocks.
     ///
     /// If verification is ongoing, returns `PreviousCheckpoint(height)`.
     /// `height` increases as checkpoints are verified.
     ///
     /// If verification has finished, returns `FinalCheckpoint`.
-    fn previous_checkpoint_height(&self) -> Progress<BlockHeight> {
+    fn previous_checkpoint_height(&self) -> Progress<block::Height> {
         self.verifier_progress
     }
 
     /// Return the start of the current checkpoint range.
     ///
     /// Returns None if verification has finished.
-    fn current_start_bound(&self) -> Option<Bound<BlockHeight>> {
+    fn current_start_bound(&self) -> Option<Bound<block::Height>> {
         match self.previous_checkpoint_height() {
             BeforeGenesis => Some(Unbounded),
-            PreviousCheckpoint(height) => Some(Excluded(height)),
+            InitialTip(height) | PreviousCheckpoint(height) => Some(Excluded(height)),
             FinalCheckpoint => None,
         }
     }
@@ -194,17 +238,15 @@ impl CheckpointVerifier {
     /// `height` increases as checkpoints are verified.
     ///
     /// If verification has finished, returns `FinishedVerifying`.
-    fn target_checkpoint_height(&self) -> Target<BlockHeight> {
+    fn target_checkpoint_height(&self) -> Target<block::Height> {
         // Find the height we want to start searching at
         let mut pending_height = match self.previous_checkpoint_height() {
             // Check if we have the genesis block as a special case, to simplify the loop
-            BeforeGenesis if !self.queued.contains_key(&BlockHeight(0)) => {
-                // XXX scratch tracing line for debugging, delete this
-                tracing::debug!("beforegenesis if !self.queued.contains_key(&BlockHeight(0))");
+            BeforeGenesis if !self.queued.contains_key(&block::Height(0)) => {
                 return WaitingForBlocks;
             }
-            BeforeGenesis => BlockHeight(0),
-            PreviousCheckpoint(height) => height,
+            BeforeGenesis => block::Height(0),
+            InitialTip(height) | PreviousCheckpoint(height) => height,
             FinalCheckpoint => return FinishedVerifying,
         };
 
@@ -222,7 +264,7 @@ impl CheckpointVerifier {
         // it stops after the first gap.
         for (&height, _) in self.queued.range((Excluded(pending_height), Unbounded)) {
             // If the queued blocks are continuous.
-            if height == BlockHeight(pending_height.0 + 1) {
+            if height == block::Height(pending_height.0 + 1) {
                 pending_height = height;
             } else {
                 break;
@@ -253,9 +295,13 @@ impl CheckpointVerifier {
     /// Return the most recently verified checkpoint's hash.
     ///
     /// See `previous_checkpoint_height()` for details.
-    fn previous_checkpoint_hash(&self) -> Progress<BlockHeaderHash> {
+    fn previous_checkpoint_hash(&self) -> Progress<block::Hash> {
         match self.previous_checkpoint_height() {
             BeforeGenesis => BeforeGenesis,
+            InitialTip(_) => self
+                .initial_tip_hash
+                .map(InitialTip)
+                .expect("initial tip height must have an initial tip hash"),
             PreviousCheckpoint(height) => self
                 .checkpoint_list
                 .hash(height)
@@ -273,7 +319,7 @@ impl CheckpointVerifier {
     ///  - the block's height is less than or equal to the previously verified
     ///    checkpoint
     ///  - verification has finished
-    fn check_height(&self, height: BlockHeight) -> Result<(), Error> {
+    fn check_height(&self, height: block::Height) -> Result<(), Error> {
         if height > self.checkpoint_list.max_height() {
             Err("block is higher than the maximum checkpoint")?;
         }
@@ -282,10 +328,12 @@ impl CheckpointVerifier {
             // Any height is valid
             BeforeGenesis => {}
             // Greater heights are valid
-            PreviousCheckpoint(previous_height) if (height <= previous_height) => {
-                Err("block height has already been verified")?
+            InitialTip(previous_height) | PreviousCheckpoint(previous_height)
+                if (height <= previous_height) =>
+            {
+                Err(format!("Block has already been verified. {:?}", height))?
             }
-            PreviousCheckpoint(_) => {}
+            InitialTip(_) | PreviousCheckpoint(_) => {}
             // We're finished, so no checkpoint height is valid
             FinalCheckpoint => Err("verification has finished")?,
         };
@@ -294,7 +342,7 @@ impl CheckpointVerifier {
     }
 
     /// Increase the current checkpoint height to `verified_height`,
-    fn update_progress(&mut self, verified_height: BlockHeight) {
+    fn update_progress(&mut self, verified_height: block::Height) {
         // Ignore blocks that are below the previous checkpoint, or otherwise
         // have invalid heights.
         //
@@ -311,6 +359,8 @@ impl CheckpointVerifier {
             self.verifier_progress = FinalCheckpoint;
         } else if self.checkpoint_list.contains(verified_height) {
             self.verifier_progress = PreviousCheckpoint(verified_height);
+            // We're done with the initial tip hash now
+            self.initial_tip_hash = None;
         }
     }
 
@@ -318,7 +368,7 @@ impl CheckpointVerifier {
     ///
     /// Returns an error if the block's height is invalid, see `check_height()`
     /// for details.
-    fn check_block(&self, block: &Block) -> Result<BlockHeight, Error> {
+    fn check_block(&self, block: &Block) -> Result<block::Height, Error> {
         let block_height = block
             .coinbase_height()
             .ok_or("the block does not have a coinbase height")?;
@@ -334,10 +384,7 @@ impl CheckpointVerifier {
     ///
     /// If the block does not have a coinbase height, sends an error on `tx`,
     /// and does not queue the block.
-    fn queue_block(
-        &mut self,
-        block: Arc<Block>,
-    ) -> oneshot::Receiver<Result<BlockHeaderHash, Error>> {
+    fn queue_block(&mut self, block: Arc<Block>) -> oneshot::Receiver<Result<block::Hash, Error>> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -345,7 +392,9 @@ impl CheckpointVerifier {
         let height = match self.check_block(&block) {
             Ok(height) => height,
             Err(error) => {
-                tracing::warn!(?error);
+                // Block errors happen frequently on mainnet, due to bad peers.
+                tracing::debug!(?error);
+
                 // Sending might fail, depending on what the caller does with rx,
                 // but there's nothing we can do about it.
                 let _ = tx.send(Err(error));
@@ -361,6 +410,18 @@ impl CheckpointVerifier {
             .entry(height)
             .or_insert_with(|| QueuedBlockList::with_capacity(1));
 
+        let hash = block.hash();
+
+        for qb in qblocks.iter_mut() {
+            if qb.hash == hash {
+                let old_tx = std::mem::replace(&mut qb.tx, tx);
+                let e = "rejected older of duplicate verification requests".into();
+                tracing::debug!(?e);
+                let _ = old_tx.send(Err(e));
+                return rx;
+            }
+        }
+
         // Memory DoS resistance: limit the queued blocks at each height
         if qblocks.len() >= MAX_QUEUED_BLOCKS_PER_HEIGHT {
             let e = "too many queued blocks at this height".into();
@@ -370,7 +431,6 @@ impl CheckpointVerifier {
         }
 
         // Add the block to the list of queued blocks at this height
-        let hash = block.as_ref().into();
         let new_qblock = QueuedBlock { block, hash, tx };
         // This is a no-op for the first block in each QueuedBlockList.
         qblocks.reserve_exact(1);
@@ -395,8 +455,8 @@ impl CheckpointVerifier {
     /// Returns the first valid block. If there is no valid block, returns None.
     fn process_height(
         &mut self,
-        height: BlockHeight,
-        expected_hash: BlockHeaderHash,
+        height: block::Height,
+        expected_hash: block::Hash,
     ) -> Option<QueuedBlock> {
         let mut qblocks = self
             .queued
@@ -473,7 +533,7 @@ impl CheckpointVerifier {
             // like other blocks, the genesis parent hash is set by the
             // consensus parameters.
             BeforeGenesis => parameters::GENESIS_PREVIOUS_BLOCK_HASH,
-            PreviousCheckpoint(hash) => hash,
+            InitialTip(hash) | PreviousCheckpoint(hash) => hash,
             FinalCheckpoint => return,
         };
         // Return early if we're still waiting for more blocks
@@ -488,8 +548,9 @@ impl CheckpointVerifier {
                 tracing::debug!("waiting for blocks to complete checkpoint range");
                 return;
             }
-            // XXX(hdevalence) should this be unreachable!("called after finished") ?
-            _ => return,
+            FinishedVerifying => {
+                unreachable!("the FinalCheckpoint case should have returned earlier")
+            }
         };
 
         // Keep the old previous checkpoint height, to make sure we're making
@@ -502,7 +563,7 @@ impl CheckpointVerifier {
                 .expect("earlier code checks if verification has finished"),
             Included(target_checkpoint_height),
         );
-        let range_heights: Vec<BlockHeight> = self
+        let range_heights: Vec<block::Height> = self
             .queued
             .range_mut(current_range)
             .rev()
@@ -523,7 +584,7 @@ impl CheckpointVerifier {
             } else {
                 // The last block height we processed did not have any blocks
                 // with a matching hash, so chain verification has failed.
-                tracing::warn!(
+                tracing::info!(
                     ?current_height,
                     ?current_range,
                     "No valid blocks at height in CheckpointVerifier"
@@ -641,7 +702,7 @@ impl Drop for CheckpointVerifier {
 ///
 /// After verification, the block futures resolve to their hashes.
 impl Service<Arc<Block>> for CheckpointVerifier {
-    type Response = BlockHeaderHash;
+    type Response = block::Hash;
     type Error = Error;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;

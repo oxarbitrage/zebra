@@ -3,28 +3,25 @@ use std::{
     error::Error,
     sync::Arc,
 };
-use zebra_chain::{
-    block::{Block, BlockHeaderHash},
-    types::BlockHeight,
-};
+use zebra_chain::block::{self, Block};
 #[derive(Default)]
 pub(super) struct BlockIndex {
-    by_hash: HashMap<BlockHeaderHash, Arc<Block>>,
-    by_height: BTreeMap<BlockHeight, Arc<Block>>,
+    by_hash: HashMap<block::Hash, Arc<Block>>,
+    height_map: BTreeMap<block::Height, block::Hash>,
 }
 
 impl BlockIndex {
     pub(super) fn insert(
         &mut self,
         block: impl Into<Arc<Block>>,
-    ) -> Result<BlockHeaderHash, Box<dyn Error + Send + Sync + 'static>> {
+    ) -> Result<block::Hash, Box<dyn Error + Send + Sync + 'static>> {
         let block = block.into();
         let hash = block.as_ref().into();
         let height = block.coinbase_height().unwrap();
 
-        match self.by_height.entry(height) {
+        match self.height_map.entry(height) {
             Entry::Vacant(entry) => {
-                let _ = entry.insert(block.clone());
+                let _ = entry.insert(hash);
                 let _ = self.by_hash.insert(hash, block);
                 Ok(hash)
             }
@@ -32,35 +29,18 @@ impl BlockIndex {
         }
     }
 
-    pub(super) fn get(&mut self, query: impl Into<BlockQuery>) -> Option<Arc<Block>> {
-        match query.into() {
-            BlockQuery::ByHash(hash) => self.by_hash.get(&hash),
-            BlockQuery::ByHeight(height) => self.by_height.get(&height),
-        }
-        .cloned()
+    pub(super) fn get(&self, hash: block::Hash) -> Option<Arc<Block>> {
+        self.by_hash.get(&hash).cloned()
+    }
+
+    pub(super) fn get_main_chain_at(&self, height: block::Height) -> Option<block::Hash> {
+        self.height_map.get(&height).cloned()
     }
 
     pub(super) fn get_tip(&self) -> Option<Arc<Block>> {
-        self.by_height
-            .iter()
-            .next_back()
-            .map(|(_key, value)| value.clone())
-    }
-}
-
-pub(super) enum BlockQuery {
-    ByHash(BlockHeaderHash),
-    ByHeight(BlockHeight),
-}
-
-impl From<BlockHeaderHash> for BlockQuery {
-    fn from(hash: BlockHeaderHash) -> Self {
-        Self::ByHash(hash)
-    }
-}
-
-impl From<BlockHeight> for BlockQuery {
-    fn from(height: BlockHeight) -> Self {
-        Self::ByHeight(height)
+        self.height_map.iter().next_back().map(|(_height, &hash)| {
+            self.get(hash)
+                .expect("block must be in pool to be in the height map")
+        })
     }
 }

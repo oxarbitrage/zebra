@@ -12,7 +12,7 @@ use std::{
     task::{Context, Poll},
 };
 use tower::{buffer::Buffer, Service};
-use zebra_chain::block::BlockHeaderHash;
+use zebra_chain::block;
 
 mod block_index;
 
@@ -22,7 +22,7 @@ struct InMemoryState {
 }
 
 impl InMemoryState {
-    fn contains(&mut self, _hash: BlockHeaderHash) -> Result<Option<u32>, Error> {
+    fn contains(&mut self, _hash: block::Hash) -> Result<Option<u32>, Error> {
         todo!()
     }
 }
@@ -98,9 +98,8 @@ impl Service<Request> for InMemoryState {
                 let block_locator = crate::block_locator_heights(tip_height)
                     .map(|height| {
                         self.index
-                            .get(height)
+                            .get_main_chain_at(height)
                             .expect("there should be no holes in the chain")
-                            .hash()
                     })
                     .collect();
 

@@ -4,9 +4,13 @@ use crate::constants::magics;
 
 use std::fmt;
 
-use zebra_chain::types::BlockHeight;
-use zebra_chain::Network::{self, *};
-use zebra_consensus::parameters::NetworkUpgrade::{self, *};
+use zebra_chain::{
+    block,
+    parameters::{
+        Network::{self, *},
+        NetworkUpgrade::{self, *},
+    },
+};
 
 #[cfg(test)]
 use proptest_derive::Arbitrary;
@@ -43,7 +47,7 @@ impl Version {
         // TODO: Should we reject earlier protocol versions during our initial
         //       sync? zcashd accepts 170_002 or later during its initial sync.
         Version(match (network, network_upgrade) {
-            (_, BeforeOverwinter) => 170_002,
+            (_, Genesis) | (_, BeforeOverwinter) => 170_002,
             (Testnet, Overwinter) => 170_003,
             (Mainnet, Overwinter) => 170_005,
             (_, Sapling) => 170_007,
@@ -59,7 +63,8 @@ impl Version {
     /// Returns the current minimum protocol version for `network` and `height`.
     ///
     /// Returns None if the network has no branch id at this height.
-    pub fn current_min(network: Network, height: BlockHeight) -> Version {
+    #[allow(dead_code)]
+    pub fn current_min(network: Network, height: block::Height) -> Version {
         let network_upgrade = NetworkUpgrade::current(network, height);
         Version::min_for_upgrade(network, network_upgrade)
     }
@@ -148,14 +153,14 @@ mod test {
     /// extreme values.
     fn version_extremes(network: Network) {
         assert_eq!(
-            Version::current_min(network, BlockHeight(0)),
+            Version::current_min(network, block::Height(0)),
             Version::min_for_upgrade(network, BeforeOverwinter),
         );
 
         // We assume that the last version we know about continues forever
         // (even if we suspect that won't be true)
         assert_ne!(
-            Version::current_min(network, BlockHeight::MAX),
+            Version::current_min(network, block::Height::MAX),
             Version::min_for_upgrade(network, BeforeOverwinter),
         );
     }
@@ -173,7 +178,7 @@ mod test {
     /// Check that the min_for_upgrade and current_min functions
     /// are consistent for `network`.
     fn version_consistent(network: Network) {
-        let highest_network_upgrade = NetworkUpgrade::current(network, BlockHeight::MAX);
+        let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
         assert!(highest_network_upgrade == Canopy || highest_network_upgrade == Heartwood,
                 "expected coverage of all network upgrades: add the new network upgrade to the list in this test");
 
