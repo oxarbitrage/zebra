@@ -351,3 +351,25 @@ fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn longer_output_test() -> Result<()> {
+    zebra_test::init();
+    let (tempdir, _guard) = tempdir(true)?;
+
+    let mut child = get_child(&["start"], &tempdir)?;
+
+    // Run the program and kill it at 60 second to get a longer output
+    std::thread::sleep(Duration::from_secs(60));
+    child.kill()?;
+
+    let output = child.wait_with_output()?;
+    let output = output.assert_failure()?;
+
+    output.stdout_contains(r"created block locator")?;
+
+    // Make sure the command was killed
+    assert!(output.was_killed());
+
+    Ok(())
+}
