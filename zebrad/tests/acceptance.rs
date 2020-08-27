@@ -359,8 +359,8 @@ fn longer_output_test() -> Result<()> {
 
     let mut child = get_child(&["start"], &tempdir)?;
 
-    // Run the program and kill it at 120 second to get a longer output
-    std::thread::sleep(Duration::from_secs(120));
+    // Run the program and kill it at 240 second to get a longer output
+    std::thread::sleep(Duration::from_secs(240));
     child.kill()?;
 
     let output = child.wait_with_output()?;
