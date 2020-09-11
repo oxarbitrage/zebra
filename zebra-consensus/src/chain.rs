@@ -33,16 +33,23 @@ use zebra_chain::parameters::{Network, NetworkUpgrade::Sapling};
 
 /// The maximum expected gap between blocks.
 ///
-/// Used to identify unexpected high blocks.
+/// Used to identify unexpected out of order blocks.
 const MAX_EXPECTED_BLOCK_GAP: u32 = 100_000;
 
 /// A wrapper type that holds the `ChainVerifier`'s `CheckpointVerifier`, and
 /// its associated state.
 #[derive(Clone)]
-struct ChainCheckpointVerifier {
+struct ChainCheckpointVerifier<S>
+where
+    S: Service<zebra_state::Request, Response = zebra_state::Response, Error = Error>
+        + Send
+        + Clone
+        + 'static,
+    S::Future: Send + 'static,
+{
     /// The underlying `CheckpointVerifier`, wrapped in a buffer, so we can
     /// clone and share it with futures.
-    verifier: Buffer<CheckpointVerifier, Arc<Block>>,
+    verifier: Buffer<CheckpointVerifier<S>, Arc<Block>>,
 
     /// The maximum checkpoint height for `checkpoint_verifier`.
     max_height: block::Height,
@@ -67,10 +74,7 @@ where
     /// associated state.
     ///
     /// None if all the checkpoints have been verified.
-    checkpoint: Option<ChainCheckpointVerifier>,
-
-    /// The underlying `ZebraState`, possibly wrapped in other services.
-    state_service: S,
+    checkpoint: Option<ChainCheckpointVerifier<S>>,
 
     /// The most recent block height that was submitted to the verifier.
     ///
@@ -103,36 +107,33 @@ where
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // We don't expect the state or verifiers to exert backpressure on our
-        // users, so we don't need to call `state_service.poll_ready()` here.
+        // We don't expect the verifiers to exert backpressure on our
+        // users, so we don't need to call the verifier's `poll_ready` here.
         // (And we don't know which verifier to choose at this point, anyway.)
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
-        // TODO(jlusby): Error = Report, handle errors from state_service.
-        let span = tracing::debug_span!(
-            "block_verify",
-            height = ?block.coinbase_height(),
-            hash = ?block.hash()
-        );
-        let block_height = block.coinbase_height();
+        // TODO(jlusby): Error = Report
+        let height = block.coinbase_height();
+        let hash = block.hash();
+        let span = tracing::debug_span!("block_verify", ?height, ?hash,);
 
         let mut block_verifier = self.block_verifier.clone();
-        let mut state_service = self.state_service.clone();
         let checkpoint_verifier = self.checkpoint.clone().map(|c| c.verifier);
         let max_checkpoint_height = self.checkpoint.clone().map(|c| c.max_height);
 
-        // Log an info-level message on unexpected high blocks
-        let is_unexpected_high_block = match (block_height, self.last_block_height) {
-            (Some(block::Height(block_height)), Some(block::Height(last_block_height)))
-                if (block_height > last_block_height + MAX_EXPECTED_BLOCK_GAP) =>
+        // Log an info-level message on unexpected out of order blocks
+        let is_unexpected_gap = match (height, self.last_block_height) {
+            (Some(block::Height(height)), Some(block::Height(last_block_height)))
+                if (height > last_block_height + MAX_EXPECTED_BLOCK_GAP)
+                    || (height + MAX_EXPECTED_BLOCK_GAP < last_block_height) =>
             {
-                self.last_block_height = Some(block::Height(block_height));
+                self.last_block_height = Some(block::Height(height));
                 true
             }
-            (Some(block_height), _) => {
-                self.last_block_height = Some(block_height);
+            (Some(height), _) => {
+                self.last_block_height = Some(height);
                 false
             }
             // The other cases are covered by the verifiers
@@ -140,45 +141,40 @@ where
         };
 
         async move {
-            // TODO(teor): in the post-sapling checkpoint range, allow callers
-            //             to use BlockVerifier, CheckpointVerifier, or both.
-
             // Call a verifier based on the block height and checkpoints.
-            if is_higher_than_max_checkpoint(block_height, max_checkpoint_height) {
-                // Log a message on early high blocks.
+            if is_higher_than_max_checkpoint(height, max_checkpoint_height) {
+                // Log a message on unexpected out of order blocks.
+                //
                 // The sync service rejects most of these blocks, but we
                 // still want to know if a large number get through.
-                //
-                // This message can also happen if we keep getting unexpected
-                // low blocks. (We can't distinguish between these cases, until
-                // we've verified the blocks.)
-                if is_unexpected_high_block {
-                    tracing::debug!(?block_height, "unexpected high block, or recent unexpected low blocks");
+                if is_unexpected_gap {
+                    tracing::debug!("large block height gap: this block or the previous block is out of order");
                 }
 
-                block_verifier
+                let verified_hash = block_verifier
                     .ready_and()
                     .await?
                     .call(block.clone())
                     .await?;
+                assert_eq!(verified_hash, hash, "block verifier returned wrong hash: hashes must be equal");
             } else {
-                checkpoint_verifier
-                    .expect("Missing checkpoint verifier: verifier must be Some if max checkpoint height is Some")
+                let verified_hash = checkpoint_verifier
+                    .expect("missing checkpoint verifier: verifier must be Some if max checkpoint height is Some")
                     .ready_and()
                     .await?
                     .call(block.clone())
                     .await?;
+                assert_eq!(verified_hash, hash, "checkpoint verifier returned wrong hash: hashes must be equal");
             }
 
-            let add_block = state_service
-                .ready_and()
-                .await?
-                .call(zebra_state::Request::AddBlock { block });
+            tracing::trace!(?height, ?hash, "verified block");
+            metrics::gauge!(
+                "chain.verified.block.height",
+                height.expect("valid blocks have a block height").0 as _
+            );
+            metrics::counter!("chain.verified.block.count", 1);
 
-            match add_block.await? {
-                zebra_state::Response::Added { hash } => Ok(hash),
-                _ => Err("adding block to zebra-state failed".into()),
-            }
+            Ok(hash)
         }
         .instrument(span)
         .boxed()
@@ -254,10 +250,6 @@ where
 /// Return a chain verification service, using the provided block verifier,
 /// checkpoint list, and state service.
 ///
-/// The chain verifier holds a state service of type `S`, used as context for
-/// block validation and to which newly verified blocks will be committed. This
-/// state is pluggable to allow for testing or instrumentation.
-///
 /// The returned type is opaque to allow instrumentation or other wrappers, but
 /// can be boxed for storage. It is also `Clone` to allow sharing of a
 /// verification service.
@@ -321,12 +313,12 @@ where
         (Some(initial_height), _, Some(max_checkpoint_height)) if (initial_height > max_checkpoint_height) => None,
         // No list, no checkpoint verifier
         (_, None, _) => None,
-
         (_, Some(_), None) => panic!("Missing max checkpoint height: height must be Some if verifier is Some"),
+
         // We've done all the checks we need to create a checkpoint verifier
         (_, Some(list), Some(max_height)) => Some(
             ChainCheckpointVerifier {
-                verifier: Buffer::new(CheckpointVerifier::from_checkpoint_list(list, initial_tip), 1),
+                verifier: Buffer::new(CheckpointVerifier::from_checkpoint_list(list, initial_tip, state_service), 1),
                 max_height,
             }),
     };
@@ -335,7 +327,6 @@ where
         ChainVerifier {
             block_verifier,
             checkpoint,
-            state_service,
             last_block_height: initial_height,
         },
         1,
