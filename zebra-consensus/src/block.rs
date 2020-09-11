@@ -23,9 +23,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
-use tokio::time;
 use tower::{buffer::Buffer, Service, ServiceExt};
 
 use zebra_chain::block::{self, Block};
@@ -40,9 +38,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    /// The underlying `ZebraState`, possibly wrapped in other services.
-    // TODO: contextual verification
-    #[allow(dead_code)]
+    /// The underlying state service, possibly wrapped in other services.
     state_service: S,
 }
 
@@ -75,7 +71,7 @@ where
     }
 
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
-        let mut state = self.state_service.clone();
+        let mut state_service = self.state_service.clone();
 
         // TODO(jlusby): Error = Report, handle errors from state_service.
         async move {
@@ -85,61 +81,70 @@ where
             // height for parsed blocks when we deserialize them.
             let height = block
                 .coinbase_height()
-                .ok_or("Invalid block: missing block height.")?;
+                .ok_or_else(|| format!("invalid block {:?}: missing block height",
+                                       hash))?;
             if height > block::Height::MAX {
-                Err("Invalid block height: greater than the maximum height.")?;
+                Err(format!("invalid block height {:?} in {:?}: greater than the maximum height {:?}",
+                            height,
+                            hash,
+                            block::Height::MAX))?;
             }
 
             // Check that this block is actually a new block
-            if BlockVerifier::get_block(&mut state, hash).await?.is_some() {
-                Err(format!("Block has already been verified. {:?} {:?}", height, hash))?;
+            if BlockVerifier::get_block(&mut state_service, hash).await?.is_some() {
+                Err(format!("duplicate block {:?} {:?}: block has already been verified",
+                            height,
+                            hash))?;
             }
 
             // Do the difficulty checks first, to raise the threshold for
             // attacks that use any other fields.
-            let difficulty_threshold = block.header.difficulty_threshold.to_expanded().ok_or("Invalid difficulty threshold in block header.")?;
+            let difficulty_threshold = block
+                .header
+                .difficulty_threshold
+                .to_expanded()
+                .ok_or_else(|| format!("invalid difficulty threshold in block header {:?} {:?}",
+                                       height,
+                                       hash))?;
             if hash > difficulty_threshold {
-                Err("Block failed the difficulty filter: hash must be less than or equal to the difficulty threshold.")?;
+                Err(format!("block {:?} failed the difficulty filter: hash {:?} must be less than or equal to the difficulty threshold {:?}",
+                            height,
+                            hash,
+                            difficulty_threshold))?;
             }
-            block.header.is_equihash_solution_valid()?;
+            check::is_equihash_solution_valid(&block.header)?;
 
             // Since errors cause an early exit, try to do the
             // quick checks first.
 
             // Field validity and structure checks
             let now = Utc::now();
-            block.header.is_time_valid_at(now)?;
+            check::is_time_valid_at(&block.header, now)?;
             check::is_coinbase_first(&block)?;
             check::is_subsidy_correct(&block)?;
 
-            // TODO:
-            //   - context-free header verification: merkle root
-            //   - contextual verification
+            // TODO: context-free header verification: merkle root
 
-            // As a temporary solution for chain gaps, wait for the previous block,
-            // and check its height.
-            // TODO:
-            //   - Add a previous block height and hash constraint to the AddBlock request,
-            //     so that we can verify in parallel, then check constraints before committing
-            //
-            // Skip contextual checks for the genesis block
-            let previous_block_hash = block.header.previous_block_hash;
-            if previous_block_hash != crate::parameters::GENESIS_PREVIOUS_BLOCK_HASH {
-                tracing::debug!(?height, "Awaiting previous block from state");
-                let previous_block = BlockVerifier::await_block(
-                    &mut state,
-                    previous_block_hash,
-                    block::Height(height.0 - 1),
-                )
+            tracing::trace!("verified block");
+            metrics::gauge!(
+                "block.verified.block.height",
+                height.0 as _
+            );
+            metrics::counter!("block.verified.block.count", 1);
+
+            // Commit the block in the future - the state will handle out of
+            // order blocks.
+            let ready_state = state_service
+                .ready_and()
                 .await?;
 
-                let previous_height = previous_block.coinbase_height().unwrap();
-                if height.0 != previous_height.0 + 1 {
-                    Err("Invalid block height: must be 1 more than the previous block height.")?;
+            match ready_state.call(zebra_state::Request::AddBlock { block }).await? {
+                zebra_state::Response::Added { hash: committed_hash } => {
+                    assert_eq!(committed_hash, hash, "state returned wrong hash: hashes must be equal");
+                    Ok(hash)
                 }
+                _ => Err(format!("adding block {:?} {:?} to state failed", height, hash))?,
             }
-
-            Ok(hash)
         }
         .boxed()
     }
@@ -160,9 +165,12 @@ where
     /// Get the block for `hash`, using `state`.
     ///
     /// If there is no block for that hash, returns `Ok(None)`.
-    /// Returns an error if `state.poll_ready` errors.
-    async fn get_block(state: &mut S, hash: block::Hash) -> Result<Option<Arc<Block>>, Report> {
-        let block = state
+    /// Returns an error if `state_service.poll_ready` errors.
+    async fn get_block(
+        state_service: &mut S,
+        hash: block::Hash,
+    ) -> Result<Option<Arc<Block>>, Report> {
+        let block = state_service
             .ready_and()
             .await
             .map_err(|e| eyre!(e))?
@@ -176,36 +184,13 @@ where
 
         Ok(block)
     }
-
-    /// Wait until a block with `hash` is in `state`.
-    ///
-    /// Returns an error if `state.poll_ready` errors.
-    async fn await_block(
-        state: &mut S,
-        hash: block::Hash,
-        height: block::Height,
-    ) -> Result<Arc<Block>, Report> {
-        loop {
-            match BlockVerifier::get_block(state, hash).await? {
-                Some(block) => return Ok(block),
-                // Busy-waiting is only a temporary solution to waiting for blocks.
-                // TODO:
-                //   - Get an AwaitBlock future from the state
-                //   - Replace with AddBlock constraints
-                None => {
-                    tracing::debug!(?height, ?hash, "Waiting for state to have block");
-                    time::delay_for(Duration::from_millis(50)).await
-                }
-            };
-        }
-    }
 }
 
 /// Return a block verification service, using the provided state service.
 ///
-/// The block verifier holds a state service of type `S`, used as context for
-/// block validation. This state is pluggable to allow for testing or
-/// instrumentation.
+/// The block verifier holds a state service of type `S`, into which newly
+/// verified blocks will be committed. This state is pluggable to allow for
+/// testing or instrumentation.
 ///
 /// The returned type is opaque to allow instrumentation or other wrappers, but
 /// can be boxed for storage. It is also `Clone` to allow sharing of a

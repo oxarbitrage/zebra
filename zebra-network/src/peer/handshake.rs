@@ -394,20 +394,36 @@ where
                 })
                 .then(move |msg| {
                     let inv_collector = inv_collector.clone();
+                    let span = debug_span!("inventory_filter");
                     async move {
                         if let Ok(Message::Inv(hashes)) = &msg {
                             // We ignore inventory messages with more than one
-                            // item because they are most likely replies to a
-                            // query rather than a newly gossiped block.
+                            // block, because they are most likely replies to a
+                            // query, rather than a newly gossiped block.
+                            //
+                            // (We process inventory messages with any number of
+                            // transactions.)
                             //
                             // https://zebra.zfnd.org/dev/rfcs/0003-inventory-tracking.html#inventory-monitoring
-                            if hashes.len() == 1 {
-                                let hash = hashes[0];
-                                let _ = inv_collector.send((hash, addr));
+                            match hashes.as_slice() {
+                                [hash @ InventoryHash::Block(_)] => {
+                                    let _ = inv_collector.send((*hash, addr));
+                                }
+                                [hashes @ ..] => {
+                                    for hash in hashes {
+                                        if matches!(hash, InventoryHash::Tx(_)) {
+                                            debug!(?hash, "registering Tx inventory hash");
+                                            let _ = inv_collector.send((*hash, addr));
+                                        } else {
+                                            trace!(?hash, "ignoring non Tx inventory hash")
+                                        }
+                                    }
+                                }
                             }
                         }
                         msg
                     }
+                    .instrument(span)
                 })
                 .boxed();
 
