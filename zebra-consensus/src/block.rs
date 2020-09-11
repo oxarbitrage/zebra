@@ -9,6 +9,7 @@
 //! verification.
 
 mod check;
+mod subsidies;
 
 #[cfg(test)]
 mod tests;
@@ -109,6 +110,7 @@ where
             let now = Utc::now();
             block.header.is_time_valid_at(now)?;
             check::is_coinbase_first(&block)?;
+            check::is_subsidy_correct(&block)?;
 
             // TODO:
             //   - context-free header verification: merkle root
