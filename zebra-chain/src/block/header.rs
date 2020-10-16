@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
+use thiserror::Error;
 
 use crate::work::{difficulty::CompactDifficulty, equihash::Solution};
 
-use super::{merkle, Error, Hash};
+use super::{merkle, Hash, Height};
 
 /// A block header, containing metadata about a block.
 ///
@@ -67,17 +68,41 @@ pub struct Header {
     pub solution: Solution,
 }
 
+/// TODO: Use this error as the source for zebra_consensus::error::BlockError::Time,
+/// and make `BlockError::Time` add additional context.
+/// See https://github.com/ZcashFoundation/zebra/issues/1021 for more details.
+#[derive(Error, Debug)]
+pub enum BlockTimeError {
+    #[error("invalid time {0:?} in block header {1:?} {2:?}: block time is more than 2 hours in the future ({3:?}). Hint: check your machine's date, time, and time zone.")]
+    InvalidBlockTime(
+        DateTime<Utc>,
+        crate::block::Height,
+        crate::block::Hash,
+        DateTime<Utc>,
+    ),
+}
+
 impl Header {
-    /// TODO Inline this function in zebra_consensus::block::check see
-    /// https://github.com/ZcashFoundation/zebra/issues/1021 for more details
-    pub fn is_time_valid_at(&self, now: DateTime<Utc>) -> Result<(), Error> {
+    /// TODO: Inline this function into zebra_consensus::block::check::time_is_valid_at.
+    /// See https://github.com/ZcashFoundation/zebra/issues/1021 for more details.
+    pub fn time_is_valid_at(
+        &self,
+        now: DateTime<Utc>,
+        height: &Height,
+        hash: &Hash,
+    ) -> Result<(), BlockTimeError> {
         let two_hours_in_the_future = now
             .checked_add_signed(Duration::hours(2))
-            .ok_or("overflow when calculating 2 hours in the future")?;
+            .expect("calculating 2 hours in the future does not overflow");
         if self.time <= two_hours_in_the_future {
             Ok(())
         } else {
-            Err("block header time is more than 2 hours in the future".into())
+            Err(BlockTimeError::InvalidBlockTime(
+                self.time,
+                *height,
+                *hash,
+                two_hours_in_the_future,
+            ))?
         }
     }
 }

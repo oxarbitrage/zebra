@@ -11,9 +11,9 @@ use tracing_futures::Instrument;
 
 use zebra_chain::{
     block::{self, Block},
-    parameters::Network,
+    parameters::{genesis_hash, Network},
 };
-use zebra_consensus::{checkpoint, parameters};
+use zebra_consensus::checkpoint;
 use zebra_network as zn;
 use zebra_state as zs;
 
@@ -128,6 +128,12 @@ where
     genesis_hash: block::Hash,
 }
 
+/// Polls the network to determine whether further blocks are available and
+/// downloads them.
+///
+/// This component is used for initial block sync, but the `Inbound` service is
+/// responsible for participating in the gossip protocols used for block
+/// diffusion.
 impl<ZN, ZS, ZV> ChainSync<ZN, ZS, ZV>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = Error> + Send + Clone + 'static,
@@ -156,7 +162,7 @@ where
             verifier,
             prospective_tips: HashSet::new(),
             pending_blocks: Box::pin(FuturesUnordered::new()),
-            genesis_hash: parameters::genesis_hash(chain),
+            genesis_hash: genesis_hash(chain),
         }
     }
 
@@ -312,12 +318,10 @@ where
             .ready_and()
             .await
             .map_err(|e| eyre!(e))?
-            .call(zebra_state::Request::GetBlockLocator {
-                genesis: self.genesis_hash,
-            })
+            .call(zebra_state::Request::BlockLocator)
             .await
             .map(|response| match response {
-                zebra_state::Response::BlockLocator { block_locator } => block_locator,
+                zebra_state::Response::BlockLocator(block_locator) => block_locator,
                 _ => unreachable!(
                     "GetBlockLocator request can only result in Response::BlockLocator"
                 ),
@@ -608,7 +612,7 @@ where
             tracing::trace!(?hash, "requested block");
 
             // This span is used to help diagnose sync warnings
-            let span = tracing::warn_span!("block_fetch_verify", ?hash);
+            let span = tracing::warn_span!("block_fetch_verify", %hash);
             let mut verifier = self.verifier.clone();
             let task = tokio::spawn(
                 async move {
@@ -654,7 +658,7 @@ where
             .ready_and()
             .await
             .map_err(|e| eyre!(e))?
-            .call(zebra_state::Request::GetDepth { hash })
+            .call(zebra_state::Request::Depth(hash))
             .await
             .map_err(|e| eyre!(e))?
         {

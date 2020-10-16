@@ -11,15 +11,16 @@
 //! the actual work represented by the block header hash.
 #![allow(clippy::unit_arg)]
 
-use crate::block;
+use crate::{block, parameters::Network};
 
 use std::cmp::{Ordering, PartialEq, PartialOrd};
 use std::{fmt, ops::Add, ops::AddAssign};
 
 use primitive_types::U256;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
+
 #[cfg(test)]
 mod tests;
 
@@ -52,7 +53,7 @@ mod tests;
 /// multiple equivalent `CompactDifficulty` values, due to redundancy in the
 /// floating-point format.
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct CompactDifficulty(pub u32);
 
 impl fmt::Debug for CompactDifficulty {
@@ -212,7 +213,7 @@ impl CompactDifficulty {
             // zcashd rejects zero values, without comparing the hash
             None
         } else {
-            Some(ExpandedDifficulty(result))
+            Some(result.into())
         }
     }
 
@@ -235,10 +236,10 @@ impl CompactDifficulty {
         // `((2^256 - expanded - 1) / (expanded + 1)) + 1`, or
         let result = (!expanded.0 / (expanded.0 + 1)) + 1;
         if result <= u128::MAX.into() {
-            return Some(Work(result.as_u128()));
+            Work(result.as_u128()).into()
+        } else {
+            None
         }
-
-        None
     }
 }
 
@@ -255,7 +256,27 @@ impl ExpandedDifficulty {
     /// Hashes are not used to calculate the difficulties of future blocks, so
     /// users of this module should avoid converting hashes into difficulties.
     fn from_hash(hash: &block::Hash) -> ExpandedDifficulty {
-        ExpandedDifficulty(U256::from_little_endian(&hash.0))
+        U256::from_little_endian(&hash.0).into()
+    }
+
+    /// Returns the easiest target difficulty allowed on `network`.
+    ///
+    /// See `PoWLimit` in the Zcash specification.
+    pub fn target_difficulty_limit(network: Network) -> ExpandedDifficulty {
+        let limit: U256 = match network {
+            /* 2^243 - 1 */
+            Network::Mainnet => (U256::one() << 243) - 1,
+            /* 2^251 - 1 */
+            Network::Testnet => (U256::one() << 251) - 1,
+        };
+
+        limit.into()
+    }
+}
+
+impl From<U256> for ExpandedDifficulty {
+    fn from(value: U256) -> Self {
+        ExpandedDifficulty(value)
     }
 }
 
@@ -271,6 +292,9 @@ impl PartialEq<block::Hash> for ExpandedDifficulty {
 impl PartialOrd<block::Hash> for ExpandedDifficulty {
     /// `block::Hash`es are compared with `ExpandedDifficulty` thresholds by
     /// converting the hash to a 256-bit integer in little-endian order.
+    ///
+    /// Greater values represent *less* work. This matches the convention in
+    /// zcashd and bitcoin.
     fn partial_cmp(&self, other: &block::Hash) -> Option<Ordering> {
         self.partial_cmp(&ExpandedDifficulty::from_hash(other))
     }
@@ -292,14 +316,15 @@ impl PartialOrd<ExpandedDifficulty> for block::Hash {
         use Ordering::*;
 
         // Use the base implementation, but reverse the order.
-        match other.partial_cmp(self) {
-            Some(Less) => Some(Greater),
-            Some(Greater) => Some(Less),
-            Some(Equal) => Some(Equal),
-            None => unreachable!(
-                "Unexpected incomparable values: difficulties and hashes have a total order."
-            ),
+        match other
+            .partial_cmp(self)
+            .expect("difficulties and hashes have a total order")
+        {
+            Less => Greater,
+            Greater => Less,
+            Equal => Equal,
         }
+        .into()
     }
 }
 
@@ -318,5 +343,46 @@ impl Add for Work {
 impl AddAssign for Work {
     fn add_assign(&mut self, rhs: Work) {
         *self = *self + rhs;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// Partial work used to track relative work in non-finalized chains
+pub struct PartialCumulativeWork(u128);
+
+impl std::ops::Add<Work> for PartialCumulativeWork {
+    type Output = PartialCumulativeWork;
+
+    fn add(self, rhs: Work) -> Self::Output {
+        let result = self
+            .0
+            .checked_add(rhs.0)
+            .expect("Work values do not overflow");
+
+        PartialCumulativeWork(result)
+    }
+}
+
+impl std::ops::AddAssign<Work> for PartialCumulativeWork {
+    fn add_assign(&mut self, rhs: Work) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::ops::Sub<Work> for PartialCumulativeWork {
+    type Output = PartialCumulativeWork;
+
+    fn sub(self, rhs: Work) -> Self::Output {
+        let result = self.0
+            .checked_sub(rhs.0)
+            .expect("PartialCumulativeWork values do not underflow: all subtracted Work values must have been previously added to the PartialCumulativeWork");
+
+        PartialCumulativeWork(result)
+    }
+}
+
+impl std::ops::SubAssign<Work> for PartialCumulativeWork {
+    fn sub_assign(&mut self, rhs: Work) {
+        *self = *self - rhs;
     }
 }

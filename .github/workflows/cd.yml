@@ -12,6 +12,7 @@ env:
 jobs:
   build:
     name: Google Cloud / Test, Build, and Deploy
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
 

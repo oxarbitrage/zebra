@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Cursor, Write};
 
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
@@ -57,21 +58,64 @@ fn deserialize_blockheader() {
 
 #[test]
 fn deserialize_block() {
-    zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into::<Block>()
-        .expect("block test vector should deserialize");
-    zebra_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into::<Block>()
-        .expect("block test vector should deserialize");
-    // https://explorer.zcha.in/blocks/415000
-    zebra_test::vectors::BLOCK_MAINNET_415000_BYTES
-        .zcash_deserialize_into::<Block>()
-        .expect("block test vector should deserialize");
-    // https://explorer.zcha.in/blocks/434873
     // this one has a bad version field
     zebra_test::vectors::BLOCK_MAINNET_434873_BYTES
         .zcash_deserialize_into::<Block>()
         .expect("block test vector should deserialize");
+
+    for block in zebra_test::vectors::BLOCKS.iter() {
+        block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+    }
+}
+
+#[test]
+fn block_test_vectors_unique() {
+    let block_count = zebra_test::vectors::BLOCKS.len();
+    let block_hashes: HashSet<_> = zebra_test::vectors::BLOCKS
+        .iter()
+        .map(|b| {
+            b.zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid")
+                .hash()
+        })
+        .collect();
+
+    // putting the same block in two files is an easy mistake to make
+    assert_eq!(
+        block_count,
+        block_hashes.len(),
+        "block test vectors must be unique"
+    );
+}
+
+#[test]
+fn block_test_vectors_height_mainnet() {
+    block_test_vectors_height(Network::Mainnet);
+}
+
+#[test]
+fn block_test_vectors_height_testnet() {
+    block_test_vectors_height(Network::Testnet);
+}
+
+fn block_test_vectors_height(network: Network) {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (&height, block) in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+        assert_eq!(
+            block.coinbase_height().expect("block height is valid").0,
+            height,
+            "deserialized height must match BTreeMap key height"
+        );
+    }
 }
 
 #[test]
@@ -142,14 +186,18 @@ fn block_limits_single_tx() {
     Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
 }
 
-/// Test wrapper for `BlockHeader.is_time_valid_at`.
+/// Test wrapper for `BlockHeader.time_is_valid_at`.
 ///
 /// Generates a block header, sets its `time` to `block_header_time`, then
-/// calls `is_time_valid_at`.
-fn node_time_check(block_header_time: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), Error> {
+/// calls `time_is_valid_at`.
+fn node_time_check(
+    block_header_time: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), BlockTimeError> {
     let mut header = generate::block_header();
     header.time = block_header_time;
-    header.is_time_valid_at(now)
+    // pass a zero height and hash - they are only used in the returned error
+    header.time_is_valid_at(now, &Height(0), &Hash([0; 32]))
 }
 
 #[test]

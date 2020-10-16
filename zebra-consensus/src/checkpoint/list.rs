@@ -8,24 +8,19 @@
 #[cfg(test)]
 mod tests;
 
-use crate::parameters;
+use crate::BoxError;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    error,
     ops::RangeBounds,
     str::FromStr,
 };
 
 use zebra_chain::block;
-use zebra_chain::parameters::{Network, NetworkUpgrade, NetworkUpgrade::*};
+use zebra_chain::parameters::{genesis_hash, Network};
 
 const MAINNET_CHECKPOINTS: &str = include_str!("main-checkpoints.txt");
 const TESTNET_CHECKPOINTS: &str = include_str!("test-checkpoints.txt");
-
-/// The inner error type for CheckpointVerifier.
-// TODO(jlusby): Error = Report ?
-type Error = Box<dyn error::Error + Send + Sync + 'static>;
 
 /// A list of block height and hash checkpoints.
 ///
@@ -40,7 +35,7 @@ type Error = Box<dyn error::Error + Send + Sync + 'static>;
 pub(crate) struct CheckpointList(BTreeMap<block::Height, block::Hash>);
 
 impl FromStr for CheckpointList {
-    type Err = Error;
+    type Err = BoxError;
 
     /// Parse a string into a CheckpointList.
     ///
@@ -78,48 +73,11 @@ impl CheckpointList {
         };
 
         match checkpoint_list.hash(block::Height(0)) {
-            Some(hash) if hash == parameters::genesis_hash(network) => checkpoint_list,
+            Some(hash) if hash == genesis_hash(network) => checkpoint_list,
             Some(_) => {
                 panic!("The hard-coded genesis checkpoint does not match the network genesis hash")
             }
             None => unreachable!("Parser should have checked for a missing genesis checkpoint"),
-        }
-    }
-
-    /// Returns the hard-coded checkpoint list for `network`, up to and
-    /// including the first checkpoint after the activation of the `limit`
-    /// network upgrade.
-    pub fn new_up_to(network: Network, limit: NetworkUpgrade) -> Self {
-        let full_list = Self::new(network);
-
-        match limit {
-            Genesis | BeforeOverwinter | Overwinter => unreachable!("Caller passed a pre-Sapling network upgrade: Zebra must checkpoint up to Sapling activation"),
-            _ => {},
-        };
-
-        let activation = match limit.activation_height(network) {
-            Some(height) => height,
-            // If it's a future upgrade, it can't possibly limit our past checkpoints
-            None => return full_list,
-        };
-
-        let last_checkpoint = match full_list.min_height_in_range(activation..) {
-            Some(height) => height,
-            // If the full list has no checkpoints after limit, then all checkpoints
-            // are already under the limit
-            None => return full_list,
-        };
-
-        let limited_list = full_list
-            .0
-            .range(..=last_checkpoint)
-            .map(|(hash, height)| (*hash, *height));
-
-        match Self::from_list(limited_list) {
-            Ok(list) => list,
-            Err(_) => unreachable!(
-                "Unexpected invalid list: a non-empty prefix of a valid list should also be valid"
-            ),
         }
     }
 
@@ -132,7 +90,7 @@ impl CheckpointList {
     /// (All other checkpoints are optional.)
     pub(crate) fn from_list(
         list: impl IntoIterator<Item = (block::Height, block::Hash)>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, BoxError> {
         // BTreeMap silently ignores duplicates, so we count the checkpoints
         // before adding them to the map
         let original_checkpoints: Vec<(block::Height, block::Hash)> = list.into_iter().collect();
@@ -144,8 +102,8 @@ impl CheckpointList {
         // Check that the list starts with the correct genesis block
         match checkpoints.iter().next() {
             Some((block::Height(0), hash))
-                if (hash == &parameters::genesis_hash(Network::Mainnet)
-                    || hash == &parameters::genesis_hash(Network::Testnet)) => {}
+                if (hash == &genesis_hash(Network::Mainnet)
+                    || hash == &genesis_hash(Network::Testnet)) => {}
             Some((block::Height(0), _)) => {
                 Err("the genesis checkpoint does not match the Mainnet or Testnet genesis hash")?
             }
