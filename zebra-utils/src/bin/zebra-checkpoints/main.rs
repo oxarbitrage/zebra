@@ -24,29 +24,11 @@ use std::os::unix::process::ExitStatusExt;
 
 mod args;
 
-/// Returns the hexadecimal-encoded string `s` in byte-reversed order.
-pub fn byte_reverse_hex(s: &str) -> String {
-    String::from_utf8(
-        s.as_bytes()
-            .chunks(2)
-            .rev()
-            .map(|c| c.iter())
-            .flatten()
-            .cloned()
-            .collect::<Vec<u8>>(),
-    )
-    .expect("input should be ascii")
-}
-
 /// We limit the memory usage for each checkpoint, based on the cumulative size of
-/// the serialized blocks in the chain. Deserialized blocks are larger, because
-/// they contain pointers and non-compact integers. But they should be within a
-/// constant factor of the serialized size.
-const MAX_CHECKPOINT_BYTE_COUNT: u64 = 256 * 1024 * 1024;
-
-/// Checkpoints must be on the main chain, so we skip blocks that are within the
-/// zcashd reorg limit.
-const BLOCK_REORG_LIMIT: block::Height = block::Height(100);
+/// the serialized blocks in the chain. Deserialized blocks are slightly larger
+/// than serialized blocks, but they should be within a constant factor of the
+/// serialized size.
+const MAX_CHECKPOINT_BYTE_COUNT: u64 = 32 * 1024 * 1024;
 
 /// Initialise tracing using its defaults.
 fn init_tracing() {
@@ -103,9 +85,11 @@ fn main() -> Result<()> {
     // calculate the maximum height
     let height_limit: block::Height = cmd_output(&mut cmd)?.trim().parse()?;
     assert!(height_limit <= block::Height::MAX);
+    // Checkpoints must be on the main chain, so we skip blocks that are within the
+    // Zcash reorg limit.
     let height_limit = height_limit
         .0
-        .checked_sub(BLOCK_REORG_LIMIT.0)
+        .checked_sub(zebra_state::MAX_BLOCK_REORG_HEIGHT)
         .map(block::Height)
         .expect("zcashd has some mature blocks: wait for zcashd to sync more blocks");
 
@@ -139,7 +123,7 @@ fn main() -> Result<()> {
         let v: Value = serde_json::from_str(&output)?;
 
         // get the values we are interested in
-        let hash: block::Hash = v["hash"].as_str().map(byte_reverse_hex).unwrap().parse()?;
+        let hash: block::Hash = v["hash"].as_str().unwrap().parse()?;
         let height = block::Height(v["height"].as_u64().unwrap() as u32);
         assert!(height <= block::Height::MAX);
         assert_eq!(x, height.0);
@@ -152,10 +136,10 @@ fn main() -> Result<()> {
         // check if checkpoint
         if height == block::Height(0)
             || cumulative_bytes >= MAX_CHECKPOINT_BYTE_COUNT
-            || height_gap.0 >= zebra_consensus::checkpoint::MAX_CHECKPOINT_HEIGHT_GAP as u32
+            || height_gap.0 >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP as u32
         {
             // print to output
-            println!("{} {}", height.0, &hex::encode(hash.0),);
+            println!("{} {}", height.0, hash);
 
             // reset counters
             cumulative_bytes = 0;

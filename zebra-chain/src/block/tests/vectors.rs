@@ -19,7 +19,7 @@ fn blockheaderhash_debug() {
 
     assert_eq!(
         format!("{:?}", hash),
-        "block::Hash(\"bf46b4b5030752fedac6f884976162bbfb29a9398f104a280b3e34d51b416631\")"
+        "block::Hash(\"3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf\")"
     );
 }
 
@@ -31,7 +31,7 @@ fn blockheaderhash_from_blockheader() {
 
     assert_eq!(
         format!("{:?}", hash),
-        "block::Hash(\"39c92b8c6b582797830827c78d58674c7205fcb21991887c124d1dbe4b97d6d1\")"
+        "block::Hash(\"d1d6974bbe1d4d127c889119b2fc05724c67588dc72708839727586b8c2bc939\")"
     );
 
     let mut bytes = Cursor::new(Vec::new());
@@ -50,10 +50,21 @@ fn blockheaderhash_from_blockheader() {
 
 #[test]
 fn deserialize_blockheader() {
-    // https://explorer.zcha.in/blocks/415000
-    let _header = zebra_test::vectors::HEADER_MAINNET_415000_BYTES
-        .zcash_deserialize_into::<Header>()
-        .expect("blockheader test vector should deserialize");
+    zebra_test::init();
+
+    // Includes the 32-byte nonce and 3-byte equihash length field.
+    const BLOCK_HEADER_LENGTH: usize = crate::work::equihash::Solution::INPUT_LENGTH
+        + 32
+        + 3
+        + crate::work::equihash::SOLUTION_SIZE;
+
+    for block in zebra_test::vectors::BLOCKS.iter() {
+        let header_bytes = &block[..BLOCK_HEADER_LENGTH];
+
+        let _header = header_bytes
+            .zcash_deserialize_into::<Header>()
+            .expect("blockheader test vector should deserialize");
+    }
 }
 
 #[test]

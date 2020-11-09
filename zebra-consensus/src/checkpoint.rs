@@ -1,17 +1,17 @@
-//! Checkpoint-based block verification for Zebra.
+//! Checkpoint-based block verification.
 //!
-//! Checkpoint-based verification uses a list of checkpoint hashes to speed up the
-//! initial chain sync for Zebra. This list is distributed with Zebra.
+//! Checkpoint-based verification uses a list of checkpoint hashes to
+//! speed up the initial chain sync for Zebra. This list is distributed
+//! with Zebra.
 //!
-//! The CheckpointVerifier queues pending blocks. Once there is a chain from the
-//! previous checkpoint to a target checkpoint, it verifies all the blocks in
-//! that chain.
+//! The checkpoint verifier queues pending blocks.  Once there is a
+//! chain from the previous checkpoint to a target checkpoint, it
+//! verifies all the blocks in that chain, and sends accepted blocks to
+//! the state service as finalized chain state, skipping contextual
+//! verification checks.
 //!
-//! Verification starts at the first checkpoint, which is the genesis block for the
-//! configured network.
-//!
-//! Verification is provided via a `tower::Service`, to support backpressure and batch
-//! verification.
+//! Verification starts at the first checkpoint, which is the genesis
+//! block for the configured network.
 
 use std::{
     collections::BTreeMap,
@@ -79,7 +79,14 @@ pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 
 /// We limit the maximum number of blocks in each checkpoint. Each block uses a
 /// constant amount of memory for the supporting data structures and futures.
-pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 2_000;
+///
+/// We choose a checkpoint gap that allows us to verify one checkpoint for
+/// every `ObtainTips` or `ExtendTips` response.
+///
+/// `zcashd`'s maximum `FindBlocks` response size is 500 hashes. `zebrad` uses
+/// 1 hash to verify the tip, and discards 1-2 hashes to work around `zcashd`
+/// bugs. So the most efficient gap is slightly less than 500 blocks.
+pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 400;
 
 /// A checkpointing block verifier.
 ///
@@ -143,6 +150,7 @@ where
     /// than constructing multiple verification services for the same network. To
     /// clone a CheckpointVerifier, you might need to wrap it in a
     /// `tower::Buffer` service.
+    #[allow(dead_code)]
     pub fn new(
         network: Network,
         initial_tip: Option<(block::Height, block::Hash)>,
@@ -202,7 +210,8 @@ where
                 if height >= checkpoint_list.max_height() {
                     (None, Progress::FinalCheckpoint)
                 } else {
-                    metrics::gauge!("checkpoint.previous.height", height.0 as i64);
+                    metrics::gauge!("checkpoint.verified.height", height.0 as i64);
+                    metrics::gauge!("checkpoint.processing.next.height", height.0 as i64);
                     (Some(hash), Progress::InitialTip(height))
                 }
             }
@@ -255,7 +264,7 @@ where
     /// If verification has finished, returns `FinishedVerifying`.
     fn target_checkpoint_height(&self) -> Target<block::Height> {
         // Find the height we want to start searching at
-        let mut pending_height = match self.previous_checkpoint_height() {
+        let start_height = match self.previous_checkpoint_height() {
             // Check if we have the genesis block as a special case, to simplify the loop
             BeforeGenesis if !self.queued.contains_key(&block::Height(0)) => {
                 tracing::trace!("Waiting for genesis block");
@@ -279,6 +288,7 @@ where
         //
         // But at the moment, this implementation is slightly faster, because
         // it stops after the first gap.
+        let mut pending_height = start_height;
         for (&height, _) in self.queued.range((Excluded(pending_height), Unbounded)) {
             // If the queued blocks are continuous.
             if height == block::Height(pending_height.0 + 1) {
@@ -290,10 +300,13 @@ where
                                 next_height = ?height,
                                 ?gap,
                                 "Waiting for more checkpoint blocks");
-                metrics::gauge!("checkpoint.contiguous.height", pending_height.0 as i64);
                 break;
             }
         }
+        metrics::gauge!(
+            "checkpoint.queued.continuous.height",
+            pending_height.0 as i64
+        );
 
         // Now find the start of the checkpoint range
         let start = self.current_start_bound().expect(
@@ -312,8 +325,13 @@ where
         );
 
         if let Some(block::Height(target_checkpoint)) = target_checkpoint {
-            metrics::gauge!("checkpoint.target.height", target_checkpoint as i64);
+            metrics::gauge!(
+                "checkpoint.processing.next.height",
+                target_checkpoint as i64
+            );
         } else {
+            // Use the start height if there is no potential next checkpoint
+            metrics::gauge!("checkpoint.processing.next.height", start_height.0 as i64);
             metrics::counter!("checkpoint.waiting.count", 1);
         }
 
@@ -351,7 +369,10 @@ where
     ///  - verification has finished
     fn check_height(&self, height: block::Height) -> Result<(), VerifyCheckpointError> {
         if height > self.checkpoint_list.max_height() {
-            Err(VerifyCheckpointError::TooHigh)?;
+            Err(VerifyCheckpointError::TooHigh {
+                height,
+                max_height: self.checkpoint_list.max_height(),
+            })?;
         }
 
         match self.previous_checkpoint_height() {
@@ -361,7 +382,13 @@ where
             InitialTip(previous_height) | PreviousCheckpoint(previous_height)
                 if (height <= previous_height) =>
             {
-                Err(VerifyCheckpointError::Duplicate { height })?
+                let e = Err(VerifyCheckpointError::AlreadyVerified {
+                    height,
+                    verified_height: previous_height,
+                });
+                // TODO: reduce to trace level once the AlreadyVerified bug is fixed
+                tracing::info!(?e);
+                e?;
             }
             InitialTip(_) | PreviousCheckpoint(_) => {}
             // We're finished, so no checkpoint height is valid
@@ -386,10 +413,10 @@ where
 
         // Ignore heights that aren't checkpoint heights
         if verified_height == self.checkpoint_list.max_height() {
-            metrics::gauge!("checkpoint.previous.height", verified_height.0 as i64);
+            metrics::gauge!("checkpoint.verified.height", verified_height.0 as i64);
             self.verifier_progress = FinalCheckpoint;
         } else if self.checkpoint_list.contains(verified_height) {
-            metrics::gauge!("checkpoint.previous.height", verified_height.0 as i64);
+            metrics::gauge!("checkpoint.verified.height", verified_height.0 as i64);
             self.verifier_progress = PreviousCheckpoint(verified_height);
             // We're done with the initial tip hash now
             self.initial_tip_hash = None;
@@ -403,7 +430,7 @@ where
     fn check_block(&self, block: &Block) -> Result<block::Height, VerifyCheckpointError> {
         let block_height = block
             .coinbase_height()
-            .ok_or(VerifyCheckpointError::CoinbaseHeight)?;
+            .ok_or(VerifyCheckpointError::CoinbaseHeight { hash: block.hash() })?;
         self.check_height(block_height)?;
         Ok(block_height)
     }
@@ -450,7 +477,7 @@ where
         for qb in qblocks.iter_mut() {
             if qb.hash == hash {
                 let old_tx = std::mem::replace(&mut qb.tx, tx);
-                let e = VerifyCheckpointError::NewerRequest;
+                let e = VerifyCheckpointError::NewerRequest { height, hash };
                 tracing::trace!(?e);
                 let _ = old_tx.send(Err(e));
                 return rx;
@@ -471,16 +498,17 @@ where
         qblocks.reserve_exact(1);
         qblocks.push(new_qblock);
 
-        let is_checkpoint = self.checkpoint_list.contains(height);
-        tracing::trace!(?height, ?hash, ?is_checkpoint, "Queued block");
+        metrics::gauge!(
+            "checkpoint.queued.max.height",
+            self.queued
+                .keys()
+                .next_back()
+                .expect("queued has at least one entry")
+                .0 as i64
+        );
 
-        // TODO(teor):
-        //   - Remove this log once the CheckpointVerifier is working?
-        //   - Modify the default filter or add another log, so users see
-        //     regular download progress info (vs verification info)
-        if is_checkpoint {
-            tracing::info!(?height, ?hash, ?is_checkpoint, "Queued checkpoint block");
-        }
+        let is_checkpoint = self.checkpoint_list.contains(height);
+        tracing::debug!(?height, ?hash, ?is_checkpoint, "queued block");
 
         rx
     }
@@ -516,9 +544,9 @@ where
         // Find a queued block at this height, which is part of the hash chain.
         //
         // There are two possible outcomes here:
-        //   - at least one block matches the chain (the common case)
-        //     (if there are duplicate blocks, one succeeds, and the others fail)
+        //   - one of the blocks matches the chain (the common case)
         //   - no blocks match the chain, verification has failed for this range
+        // If there are any side-chain blocks, they fail validation.
         let mut valid_qblock = None;
         for qblock in qblocks.drain(..) {
             if qblock.hash == expected_hash {
@@ -526,21 +554,18 @@ where
                     // The first valid block at the current height
                     valid_qblock = Some(qblock);
                 } else {
-                    tracing::info!(?height, ?qblock.hash, ?expected_hash,
-                                   "Duplicate block at height in CheckpointVerifier");
-                    // Reject duplicate blocks at the same height
-                    let _ = qblock
-                        .tx
-                        .send(Err(VerifyCheckpointError::Duplicate { height }));
+                    unreachable!("unexpected duplicate block {:?} {:?}: duplicate blocks should be rejected before being queued",
+                                 height, qblock.hash);
                 }
             } else {
                 tracing::info!(?height, ?qblock.hash, ?expected_hash,
-                               "Bad block hash at height in CheckpointVerifier");
-                // A bad block, that isn't part of the chain.
-                let _ = qblock.tx.send(Err(VerifyCheckpointError::UnexpectedHash {
-                    found: qblock.hash,
-                    expected: expected_hash,
-                }));
+                               "Side chain hash at height in CheckpointVerifier");
+                let _ = qblock
+                    .tx
+                    .send(Err(VerifyCheckpointError::UnexpectedSideChain {
+                        found: qblock.hash,
+                        expected: expected_hash,
+                    }));
             }
         }
 
@@ -669,10 +694,6 @@ where
 
         let block_count = rev_valid_blocks.len();
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
-        metrics::gauge!(
-            "checkpoint.verified.block.height",
-            target_checkpoint_height.0 as _
-        );
         metrics::counter!("checkpoint.verified.block.count", block_count as _);
 
         // All the blocks we've kept are valid, so let's verify them
@@ -745,14 +766,23 @@ where
 pub enum VerifyCheckpointError {
     #[error("checkpoint request after checkpointing finished")]
     Finished,
-    #[error("block is higher than the maximum checkpoint")]
-    TooHigh,
-    #[error("block at {height:?} has already been verified")]
-    Duplicate { height: block::Height },
-    #[error("rejected older of duplicate verification requests")]
-    NewerRequest,
-    #[error("the block does not have a coinbase height")]
-    CoinbaseHeight,
+    #[error("block at {height:?} is higher than the maximum checkpoint {max_height:?}")]
+    TooHigh {
+        height: block::Height,
+        max_height: block::Height,
+    },
+    #[error("block {height:?} is less than or equal to the verified tip {verified_height:?}")]
+    AlreadyVerified {
+        height: block::Height,
+        verified_height: block::Height,
+    },
+    #[error("rejected older of duplicate verification requests for block at {height:?} {hash:?}")]
+    NewerRequest {
+        height: block::Height,
+        hash: block::Hash,
+    },
+    #[error("the block {hash:?} does not have a coinbase height")]
+    CoinbaseHeight { hash: block::Hash },
     #[error("checkpoint verifier was dropped")]
     Dropped,
     #[error(transparent)]
@@ -762,7 +792,7 @@ pub enum VerifyCheckpointError {
     #[error("too many queued blocks at this height")]
     QueuedLimit,
     #[error("the block hash does not match the chained checkpoint hash, expected {expected:?} found {found:?}")]
-    UnexpectedHash {
+    UnexpectedSideChain {
         expected: block::Hash,
         found: block::Hash,
     },
@@ -785,7 +815,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[instrument(name = "checkpoint_call", skip(self, block))]
+    #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {

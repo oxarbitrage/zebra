@@ -27,7 +27,16 @@ pub struct Config {
     /// | Other   | `std::env::current_dir()/cache`                 |                                    |
     pub cache_dir: PathBuf,
 
-    /// The maximum number of bytes to use caching data in memory.
+    /// Controls the size of the database cache, in bytes.
+    ///
+    /// This corresponds to `sled`'s [`cache_capacity`][cc] parameter.
+    /// Note that the behavior of this parameter is [somewhat
+    /// unintuitive][gh], measuring the on-disk size of the cached data,
+    /// not the in-memory size, which may be much larger, especially for
+    /// smaller keys and values.
+    ///
+    /// [cc]: https://docs.rs/sled/0.34.4/sled/struct.Config.html#method.cache_capacity
+    /// [gh]: https://github.com/spacejam/sled/issues/986#issuecomment-592950100
     pub memory_cache_bytes: u64,
 
     /// Whether to use an ephemeral database.
@@ -38,6 +47,11 @@ pub struct Config {
     ///
     /// [`cache_dir`]: struct.Config.html#structfield.cache_dir
     pub ephemeral: bool,
+
+    /// Commit blocks to the finalized state up to this height, then exit Zebra.
+    ///
+    /// If `None`, continue syncing indefinitely.
+    pub debug_stop_at_height: Option<u32>,
 }
 
 impl Config {
@@ -56,7 +70,12 @@ impl Config {
         if self.ephemeral {
             config.temporary(self.ephemeral)
         } else {
-            let path = self.cache_dir.join(net_dir).join("state");
+            let path = self
+                .cache_dir
+                .join("state")
+                .join(format!("v{}", crate::constants::SLED_FORMAT_VERSION))
+                .join(net_dir);
+
             config.path(path)
         }
     }
@@ -77,8 +96,9 @@ impl Default for Config {
 
         Self {
             cache_dir,
-            memory_cache_bytes: 512 * 1024 * 1024,
+            memory_cache_bytes: 50_000_000,
             ephemeral: false,
+            debug_stop_at_height: None,
         }
     }
 }

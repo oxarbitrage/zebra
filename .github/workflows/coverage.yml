@@ -20,10 +20,13 @@ jobs:
         with:
           toolchain: stable
           override: true
+      - name: Skip network tests on Ubuntu
+        # Ubuntu runners don't have network or DNS configured during test steps
+        run: echo "ZEBRA_SKIP_NETWORK_TESTS=1" >> $GITHUB_ENV
       - name: Run cargo-tarpaulin
         uses: actions-rs/tarpaulin@v0.1
         with:
           version: 'latest'
           timeout: 600
       - name: Upload coverage report to Codecov
-        uses: codecov/codecov-action@v1.0.13
+        uses: codecov/codecov-action@v1.0.14

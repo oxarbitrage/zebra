@@ -15,7 +15,7 @@ use zebra_chain::{
     block::{self, Block, Height},
     parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    work::difficulty::{CompactDifficulty, ExpandedDifficulty},
+    work::difficulty::{ExpandedDifficulty, INVALID_COMPACT_DIFFICULTY},
 };
 use zebra_test::transcript::{TransError, Transcript};
 
@@ -114,7 +114,10 @@ async fn check_transcripts() -> Result<(), Report> {
     zebra_test::init();
 
     let network = Network::Mainnet;
-    let state_service = zebra_state::init(zebra_state::Config::ephemeral(), network);
+    let state_service = Buffer::new(
+        zebra_state::init(zebra_state::Config::ephemeral(), network),
+        1,
+    );
 
     let block_verifier = Buffer::new(BlockVerifier::new(network, state_service.clone()), 1);
 
@@ -185,7 +188,7 @@ fn difficulty_validation_failure() -> Result<(), Report> {
     let hash = block.hash();
 
     // Set the difficulty field to an invalid value
-    block.header.difficulty_threshold = CompactDifficulty(u32::MAX);
+    block.header.difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
 
     // Validate the block
     let result =
@@ -357,12 +360,7 @@ fn founders_reward_validation_failure() -> Result<(), Report> {
 
     let network = Network::Mainnet;
 
-    // Get a header from a block in the mainnet that is inside the founders reward period.
-    let header =
-        block::Header::zcash_deserialize(&zebra_test::vectors::HEADER_MAINNET_415000_BYTES[..])
-            .unwrap();
-
-    // From the same block get the coinbase transaction
+    // Get a block in the mainnet that is inside the founders reward period.
     let block =
         Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_415000_BYTES[..])
             .expect("block should deserialize");
@@ -384,7 +382,7 @@ fn founders_reward_validation_failure() -> Result<(), Report> {
     let mut transactions: Vec<Arc<zebra_chain::transaction::Transaction>> = Vec::new();
     transactions.push(Arc::new(tx));
     let block = Block {
-        header,
+        header: block.header,
         transactions,
     };
 

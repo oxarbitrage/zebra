@@ -1,35 +1,6 @@
-use std::ffi::OsStr;
-
-use zebra_chain::{block, parameters::Network};
+use zebra_chain::block;
 
 use super::*;
-
-#[test]
-fn test_path_mainnet() {
-    test_path(Network::Mainnet);
-}
-
-#[test]
-fn test_path_testnet() {
-    test_path(Network::Testnet);
-}
-
-/// Check the sled path for `network`.
-fn test_path(network: Network) {
-    zebra_test::init();
-
-    let config = Config::default();
-    // we can't do many useful tests on this value, because it depends on the
-    // local environment and OS.
-    let sled_config = config.sled_config(network);
-    let mut path = sled_config.get_path();
-    assert_eq!(path.file_name(), Some(OsStr::new("state")));
-    assert!(path.pop());
-    match network {
-        Network::Mainnet => assert_eq!(path.file_name(), Some(OsStr::new("mainnet"))),
-        Network::Testnet => assert_eq!(path.file_name(), Some(OsStr::new("testnet"))),
-    }
-}
 
 /// Block heights, and the expected minimum block locator height
 static BLOCK_LOCATOR_CASES: &[(u32, u32)] = &[
@@ -77,10 +48,10 @@ fn test_block_locator_heights() {
             block::Height(min_height),
             "locators must end with the specified final height"
         );
-        assert!(height - final_height.0 <= constants::MAX_BLOCK_REORG_HEIGHT.0,
+        assert!(height - final_height.0 <= constants::MAX_BLOCK_REORG_HEIGHT,
                     format!("locator for {} must not be more than the maximum reorg height {} below the tip, but {} is {} blocks below the tip",
                          height,
-                         constants::MAX_BLOCK_REORG_HEIGHT.0,
+                         constants::MAX_BLOCK_REORG_HEIGHT,
                          final_height.0,
                          height - final_height.0));
     }

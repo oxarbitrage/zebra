@@ -14,10 +14,13 @@ use tracing::{debug_span, instrument, trace};
 use zebra_chain::{
     block::{self, Block},
     primitives::Groth16Proof,
-    sapling, sprout, transaction, transparent,
+    sapling, sprout,
+    transaction::{self, Transaction},
+    transparent,
     work::difficulty::PartialCumulativeWork,
 };
 
+use crate::request::HashOrHeight;
 use crate::service::QueuedBlock;
 
 #[derive(Default, Clone)]
@@ -76,7 +79,7 @@ impl Chain {
             .expect("only called while blocks is populated")
     }
 
-    /// Fork a chain at the block with the givin hash, if it is part of this
+    /// Fork a chain at the block with the given hash, if it is part of this
     /// chain.
     pub fn fork(&self, fork_tip: block::Hash) -> Option<Self> {
         if !self.height_by_hash.contains_key(&fork_tip) {
@@ -490,15 +493,11 @@ impl NonFinalizedState {
     }
 
     /// Returns the length of the non-finalized portion of the current best chain.
-    pub fn best_chain_len(&self) -> block::Height {
-        block::Height(
-            self.chain_set
-                .iter()
-                .next_back()
-                .expect("only called after inserting a block")
-                .blocks
-                .len() as u32,
-        )
+    pub fn best_chain_len(&self) -> u32 {
+        self.best_chain()
+            .expect("only called after inserting a block")
+            .blocks
+            .len() as u32
     }
 
     /// Returns `true` if `hash` is contained in the non-finalized portion of any
@@ -546,6 +545,53 @@ impl NonFinalizedState {
         }
 
         None
+    }
+
+    /// Returns the `block` at a given height or hash in the best chain.
+    pub fn block(&self, hash_or_height: HashOrHeight) -> Option<Arc<Block>> {
+        let best_chain = self.best_chain()?;
+        let height =
+            hash_or_height.height_or_else(|hash| best_chain.height_by_hash.get(&hash).cloned())?;
+
+        best_chain.blocks.get(&height).cloned()
+    }
+
+    /// Returns the hash for a given `block::Height` if it is present in the best chain.
+    pub fn hash(&self, height: block::Height) -> Option<block::Hash> {
+        self.block(height.into()).map(|block| block.hash())
+    }
+
+    /// Returns the tip of the best chain.
+    pub fn tip(&self) -> Option<(block::Height, block::Hash)> {
+        let best_chain = self.best_chain()?;
+        let height = best_chain.non_finalized_tip_height();
+        let hash = best_chain.non_finalized_tip_hash();
+
+        Some((height, hash))
+    }
+
+    /// Returns the depth of `hash` in the best chain.
+    pub fn height(&self, hash: block::Hash) -> Option<block::Height> {
+        let best_chain = self.best_chain()?;
+        let height = *best_chain.height_by_hash.get(&hash)?;
+        Some(height)
+    }
+
+    /// Returns the given transaction if it exists in the best chain.
+    pub fn transaction(&self, hash: transaction::Hash) -> Option<Arc<Transaction>> {
+        let best_chain = self.best_chain()?;
+        best_chain.tx_by_hash.get(&hash).map(|(height, index)| {
+            let block = &best_chain.blocks[height];
+            block.transactions[*index].clone()
+        })
+    }
+
+    /// Return the non-finalized portion of the current best chain
+    fn best_chain(&self) -> Option<&Chain> {
+        self.chain_set
+            .iter()
+            .next_back()
+            .map(|box_chain| box_chain.deref())
     }
 }
 
@@ -640,6 +686,11 @@ impl QueuedBlocks {
                 .expect("parent is present")
                 .remove(&hash);
         }
+    }
+
+    /// Return the queued block if it has already been registered
+    pub fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut QueuedBlock> {
+        self.blocks.get_mut(&hash)
     }
 }
 

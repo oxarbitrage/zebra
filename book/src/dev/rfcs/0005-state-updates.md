@@ -39,9 +39,10 @@ state service.
 * **chain state**: The state of the ledger after application of a particular
   sequence of blocks (state transitions).
 
-* **difficulty**: The cumulative proof-of-work from genesis to the chain tip.
+* **cumulative difficulty**: The cumulative proof-of-work from genesis to the
+  chain tip.
 
-* **best chain**: The chain with the greatest difficulty. This chain
+* **best chain**: The chain with the greatest cumulative difficulty. This chain
   represents the consensus state of the Zcash network and transactions.
 
 * **side chain**: A chain which is not contained in the best chain.
@@ -430,7 +431,7 @@ Commit `block` to the non-finalized state.
 
 6. Insert `parent_chain` into `self.chain_set`
 
-### `pub(super) fn commit_new_chain(&mut self, block: Arc<Block>)`
+#### `pub(super) fn commit_new_chain(&mut self, block: Arc<Block>)`
 
 Construct a new chain starting with `block`.
 
@@ -526,38 +527,42 @@ The state service uses the following entry points:
 
 New `non-finalized` blocks are commited as follows:
 
-### `pub(super) fn queue_and_commit_non_finalized_blocks(&mut self, new: Arc<Block>) -> tokio::sync::broadcast::Receiver<block::Hash>`
+### `pub(super) fn queue_and_commit_non_finalized_blocks(&mut self, new: Arc<Block>) -> tokio::sync::oneshot::Receiver<block::Hash>`
 
-1. If a duplicate block exists in the queue:
-     - Find the `QueuedBlock` for that existing duplicate block
-     - Create an extra receiver for the existing block, using `block.rsp_tx.subscribe`,
-     - Drop the newly received duplicate block
-     - Return the extra receiver, so it can be used in the response future for the duplicate block request
-
-2. Create a `QueuedBlock` for `block`:
-     - Create a `tokio::sync::broadcast` channel
-     - Use that channel to create a `QueuedBlock` for `block`.
-
-3. If a duplicate block exists in a non-finalized chain, or the finalized chain,
+1. If a duplicate block hash exists in a non-finalized chain, or the finalized chain,
    it has already been successfully verified:
-     - Broadcast `Ok(block.hash())` via `block.rsp_tx`, and return the receiver for the block's channel
+     - create a new oneshot channel
+     - immediately send `Err(DuplicateBlockHash)` drop the sender
+     - return the reciever
 
-4. Add `block` to `self.queued_blocks`
+2. If a duplicate block hash exists in the queue:
+     - Find the `QueuedBlock` for that existing duplicate block
+     - create a new channel for the new request
+     - replace the old sender in `queued_block` with the new sender
+     - send `Err(DuplicateBlockHash)` through the old sender channel
+     - continue to use the new receiver
 
-5. If `block.header.previous_block_hash` is not present in the finalized or
+3. Else create a `QueuedBlock` for `block`:
+     - Create a `tokio::sync::oneshot` channel
+     - Use that channel to create a `QueuedBlock` for `block`
+     - Add `block` to `self.queued_blocks`
+     - continue to use the new receiver
+
+4. If `block.header.previous_block_hash` is not present in the finalized or
    non-finalized state:
      - Return the receiver for the block's channel
 
-6. Else iteratively attempt to process queued blocks by their parent hash
+5. Else iteratively attempt to process queued blocks by their parent hash
    starting with `block.header.previous_block_hash`
 
-7. While there are recently commited parent hashes to process
+6. While there are recently commited parent hashes to process
     - Dequeue all blocks waiting on `parent` with `let queued_children =
       self.queued_blocks.dequeue_children(parent);`
     - for each queued `block`
       - **Run contextual validation** on `block`
-           - contextual validation will reject blocks that are past the reorg limit,
-             because the finalized block at that height is already known.
+           - contextual validation should check that the block height is
+             equal to the previous block height plus 1. This check will
+             reject blocks with invalid heights.
       - If the block fails contextual validation send the result to the
         associated channel
       - Else if the block's previous hash is the finalized tip add to the
@@ -569,17 +574,17 @@ New `non-finalized` blocks are commited as follows:
       - Add `block.hash` to the set of recently commited parent hashes to
         process
 
-8. While the length of the non-finalized portion of the best chain is greater
+7. While the length of the non-finalized portion of the best chain is greater
    than the reorg limit
     - Remove the lowest height block from the non-finalized state with
       `self.mem.finalize();`
     - Commit that block to the finalized state with
       `self.sled.commit_finalized_direct(finalized);`
 
-9. Prune orphaned blocks from `self.queued_blocks` with
+8. Prune orphaned blocks from `self.queued_blocks` with
    `self.queued_blocks.prune_by_height(finalized_height);`
-   
-10. Return the receiver for the block's channel
+
+9. Return the receiver for the block's channel
 
 ## Sled data structures
 [sled]: #sled
@@ -596,7 +601,7 @@ We use the following Sled trees:
 | `hash_by_height`     | `BE32(height)`        | `block::Hash`                       |
 | `height_by_hash`     | `block::Hash`         | `BE32(height)`                      |
 | `block_by_height`    | `BE32(height)`        | `Block`                             |
-| `tx_by_hash`         | `transaction::Hash`   | `BE32(height) || BE32(tx_index)`    |
+| `tx_by_hash`         | `transaction::Hash`   | `(BE32(height) \|\| BE32(tx_index))`|
 | `utxo_by_outpoint`   | `OutPoint`            | `TransparentOutput`                 |
 | `sprout_nullifiers`  | `sprout::Nullifier`   | `()`                                |
 | `sapling_nullifiers` | `sapling::Nullifier`  | `()`                                |
@@ -609,9 +614,14 @@ Zcash structures are encoded using `ZcashSerialize`/`ZcashDeserialize`.
 
 ### Notes on Sled trees
 
-- The `hash_by_height` and `height_by_hash` trees provide the bijection between
+- The `hash_by_height` and `height_by_hash` trees provide a bijection between
   block heights and block hashes.  (Since the Sled state only stores finalized
-  state, this is actually a bijection).
+  state, they are actually a bijection).
+  
+- The `block_by_height` tree provides a bijection between block heights and block
+  data. There is no corresponding `height_by_block` tree: instead, hash the block,
+  and use `height_by_hash`. (Since the Sled state only stores finalized state,
+  they are actually a bijection).
 
 - Blocks are stored by height, not by hash.  This has the downside that looking
   up a block by hash requires an extra level of indirection.  The upside is
@@ -638,7 +648,7 @@ Committing a block to the sled state should be implemented as a wrapper around
 a function also called by [`Request::CommitBlock`](#request-commit-block),
 which should:
 
-### `pub(super) fn queue_and_commit_finalized_blocks(&mut self, queued_block: QueuedBlock)`
+#### `pub(super) fn queue_and_commit_finalized_blocks(&mut self, queued_block: QueuedBlock)`
 
 1. Obtain the highest entry of `hash_by_height` as `(old_height, old_tip)`.
 Check that `block`'s parent hash is `old_tip` and its height is
@@ -657,13 +667,14 @@ check that `block`'s parent hash is `null` (all zeroes) and its height is `0`.
 3. If the block is a genesis block, skip any transaction updates.
 
     (Due to a [bug in zcashd](https://github.com/ZcashFoundation/zebra/issues/559),
-    genesis block transactions are ignored during validation.)
-
-4.  Update the `sprout_anchors` and `sapling_anchors` trees with the Sprout and Sapling anchors.
+    genesis block anchors and transactions are ignored during validation.)
+    
+4.  Update the `sprout_anchors` and `sapling_anchors` trees with the Sprout and
+    Sapling anchors.
 
 5. Iterate over the enumerated transactions in the block. For each transaction:
 
-   1. Insert `(transaction_hash, block_height || BE32(tx_index))` to
+   1. Insert `(transaction_hash, BE32(block_height) || BE32(tx_index))` to
    `tx_by_hash`;
 
    2. For each `TransparentInput::PrevOut { outpoint, .. }` in the
@@ -685,6 +696,14 @@ Sapling note commitment trees that have already been calculated for the last
 transaction(s) in the block that have `JoinSplit`s in the Sprout case and/or
 `Spend`/`Output` descriptions in the Sapling case. These should be passed as
 fields in the `Commit*Block` requests.
+
+Due to the coinbase maturity rules, the Sprout root is the empty root
+for the first 100 blocks. (These rules are already implemented in contextual
+validation and the anchor calculations.) Therefore, `zcashd`'s genesis bug is
+irrelevant for the mainnet and testnet chains.
+
+Hypothetically, if Sapling were activated from genesis, the specification requires
+a Sapling anchor, but `zcashd` would ignore that anchor.
 
 [`JoinSplit`]: https://doc.zebra.zfnd.org/zebra_chain/transaction/struct.JoinSplit.html
 [`Spend`]: https://doc.zebra.zfnd.org/zebra_chain/transaction/struct.Spend.html
@@ -720,7 +739,7 @@ CommitBlock {
 ```
 
 Performs contextual validation of the given block, committing it to the state
-if successful. Returns `Response::Added(BlockHeaderHash)` with the hash of
+if successful. Returns `Response::Added(block::Hash)` with the hash of
 the newly committed block or an error.
 
 ### `Request::CommitFinalizedBlock`
@@ -761,8 +780,7 @@ Returns `Response::Tip(block::Hash)` with the current best chain tip.
 Implemented by querying:
 
 - (non-finalized) the highest height block in the best chain
-if the `non-finalized` state is empty
-- (finalized) the highest height block in the `hash_by_height` tree
+- (finalized) the highest height block in the `hash_by_height` tree, if the `non-finalized` state is empty
 
 ### `Request::BlockLocator`
 [request-block-locator]: #request-block-locator
@@ -781,7 +799,7 @@ Implemented by querying:
 - (non-finalized) the `hash_by_height` map in the best chain
 - (finalized) the `hash_by_height` tree.
 
-### `Request::Transaction(TransactionHash)`
+### `Request::Transaction(transaction::Hash)`
 [request-transaction]: #request-transaction
 
 Returns
@@ -798,12 +816,11 @@ Implemented by querying:
   transaction) of each chain starting with the best chain, and then find
   block that chain's `blocks` (to get the block containing the transaction
   data)
-if the transaction is not in any non-finalized chain:
 - (finalized) the `tx_by_hash` tree (to get the block that contains the
   transaction) and then `block_by_height` tree (to get the block containing
-  the transaction data).
+  the transaction data), if the transaction is not in any non-finalized chain
 
-### `Request::Block(BlockHeaderHash)`
+### `Request::Block(block::Hash)`
 [request-block]: #request-block
 
 Returns
@@ -818,10 +835,8 @@ Implemented by querying:
 
 - (non-finalized) the `height_by_hash` of each chain starting with the best
   chain, then find block that chain's `blocks` (to get the block data)
-if the block is not in any non-finalized chain:
 - (finalized) the `height_by_hash` tree (to get the block height) and then
-    the `block_by_height` tree (to get the block data).
-
+    the `block_by_height` tree (to get the block data), if the block is not in any non-finalized chain
 
 ### `Request::AwaitUtxo(OutPoint)`
 
