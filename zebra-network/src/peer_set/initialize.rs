@@ -211,7 +211,7 @@ where
     S: Service<(TcpStream, SocketAddr), Response = peer::Client, Error = BoxError> + Clone,
     S::Future: Send + 'static,
 {
-    let mut listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     info!("Opened Zcash protocol endpoint at {}", local_addr);
     loop {
@@ -293,7 +293,10 @@ where
                     handshakes.push(
                         connector
                             .call(candidate.addr)
-                            .map_err(move |_| candidate)
+                            .map_err(move |e| {
+                                debug!(?candidate.addr, ?e, "failed to connect to candidate");
+                                candidate
+                            })
                             .boxed(),
                     );
                 } else {
@@ -311,23 +314,33 @@ where
                 let _ = demand_tx.try_send(());
             }
             Right((Some(Ok(change)), _)) => {
-                // in fact all changes are Insert so this branch is always taken
                 if let Change::Insert(ref addr, _) = change {
                     debug!(candidate.addr = ?addr, "successfully dialed new peer");
+                } else {
+                    unreachable!("unexpected handshake result: all changes should be Insert");
                 }
                 success_tx.send(Ok(change)).await?;
             }
             Right((Some(Err(candidate)), _)) => {
-                debug!(?candidate.addr, "failed to connect to peer");
+                debug!(?candidate.addr, "marking candidate as failed");
                 candidates.report_failed(candidate);
                 // The demand signal that was taken out of the queue
                 // to attempt to connect to the failed candidate never
                 // turned into a connection, so add it back:
                 let _ = demand_tx.try_send(());
             }
-            // If we don't match one of these patterns, shutdown.
-            _ => break,
+            // We don't expect to see these patterns during normal operation
+            Left((Left((None, _)), _)) => {
+                unreachable!("demand_rx never fails, because we hold demand_tx");
+            }
+            Left((Right((None, _)), _)) => {
+                unreachable!("crawl_timer never terminates");
+            }
+            Right((None, _)) => {
+                unreachable!(
+                    "handshakes never terminates, because it contains a future that never resolves"
+                );
+            }
         }
     }
-    Ok(())
 }

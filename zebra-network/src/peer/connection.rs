@@ -23,7 +23,7 @@ use futures::{
     prelude::*,
     stream::Stream,
 };
-use tokio::time::{delay_for, Delay};
+use tokio::time::{sleep, Sleep};
 use tower::Service;
 use tracing_futures::Instrument;
 
@@ -221,7 +221,7 @@ pub struct Connection<S, Tx> {
     /// A timeout for a client request. This is stored separately from
     /// State so that we can move the future out of it independently of
     /// other state handling.
-    pub(super) request_timer: Option<Delay>,
+    pub(super) request_timer: Option<Sleep>,
     pub(super) svc: S,
     pub(super) client_rx: mpsc::Receiver<ClientRequest>,
     /// A slot for an error shared between the Connection and the Client that uses it.
@@ -553,7 +553,7 @@ where
         } {
             Ok(new_state) => {
                 self.state = new_state;
-                self.request_timer = Some(delay_for(constants::REQUEST_TIMEOUT));
+                self.request_timer = Some(sleep(constants::REQUEST_TIMEOUT));
             }
             Err(e) => self.fail_with(e),
         }
@@ -561,8 +561,9 @@ where
 
     // This function has its own span, because we're creating a new work
     // context (namely, the work of processing the inbound msg as a request)
-    #[instrument(skip(self))]
+    #[instrument(name = "msg_as_req", skip(self, msg), fields(%msg))]
     async fn handle_message_as_request(&mut self, msg: Message) {
+        trace!(?msg);
         let req = match msg {
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");

@@ -3,10 +3,9 @@
 use chrono::{DateTime, Utc};
 
 use zebra_chain::{
-    block::Hash,
-    block::Height,
-    block::{Block, Header},
+    block::{Block, Hash, Header, Height},
     parameters::{Network, NetworkUpgrade},
+    transaction,
     work::{difficulty::ExpandedDifficulty, equihash},
 };
 
@@ -70,12 +69,19 @@ pub fn difficulty_is_valid(
         ))?;
     }
 
-    // Difficulty filter
+    // The difficulty filter is also context-free.
+    //
+    // ZIP 205 and ZIP 208 incorrectly describe testnet minimum difficulty blocks
+    // as a change to the difficulty filter. But in `zcashd`, it is implemented
+    // as a change to the difficulty adjustment algorithm. So we don't need to
+    // do anything special for testnet here.
+    // For details, see https://github.com/zcash/zips/issues/416
     if hash > &difficulty_threshold {
         Err(BlockError::DifficultyFilter(
             *height,
             *hash,
             difficulty_threshold,
+            network,
         ))?;
     }
 
@@ -125,7 +131,9 @@ pub fn subsidy_is_valid(block: &Block, network: Network) -> Result<(), BlockErro
         // Funding streams are paid from Canopy activation to the second halving
         // Note: Canopy activation is at the first halving on mainnet, but not on testnet
         // ZIP-1014 only applies to mainnet, ZIP-214 contains the specific rules for testnet
-        unimplemented!("funding stream block subsidy validation is not implemented")
+        tracing::trace!("funding stream block subsidy validation is not implemented");
+        // Return ok for now
+        Ok(())
     } else {
         // Future halving, with no founders reward or funding streams
         Ok(())
@@ -155,4 +163,34 @@ pub fn time_is_valid_at(
     hash: &Hash,
 ) -> Result<(), zebra_chain::block::BlockTimeError> {
     header.time_is_valid_at(now, height, hash)
+}
+
+/// Check Merkle root validity.
+///
+/// `transaction_hashes` is a precomputed list of transaction hashes.
+pub fn merkle_root_validity(
+    block: &Block,
+    transaction_hashes: &[transaction::Hash],
+) -> Result<(), BlockError> {
+    let merkle_root = transaction_hashes.iter().cloned().collect();
+
+    if block.header.merkle_root != merkle_root {
+        return Err(BlockError::BadMerkleRoot {
+            actual: merkle_root,
+            expected: block.header.merkle_root,
+        });
+    }
+
+    // Bitcoin's transaction Merkle trees are malleable, allowing blocks with
+    // duplicate transactions to have the same Merkle root as blocks without
+    // duplicate transactions. Duplicate transactions should cause a block to be
+    // rejected, as duplicate transactions imply that the block contains a
+    // double-spend.  As a defense-in-depth, however, we also check that there
+    // are no duplicate transaction hashes, by collecting into a HashSet.
+    use std::collections::HashSet;
+    if transaction_hashes.len() != transaction_hashes.iter().collect::<HashSet<_>>().len() {
+        return Err(BlockError::DuplicateTransaction);
+    }
+
+    Ok(())
 }

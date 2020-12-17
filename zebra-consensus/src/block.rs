@@ -8,6 +8,7 @@
 //! verification, where it may be accepted or rejected.
 
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -19,16 +20,17 @@ use futures::stream::FuturesUnordered;
 use futures_util::FutureExt;
 use thiserror::Error;
 use tower::{Service, ServiceExt};
+use tracing::Instrument;
 
 use zebra_chain::{
     block::{self, Block},
     parameters::Network,
-    parameters::NetworkUpgrade,
+    transaction, transparent,
     work::equihash,
 };
 use zebra_state as zs;
 
-use crate::{error::*, transaction};
+use crate::{error::*, transaction as tx};
 use crate::{script, BoxError};
 
 mod check;
@@ -42,7 +44,7 @@ pub struct BlockVerifier<S> {
     /// The network to be verified.
     network: Network,
     state_service: S,
-    transaction_verifier: transaction::Verifier<S>,
+    transaction_verifier: tx::Verifier<S>,
 }
 
 // TODO: dedupe with crate::error::BlockError
@@ -80,9 +82,8 @@ where
     S::Future: Send + 'static,
 {
     pub fn new(network: Network, state_service: S) -> Self {
-        let branch = NetworkUpgrade::Sapling.branch_id().unwrap();
-        let script_verifier = script::Verifier::new(state_service.clone(), branch);
-        let transaction_verifier = transaction::Verifier::new(script_verifier);
+        let transaction_verifier =
+            tx::Verifier::new(network, script::Verifier::new(state_service.clone()));
 
         Self {
             network,
@@ -114,15 +115,14 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network;
 
+        // We don't include the block hash, because it's likely already in a parent span
+        let span = tracing::debug_span!("block", height = ?block.coinbase_height());
+
         // TODO(jlusby): Error = Report, handle errors from state_service.
         async move {
             let hash = block.hash();
-
-            // The height is already included in the ChainVerifier span
-            let span = tracing::debug_span!("BlockVerifier::call", ?hash);
-            let _entered = span.enter();
-
             // Check that this block is actually a new block.
+            tracing::trace!("checking that block is not already in state");
             match state_service
                 .ready_and()
                 .await
@@ -138,9 +138,7 @@ where
                 _ => unreachable!("wrong response to Request::Depth"),
             }
 
-            // We repeat the height checks here, to ensure that generated blocks
-            // are valid. (We check the block heights for parsed blocks when we
-            // deserialize them.)
+            tracing::trace!("performing block checks");
             let height = block
                 .coinbase_height()
                 .ok_or(BlockError::MissingHeight(hash))?;
@@ -153,6 +151,18 @@ where
             check::difficulty_is_valid(&block.header, network, &height, &hash)?;
             check::equihash_solution_is_valid(&block.header)?;
 
+            // Next, check the Merkle root validity, to ensure that
+            // the header binds to the transactions in the blocks.
+
+            // Precomputing this avoids duplicating transaction hash computations.
+            let transaction_hashes = block
+                .transactions
+                .iter()
+                .map(|t| t.hash())
+                .collect::<Vec<_>>();
+
+            check::merkle_root_validity(&block, &transaction_hashes)?;
+
             // Since errors cause an early exit, try to do the
             // quick checks first.
 
@@ -163,22 +173,26 @@ where
             check::coinbase_is_first(&block)?;
             check::subsidy_is_valid(&block, network)?;
 
-            // TODO: context-free header verification: merkle root
-
             let mut async_checks = FuturesUnordered::new();
 
+            let known_utxos = new_outputs(&block, &transaction_hashes);
             for transaction in &block.transactions {
-                let req = transaction::Request::Block(transaction.clone());
                 let rsp = transaction_verifier
                     .ready_and()
                     .await
                     .expect("transaction verifier is always ready")
-                    .call(req);
+                    .call(tx::Request::Block {
+                        transaction: transaction.clone(),
+                        known_utxos: known_utxos.clone(),
+                        height,
+                    });
                 async_checks.push(rsp);
             }
+            tracing::trace!(len = async_checks.len(), "built async tx checks");
 
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
+                tracing::trace!(?result, remaining = async_checks.len());
                 result.map_err(VerifyBlockError::Transaction)?;
             }
 
@@ -188,11 +202,20 @@ where
             metrics::counter!("block.verified.block.count", 1);
 
             // Finally, submit the block for contextual verification.
+            let new_outputs = Arc::try_unwrap(known_utxos)
+                .expect("all verification tasks using known_utxos are complete");
+            let prepared_block = zs::PreparedBlock {
+                block,
+                hash,
+                height,
+                new_outputs,
+                transaction_hashes,
+            };
             match state_service
                 .ready_and()
                 .await
                 .map_err(VerifyBlockError::Commit)?
-                .call(zs::Request::CommitBlock { block })
+                .call(zs::Request::CommitBlock(prepared_block))
                 .await
                 .map_err(VerifyBlockError::Commit)?
             {
@@ -203,6 +226,37 @@ where
                 _ => unreachable!("wrong response for CommitBlock"),
             }
         }
+        .instrument(span)
         .boxed()
     }
+}
+
+/// Compute an index of newly created transparent outputs, given a block and a
+/// list of precomputed transaction hashes.
+fn new_outputs(
+    block: &Block,
+    transaction_hashes: &[transaction::Hash],
+) -> Arc<HashMap<transparent::OutPoint, zs::Utxo>> {
+    let mut new_outputs = HashMap::default();
+    let height = block.coinbase_height().expect("block has coinbase height");
+    for (transaction, hash) in block
+        .transactions
+        .iter()
+        .zip(transaction_hashes.iter().cloned())
+    {
+        let from_coinbase = transaction.is_coinbase();
+        for (index, output) in transaction.outputs().iter().cloned().enumerate() {
+            let index = index as u32;
+            new_outputs.insert(
+                transparent::OutPoint { hash, index },
+                zs::Utxo {
+                    output,
+                    height,
+                    from_coinbase,
+                },
+            );
+        }
+    }
+
+    Arc::new(new_outputs)
 }

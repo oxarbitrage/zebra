@@ -57,7 +57,8 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: i64 = 30 * 60;
 /// This must be a valid [BIP 14] user agent.
 ///
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
-pub const USER_AGENT: &str = "/🦓Zebra🦓:3.0.0-alpha.0/";
+// XXX can we generate this from crate metadata?
+pub const USER_AGENT: &str = "/🦓Zebra🦓:1.0.0-alpha.0/";
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
@@ -67,7 +68,7 @@ pub const USER_AGENT: &str = "/🦓Zebra🦓:3.0.0-alpha.0/";
 ///
 /// The current protocol version typically changes before Mainnet and Testnet
 /// network upgrades.
-pub const CURRENT_VERSION: Version = Version(170_012);
+pub const CURRENT_VERSION: Version = Version(170_013);
 
 /// The most recent bilateral consensus upgrade implemented by this crate.
 ///
@@ -76,7 +77,7 @@ pub const CURRENT_VERSION: Version = Version(170_012);
 //
 // TODO: replace with NetworkUpgrade::current(network, height).
 //       See the detailed comment in handshake.rs, where this constant is used.
-pub const MIN_NETWORK_UPGRADE: NetworkUpgrade = NetworkUpgrade::Heartwood;
+pub const MIN_NETWORK_UPGRADE: NetworkUpgrade = NetworkUpgrade::Canopy;
 
 /// The default RTT estimate for peer responses.
 ///
@@ -113,6 +114,8 @@ mod tests {
     /// relies on.
     #[test]
     fn ensure_live_peer_duration_value_matches_others() {
+        zebra_test::init();
+
         let constructed_live_peer_duration =
             HEARTBEAT_INTERVAL + REQUEST_TIMEOUT + REQUEST_TIMEOUT + REQUEST_TIMEOUT;
 
@@ -122,6 +125,8 @@ mod tests {
     /// Make sure that the timeout values are consistent with each other.
     #[test]
     fn ensure_timeouts_consistent() {
+        zebra_test::init();
+
         assert!(HANDSHAKE_TIMEOUT <= REQUEST_TIMEOUT,
                 "Handshakes are requests, so the handshake timeout can't be longer than the timeout for all requests.");
         // This check is particularly important on testnet, which has a small

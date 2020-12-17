@@ -7,17 +7,24 @@ use std::{
 
 use futures::{
     future::{FutureExt, TryFutureExt},
-    stream::TryStreamExt,
+    stream::{Stream, TryStreamExt},
 };
 use tokio::sync::oneshot;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zebra_network as zn;
-use zebra_network::AddressBook;
 use zebra_state as zs;
+
+use zebra_chain::block::{self, Block};
+use zebra_consensus::chain::VerifyChainError;
+use zebra_network::AddressBook;
+
+mod downloads;
+use downloads::Downloads;
 
 type Outbound = Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
 type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type Verifier = Buffer<BoxService<Arc<Block>, block::Hash, VerifyChainError>, Arc<Block>>;
 
 pub type SetupData = (Outbound, Arc<Mutex<AddressBook>>);
 
@@ -52,15 +59,23 @@ pub struct Inbound {
     outbound: Option<Outbound>,
     address_book: Option<Arc<Mutex<zn::AddressBook>>>,
     state: State,
+    verifier: Verifier,
+    downloads: Option<Pin<Box<Downloads<Outbound, Verifier, State>>>>,
 }
 
 impl Inbound {
-    pub fn new(network_setup: oneshot::Receiver<SetupData>, state: State) -> Self {
+    pub fn new(
+        network_setup: oneshot::Receiver<SetupData>,
+        state: State,
+        verifier: Verifier,
+    ) -> Self {
         Self {
             network_setup: Some(network_setup),
             outbound: None,
             address_book: None,
             state,
+            verifier,
+            downloads: None,
         }
     }
 }
@@ -71,7 +86,6 @@ impl Service<zn::Request> for Inbound {
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
-    #[instrument(skip(self, cx))]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Check whether the network setup is finished, but don't wait for it to
         // become ready before reporting readiness. We expect to get it "soon",
@@ -85,6 +99,11 @@ impl Service<zn::Request> for Inbound {
                     self.outbound = Some(outbound);
                     self.address_book = Some(address_book);
                     self.network_setup = None;
+                    self.downloads = Some(Box::pin(Downloads::new(
+                        self.outbound.clone().unwrap(),
+                        self.verifier.clone(),
+                        self.state.clone(),
+                    )));
                 }
                 Err(TryRecvError::Empty) => {
                     self.network_setup = Some(rx);
@@ -98,6 +117,12 @@ impl Service<zn::Request> for Inbound {
                 }
             };
         }
+
+        // Clean up completed download tasks
+        if let Some(downloads) = self.downloads.as_mut() {
+            while let Poll::Ready(Some(_)) = downloads.as_mut().poll_next(cx) {}
+        }
+
         // Now report readiness based on readiness of the inner services, if they're available.
         // XXX do we want to propagate backpressure from the network here?
         match (
@@ -113,7 +138,7 @@ impl Service<zn::Request> for Inbound {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "inbound", skip(self, req))]
     fn call(&mut self, req: zn::Request) -> Self::Future {
         match req {
             zn::Request::Peers => match self.address_book.as_ref() {
@@ -155,13 +180,23 @@ impl Service<zn::Request> for Inbound {
                 debug!("ignoring unimplemented request");
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::FindBlocks { .. } => {
-                debug!("ignoring unimplemented request");
-                async { Ok(zn::Response::Nil) }.boxed()
+            zn::Request::FindBlocks { known_blocks, stop } => {
+                let request = zs::Request::FindBlockHashes { known_blocks, stop };
+                self.state.call(request).map_ok(|resp| match resp {
+                        zs::Response::BlockHashes(hashes) if hashes.is_empty() => zn::Response::Nil,
+                        zs::Response::BlockHashes(hashes) => zn::Response::BlockHashes(hashes),
+                        _ => unreachable!("zebra-state should always respond to a `FindBlockHashes` request with a `BlockHashes` response"),
+                    })
+                .boxed()
             }
-            zn::Request::FindHeaders { .. } => {
-                debug!("ignoring unimplemented request");
-                async { Ok(zn::Response::Nil) }.boxed()
+            zn::Request::FindHeaders { known_blocks, stop } => {
+                let request = zs::Request::FindBlockHeaders { known_blocks, stop };
+                self.state.call(request).map_ok(|resp| match resp {
+                        zs::Response::BlockHeaders(headers) if headers.is_empty() => zn::Response::Nil,
+                        zs::Response::BlockHeaders(headers) => zn::Response::BlockHeaders(headers),
+                        _ => unreachable!("zebra-state should always respond to a `FindBlockHeaders` request with a `BlockHeaders` response"),
+                    })
+                .boxed()
             }
             zn::Request::PushTransaction(_transaction) => {
                 debug!("ignoring unimplemented request");
@@ -171,8 +206,10 @@ impl Service<zn::Request> for Inbound {
                 debug!("ignoring unimplemented request");
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::AdvertiseBlock(_block) => {
-                debug!("ignoring unimplemented request");
+            zn::Request::AdvertiseBlock(hash) => {
+                if let Some(downloads) = self.downloads.as_mut() {
+                    downloads.download_and_verify(hash);
+                }
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             zn::Request::MempoolTransactions => {

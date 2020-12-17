@@ -1,0 +1,24 @@
+FROM rust:buster
+
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+	make cmake g++ gcc llvm libclang-dev clang
+
+RUN mkdir /zebra
+WORKDIR /zebra
+
+ARG SHORT_SHA
+ENV SHORT_SHA $SHORT_SHA
+
+ENV RUST_BACKTRACE full
+ENV CARGO_HOME /zebra/.cargo/
+
+RUN rustc -V; cargo -V; rustup -V
+
+EXPOSE 8233 18233
+
+COPY . .
+
+RUN cargo test --all --no-run
+
+CMD cargo test --workspace --no-fail-fast -- -Zunstable-options --include-ignored

@@ -110,10 +110,10 @@ where
     /// This method waits for the network to become ready, and returns an error
     /// only if the network service fails. It returns immediately after queuing
     /// the request.
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self), fields(%hash))]
     pub async fn download_and_verify(&mut self, hash: block::Hash) -> Result<(), Report> {
         if self.cancel_handles.contains_key(&hash) {
-            return Err(eyre!("duplicate hash queued for download"));
+            return Err(eyre!("duplicate hash queued for download: {:?}", hash));
         }
 
         // We construct the block requests sequentially, waiting for the peer
@@ -140,6 +140,7 @@ where
             async move {
                 let rsp = tokio::select! {
                     _ = &mut cancel_rx => {
+                        tracing::trace!("task cancelled prior to download completion");
                         metrics::counter!("sync.cancelled.download.count", 1);
                         return Err("canceled block_fetch_verify".into())
                     }
@@ -159,6 +160,7 @@ where
                 let rsp = verifier.ready_and().await?.call(block);
                 let verification = tokio::select! {
                     _ = &mut cancel_rx => {
+                        tracing::trace!("task cancelled prior to verification");
                         metrics::counter!("sync.cancelled.verify.count", 1);
                         return Err("canceled block_fetch_verify".into())
                     }

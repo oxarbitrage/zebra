@@ -14,7 +14,7 @@ use futures::future::{ready, Ready};
 use once_cell::sync::Lazy;
 use rand::thread_rng;
 
-use tokio::sync::broadcast::{channel, RecvError, Sender};
+use tokio::sync::broadcast::{channel, error::RecvError, Sender};
 use tower::{util::ServiceFn, Service};
 use tower_batch::{Batch, BatchControl};
 use tower_fallback::Fallback;
@@ -62,8 +62,9 @@ pub struct Verifier {
 impl Default for Verifier {
     fn default() -> Self {
         let batch = batch::Verifier::default();
-        // XXX(hdevalence) what's a reasonable choice here?
-        let (tx, _) = channel(10);
+        // This bound should be big enough to avoid RecvErrors
+        // when tasks wait on results for a long time.
+        let (tx, _) = channel(512);
         Self { tx, batch }
     }
 }
@@ -90,8 +91,8 @@ impl Service<BatchControl<Item>> for Verifier {
                     match rx.recv().await {
                         Ok(result) => result,
                         Err(RecvError::Lagged(_)) => {
-                            tracing::warn!(
-                                "missed channel updates for the correct signature batch!"
+                            tracing::error!(
+                                "batch verification receiver lagged and lost verification results"
                             );
                             Err(Error::InvalidSignature)
                         }

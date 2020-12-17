@@ -3,7 +3,7 @@
 use super::*;
 
 use super::types::Progress::*;
-use super::types::Target::*;
+use super::types::TargetHeight::*;
 
 use color_eyre::eyre::{eyre, Report};
 use futures::{future::TryFutureExt, stream::FuturesUnordered};
@@ -213,9 +213,9 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
     Ok(())
 }
 
-#[tokio::test]
 // Temporarily ignore this test, until the state can handle out-of-order blocks
-#[ignore]
+// #[tokio::test]
+#[allow(dead_code)]
 async fn continuous_blockchain_test() -> Result<(), Report> {
     continuous_blockchain(None).await?;
     for height in 0..=10 {
@@ -225,6 +225,8 @@ async fn continuous_blockchain_test() -> Result<(), Report> {
 }
 
 /// Test a continuous blockchain, restarting verification at `restart_height`.
+// TODO: does this duplicate the test code commented out in src/chain/tests.rs?
+#[allow(dead_code)]
 #[spandoc::spandoc]
 async fn continuous_blockchain(restart_height: Option<block::Height>) -> Result<(), Report> {
     zebra_test::init();
@@ -272,7 +274,9 @@ async fn continuous_blockchain(restart_height: Option<block::Height>) -> Result<
         let initial_tip = restart_height.map(|block::Height(height)| {
             (blockchain[height as usize].1, blockchain[height as usize].2)
         });
-        let state_service = ServiceBuilder::new().buffer(1).service(zebra_state::init(zebra_state::Config::ephemeral(), Mainnet));
+        let state_service = ServiceBuilder::new()
+            .buffer(1)
+            .service(zebra_state::init(zebra_state::Config::ephemeral(), Mainnet));
         let mut checkpoint_verifier =
             CheckpointVerifier::from_list(checkpoint_list, initial_tip, state_service.clone())
                 .map_err(|e| eyre!(e))?;
@@ -318,9 +322,9 @@ async fn continuous_blockchain(restart_height: Option<block::Height>) -> Result<
 
                     /// SPANDOC: Add block to the state {?height}
                     ready_state_service
-                        .call(zebra_state::Request::CommitFinalizedBlock {
-                            block: block.clone(),
-                        })
+                        .call(zebra_state::Request::CommitFinalizedBlock(
+                            block.clone().into(),
+                        ))
                         .await
                         .map_err(|e| eyre!(e))?;
                 }

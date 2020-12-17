@@ -14,7 +14,7 @@
 //! block for the configured network.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     ops::{Bound, Bound::*},
     pin::Pin,
@@ -44,7 +44,7 @@ mod tests;
 
 pub(crate) use list::CheckpointList;
 use types::{Progress, Progress::*};
-use types::{Target, Target::*};
+use types::{TargetHeight, TargetHeight::*};
 
 /// An unverified block, which is in the queue for checkpoint verification.
 #[derive(Debug)]
@@ -98,8 +98,6 @@ where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
-    // Inputs
-    //
     /// The checkpoint list for this verifier.
     checkpoint_list: CheckpointList,
 
@@ -109,8 +107,6 @@ where
     /// The underlying state service, possibly wrapped in other services.
     state_service: S,
 
-    // Queued Blocks
-    //
     /// A queue of unverified blocks.
     ///
     /// Contains a list of unverified blocks at each block height. In most cases,
@@ -127,9 +123,6 @@ where
     verifier_progress: Progress<block::Height>,
 }
 
-/// The CheckpointVerifier implementation.
-///
-/// Contains non-service utility functions for CheckpointVerifiers.
 impl<S> CheckpointVerifier<S>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -262,7 +255,7 @@ where
     /// `height` increases as checkpoints are verified.
     ///
     /// If verification has finished, returns `FinishedVerifying`.
-    fn target_checkpoint_height(&self) -> Target<block::Height> {
+    fn target_checkpoint_height(&self) -> TargetHeight {
         // Find the height we want to start searching at
         let start_height = match self.previous_checkpoint_height() {
             // Check if we have the genesis block as a special case, to simplify the loop
@@ -386,8 +379,7 @@ where
                     height,
                     verified_height: previous_height,
                 });
-                // TODO: reduce to trace level once the AlreadyVerified bug is fixed
-                tracing::info!(?e);
+                tracing::trace!(?e);
                 e?;
             }
             InitialTip(_) | PreviousCheckpoint(_) => {}
@@ -400,6 +392,14 @@ where
 
     /// Increase the current checkpoint height to `verified_height`,
     fn update_progress(&mut self, verified_height: block::Height) {
+        if let Some(max_height) = self.queued.keys().next_back() {
+            metrics::gauge!("checkpoint.queued.max.height", max_height.0 as i64);
+        } else {
+            // use -1 as a sentinel value for "None", because 0 is a valid height
+            metrics::gauge!("checkpoint.queued.max.height", -1);
+        }
+        metrics::gauge!("checkpoint.queued_slots", self.queued.len() as i64);
+
         // Ignore blocks that are below the previous checkpoint, or otherwise
         // have invalid heights.
         //
@@ -423,15 +423,40 @@ where
         }
     }
 
-    /// If the block height of `block` is valid, returns that height.
+    /// Check that the block height and Merkle root are valid.
     ///
-    /// Returns an error if the block's height is invalid, see `check_height()`
-    /// for details.
+    /// Checking the Merkle root ensures that the block hash binds the block
+    /// contents. To prevent malleability (CVE-2012-2459), we also need to check
+    /// whether the transaction hashes are unique.
     fn check_block(&self, block: &Block) -> Result<block::Height, VerifyCheckpointError> {
         let block_height = block
             .coinbase_height()
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash: block.hash() })?;
         self.check_height(block_height)?;
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Vec<_>>();
+        let merkle_root = transaction_hashes.iter().cloned().collect();
+
+        // Check that the Merkle root is valid.
+        if block.header.merkle_root != merkle_root {
+            return Err(VerifyCheckpointError::BadMerkleRoot {
+                expected: block.header.merkle_root,
+                actual: merkle_root,
+            });
+        }
+
+        // To prevent malleability (CVE-2012-2459), we also need to check
+        // whether the transaction hashes are unique. Collecting into a HashSet
+        // deduplicates, so this checks that there are no duplicate transaction
+        // hashes, preventing Merkle root malleability.
+        if transaction_hashes.len() != transaction_hashes.iter().collect::<HashSet<_>>().len() {
+            return Err(VerifyCheckpointError::DuplicateTransaction);
+        }
+
         Ok(block_height)
     }
 
@@ -450,16 +475,11 @@ where
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
-        // Check for a valid height
+        // Check that the height and Merkle roots are valid.
         let height = match self.check_block(&block) {
             Ok(height) => height,
             Err(error) => {
-                // Block errors happen frequently on mainnet, due to bad peers.
-                tracing::trace!(?error);
-
-                // Sending might fail, depending on what the caller does with rx,
-                // but there's nothing we can do about it.
-                let _ = tx.send(Err(error));
+                tx.send(Err(error)).expect("rx has not been dropped yet");
                 return rx;
             }
         };
@@ -474,11 +494,12 @@ where
 
         let hash = block.hash();
 
+        // Replace older requests by newer ones by swapping the oneshot.
         for qb in qblocks.iter_mut() {
             if qb.hash == hash {
-                let old_tx = std::mem::replace(&mut qb.tx, tx);
                 let e = VerifyCheckpointError::NewerRequest { height, hash };
-                tracing::trace!(?e);
+                tracing::trace!(?e, "failing older of duplicate requests");
+                let old_tx = std::mem::replace(&mut qb.tx, tx);
                 let _ = old_tx.send(Err(e));
                 return rx;
             }
@@ -572,7 +593,7 @@ where
         valid_qblock
     }
 
-    /// Check all the blocks in the current checkpoint range.
+    /// Try to verify from the previous checkpoint to a target checkpoint.
     ///
     /// Send `Ok` for the blocks that are in the chain, and `Err` for side-chain
     /// blocks.
@@ -783,6 +804,13 @@ pub enum VerifyCheckpointError {
     },
     #[error("the block {hash:?} does not have a coinbase height")]
     CoinbaseHeight { hash: block::Hash },
+    #[error("merkle root {actual:?} does not match expected {expected:?}")]
+    BadMerkleRoot {
+        actual: block::merkle::Root,
+        expected: block::merkle::Root,
+    },
+    #[error("duplicate transactions in block")]
+    DuplicateTransaction,
     #[error("checkpoint verifier was dropped")]
     Dropped,
     #[error(transparent)]
@@ -822,36 +850,43 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        // Queue the block for verification, until we receive all the blocks for
-        // the current checkpoint range.
         let rx = self.queue_block(block.clone());
-
-        // Try to verify from the previous checkpoint to a target checkpoint.
-        //
-        // If there are multiple checkpoints in the target range, and one of
-        // the ranges is invalid, we'll try again with a smaller target range
-        // on the next call(). Failures always reject a block, so we know
-        // there will be at least one more call().
-        //
-        // We don't retry with a smaller range on failure, because failures
-        // should be rare.
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots", self.queued.len() as i64);
 
+        // Because the checkpoint verifier duplicates state from the state
+        // service (it tracks which checkpoints have been verified), we must
+        // commit blocks transactionally on a per-checkpoint basis. Otherwise,
+        // the checkpoint verifier's state could desync from the underlying
+        // state service. Among other problems, this could cause the checkpoint
+        // verifier to reject blocks not already in the state as
+        // already-verified.
+        //
+        // To commit blocks transactionally on a per-checkpoint basis, we must
+        // commit all verified blocks in a checkpoint range, regardless of
+        // whether or not the response futures for each block were dropped.
+        //
+        // We accomplish this by spawning a new task containing the
+        // commit-if-verified logic. This task will always execute, except if
+        // the program is interrupted, in which case there is no longer a
+        // checkpoint verifier to keep in sync with the state.
         let mut state_service = self.state_service.clone();
-        async move {
+        let commit_finalized_block = tokio::spawn(async move {
             let hash = rx
                 .await
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
+            // Once we get a verified hash, we must commit it to the chain state
+            // as a finalized block, or exit the program, so .expect rather than
+            // propagate errors from the state service.
             match state_service
                 .ready_and()
                 .await
-                .map_err(VerifyCheckpointError::CommitFinalized)?
-                .call(zs::Request::CommitFinalizedBlock { block })
+                .expect("Verified checkpoints must be committed transactionally")
+                .call(zs::Request::CommitFinalizedBlock(block.into()))
                 .await
-                .map_err(VerifyCheckpointError::CommitFinalized)?
+                .expect("Verified checkpoints must be committed transactionally")
             {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
@@ -859,6 +894,12 @@ where
                 }
                 _ => unreachable!("wrong response for CommitFinalizedBlock"),
             }
+        });
+
+        async move {
+            commit_finalized_block
+                .await
+                .expect("commit_finalized_block should not panic")
         }
         .boxed()
     }

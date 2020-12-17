@@ -34,15 +34,20 @@ state service.
 
 * **block chain**: A sequence of valid blocks linked by inclusion of the
   previous block hash in the subsequent block. Chains are rooted at the
-  *genesis* block and extend to a *tip*.
+  genesis block and extend to a **tip**.
 
 * **chain state**: The state of the ledger after application of a particular
   sequence of blocks (state transitions).
 
-* **cumulative difficulty**: The cumulative proof-of-work from genesis to the
-  chain tip.
+* **block work**: The approximate amount of work required for a miner to generate
+  a block hash that passes the difficulty filter. The number of block header
+  attempts and the mining time are proportional to the work value. Numerically
+  higher work values represent longer processing times.
 
-* **best chain**: The chain with the greatest cumulative difficulty. This chain
+* **cumulative work**: The sum of the **block work** of all blocks in a chain, from
+  genesis to the chain tip.
+
+* **best chain**: The chain with the greatest **cumulative work**. This chain
   represents the consensus state of the Zcash network and transactions.
 
 * **side chain**: A chain which is not contained in the best chain.
@@ -69,6 +74,11 @@ state service.
   chain is usually 100 blocks (the reorg limit) above the finalized tip. But it can
   be lower during the initial sync, and after a chain reorganization, if the new
   best chain is at a lower height.
+
+* **relevant chain**: The relevant chain for a block starts at the previous
+  block, and extends back to genesis.
+
+* **relevant tip**: The tip of the relevant chain.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -124,11 +134,12 @@ pub enum Request {
 ```
 
 `zebra-state` breaks down its requests into two categories and provides
-different guarantees for each category: requests that modify the state, and requests that
-do not. Requests that update the state are guaranteed to run sequentially and
-will never race against each other. Requests that read state are done
-asynchronously and are guaranteed to read at least the state present at the
-time the request was processed by the service, or a later state present at the time the request future is executed. The state service avoids
+different guarantees for each category: requests that modify the state, and
+requests that do not. Requests that update the state are guaranteed to run
+sequentially and will never race against each other. Requests that read state
+are done asynchronously and are guaranteed to read at least the state present
+at the time the request was processed by the service, or a later state
+present at the time the request future is executed. The state service avoids
 race conditions between the read state and the written state by doing all
 contextual verification internally.
 
@@ -155,7 +166,7 @@ state data at the finality boundary provided by the reorg limit.
 
 State data from blocks *above* the reorg limit (*non-finalized state*) is
 stored in-memory and handles multiple chains. State data from blocks *below*
-the reorg limit (*finalized state*) is stored persistently using `sled` and
+the reorg limit (*finalized state*) is stored persistently using `rocksdb` and
 only tracks a single chain. This allows a simplification of our state
 handling, because only finalized data is persistent and the logic for
 finalized data handles less invariants.
@@ -168,7 +179,7 @@ Another downside of this design is that we do not achieve exactly the same
 behavior as `zcashd` in the event of a 51% attack: `zcashd` limits *each* chain
 reorganization to 100 blocks, but permits multiple reorgs, while Zebra limits
 *all* chain reorgs to 100 blocks. In the event of a successful 51% attack on
-Zcash, this could be resolved by wiping the Sled state and re-syncing the new
+Zcash, this could be resolved by wiping the rocksdb state and re-syncing the new
 chain, but in this scenario there are worse problems.
 
 ## Service Interface
@@ -179,11 +190,11 @@ Determining what guarantees the state service can and should provide to the
 rest of the application requires considering two sets of behaviors:
 
 1. behaviors related to the state's external API (a `Buffer`ed `tower::Service`);
-2. behaviors related to the state's internal implementation (using `sled`).
+2. behaviors related to the state's internal implementation (using `rocksdb`).
 
 Making this distinction helps us to ensure we don't accidentally leak
 "internal" behaviors into "external" behaviors, which would violate
-encapsulation and make it more difficult to replace `sled`.
+encapsulation and make it more difficult to replace `rocksdb`.
 
 In the first category, our state is presented to the rest of the application
 as a `Buffer`ed `tower::Service`. The `Buffer` wrapper allows shared access
@@ -198,19 +209,12 @@ This means that our external API ensures that the state service sees a
 linearized sequence of state requests, although the exact ordering is
 unpredictable when there are multiple senders making requests.
 
-In the second category, the Sled API presents itself synchronously, but
-database and tree handles are cloneable and can be moved between threads. All
-that's required to process some request asynchronously is to clone the
-appropriate handle, move it into an async block, and make the call as part of
-the future. (We might want to use Tokio's blocking API for this, but this is
-an implementation detail).
-
-Because the state service has exclusive access to the sled database, and the
+Because the state service has exclusive access to the rocksdb database, and the
 state service sees a linearized sequence of state requests, we have an easy
-way to opt in to asynchronous database access. We can perform sled operations
+way to opt in to asynchronous database access. We can perform rocksdb operations
 synchronously in the `Service::call`, waiting for them to complete, and be
-sure that all future requests will see the resulting sled state. Or, we can
-perform sled operations asynchronously in the future returned by
+sure that all future requests will see the resulting rocksdb state. Or, we can
+perform rocksdb operations asynchronously in the future returned by
 `Service::call`.
 
 If we perform all *writes* synchronously and allow reads to be either
@@ -220,10 +224,10 @@ time the request was processed, or a later state.
 
 ### Summary
 
-- **Sled reads** may be done synchronously (in `call`) or asynchronously (in
+- **rocksdb reads** may be done synchronously (in `call`) or asynchronously (in
   the `Future`), depending on the context;
 
-- **Sled writes** must be done synchronously (in `call`)
+- **rocksdb writes** must be done synchronously (in `call`)
 
 ## In-memory data structures
 [in-memory]: #in-memory
@@ -231,11 +235,10 @@ time the request was processed, or a later state.
 At a high level, the in-memory data structures store a collection of chains,
 each rooted at the highest finalized block. Each chain consists of a map from
 heights to blocks. Chains are stored using an ordered map from cumulative work to
-chains, so that the map ordering is the ordering of best to worst chains.
+chains, so that the map ordering is the ordering of worst to best chains.
 
 ### The `Chain` type
 [chain-type]: #chain-type
-
 
 The `Chain` type represents a chain of blocks. Each block represents an
 incremental state update, and the `Chain` type caches the cumulative state
@@ -343,10 +346,10 @@ Remove the highest height block of the non-finalized portion of a chain.
 
 #### `Ord`
 
-The `Chain` type implements `Ord` for reorganizing chains. First chains
-are compared by their `partial_cumulative_work`. Ties are then broken by
-comparing `block::Hash`es of the tips of each chain. (This tie-breaker
-means that all `Chain`s in the `ChainSet` must have at least one block.)
+The `Chain` type implements `Ord` for reorganizing chains. First chains are
+compared by their `partial_cumulative_work`. Ties are then broken by
+comparing `block::Hash`es of the tips of each chain. (This tie-breaker means
+that all `Chain`s in the `NonFinalizedState` must have at least one block.)
 
 **Note**: Unlike `zcashd`, Zebra does not use block arrival times as a
 tie-breaker for the best tip. Since Zebra downloads blocks in parallel,
@@ -403,11 +406,11 @@ chain and updates all side chains to match.
 3. Remove the lowest height block from the best chain with
    `let finalized_block = best_chain.pop_root();`
 
-4. Add `best_chain` back to `self.chain_set`
+4. Add `best_chain` back to `self.chain_set` if `best_chain` is not empty
 
 5. For each remaining `chain` in `side_chains`
     - remove the lowest height block from `chain`
-    - If that block is equal to `finalized_block` add `chain` back to `self.chain_set`
+    - If that block is equal to `finalized_block` and `chain` is not empty add `chain` back to `self.chain_set`
     - Else, drop `chain`
 
 6. Return `finalized_block`
@@ -533,7 +536,7 @@ New `non-finalized` blocks are commited as follows:
    it has already been successfully verified:
      - create a new oneshot channel
      - immediately send `Err(DuplicateBlockHash)` drop the sender
-     - return the reciever
+     - return the receiver
 
 2. If a duplicate block hash exists in the queue:
      - Find the `QueuedBlock` for that existing duplicate block
@@ -579,22 +582,22 @@ New `non-finalized` blocks are commited as follows:
     - Remove the lowest height block from the non-finalized state with
       `self.mem.finalize();`
     - Commit that block to the finalized state with
-      `self.sled.commit_finalized_direct(finalized);`
+      `self.disk.commit_finalized_direct(finalized);`
 
 8. Prune orphaned blocks from `self.queued_blocks` with
    `self.queued_blocks.prune_by_height(finalized_height);`
 
 9. Return the receiver for the block's channel
 
-## Sled data structures
-[sled]: #sled
+## rocksdb data structures
+[rocksdb]: #rocksdb
 
-Sled provides a persistent, thread-safe `BTreeMap<&[u8], &[u8]>`. Each map is
+rocksdb provides a persistent, thread-safe `BTreeMap<&[u8], &[u8]>`. Each map is
 a distinct "tree". Keys are sorted using lex order on byte strings, so
 integer values should be stored using big-endian encoding (so that the lex
 order on byte strings is the numeric ordering).
 
-We use the following Sled trees:
+We use the following rocksdb column families:
 
 | Tree                 |                  Keys |                              Values |
 |----------------------|-----------------------|-------------------------------------|
@@ -612,16 +615,16 @@ Zcash structures are encoded using `ZcashSerialize`/`ZcashDeserialize`.
 
 **Note:** We do not store the cumulative work for the finalized chain, because the finalized work is equal for all non-finalized chains. So the additional non-finalized work can be used to calculate the relative chain order, and choose the best chain.
 
-### Notes on Sled trees
+### Notes on rocksdb column families
 
-- The `hash_by_height` and `height_by_hash` trees provide a bijection between
-  block heights and block hashes.  (Since the Sled state only stores finalized
+- The `hash_by_height` and `height_by_hash` column families provide a bijection between
+  block heights and block hashes.  (Since the rocksdb state only stores finalized
   state, they are actually a bijection).
-  
-- The `block_by_height` tree provides a bijection between block heights and block
-  data. There is no corresponding `height_by_block` tree: instead, hash the block,
-  and use `height_by_hash`. (Since the Sled state only stores finalized state,
-  they are actually a bijection).
+
+- The `block_by_height` column family provides a bijection between block
+  heights and block data. There is no corresponding `height_by_block` column
+  family: instead, hash the block, and use `height_by_hash`. (Since the
+  rocksdb state only stores finalized state, they are actually a bijection).
 
 - Blocks are stored by height, not by hash.  This has the downside that looking
   up a block by hash requires an extra level of indirection.  The upside is
@@ -629,7 +632,7 @@ Zcash structures are encoded using `ZcashSerialize`/`ZcashDeserialize`.
   common access patterns, such as helping a client sync the chain or doing
   analysis, access blocks in (potentially sparse) height order.  In addition,
   the fact that we commit blocks in order means we're writing only to the end
-  of the Sled tree, which may help save space.
+  of the rocksdb column family, which may help save space.
 
 - Transaction references are stored as a `(height, index)` pair referencing the
   height of the transaction's parent block and the transaction's index in that
@@ -644,7 +647,7 @@ commit any queued children.  (Although the checkpointer generates verified
 blocks in order when it completes a checkpoint, the blocks are committed in the
 response futures, so they may arrive out of order).
 
-Committing a block to the sled state should be implemented as a wrapper around
+Committing a block to the rocksdb state should be implemented as a wrapper around
 a function also called by [`Request::CommitBlock`](#request-commit-block),
 which should:
 
@@ -668,7 +671,7 @@ check that `block`'s parent hash is `null` (all zeroes) and its height is `0`.
 
     (Due to a [bug in zcashd](https://github.com/ZcashFoundation/zebra/issues/559),
     genesis block anchors and transactions are ignored during validation.)
-    
+
 4.  Update the `sprout_anchors` and `sapling_anchors` trees with the Sprout and
     Sapling anchors.
 
@@ -712,6 +715,59 @@ These updates can be performed in a batch or without necessarily iterating
 over all transactions, if the data is available by other means; they're
 specified this way for clarity.
 
+## Accessing previous blocks for contextual validation
+[previous-block-context]: #previous-block-context
+
+The state service performs contextual validation of blocks received via the
+`CommitBlock` request. Since `CommitBlock` is synchronous, contextual validation
+must also be performed synchronously.
+
+The relevant chain for a block starts at its previous block, and follows the
+chain of previous blocks back to the genesis block.
+
+### Relevant chain iterator
+[relevant-chain-iterator]: #relevant-chain-iterator
+
+The relevant chain can be retrieved from the state service as follows:
+* if the previous block is the finalized tip:
+  * get recent blocks from the finalized state
+* if the previous block is in the non-finalized state:
+  * get recent blocks from the relevant chain, then
+  * get recent blocks from the finalized state, if required
+
+The relevant chain can start at any non-finalized block, or at the finalized tip.
+
+### Relevant chain implementation
+[relevant-chain-implementation]: #relevant-chain-implementation
+
+The relevant chain is implemented as a `StateService` iterator, which returns
+`Arc<Block>`s.
+
+The chain iterator implements `ExactSizeIterator`, so Zebra can efficiently
+assert that the relevant chain contains enough blocks to perform each contextual
+validation check.
+
+```rust
+impl StateService {
+    /// Return an iterator over the relevant chain of the block identified by
+    /// `hash`.
+    ///
+    /// The block identified by `hash` is included in the chain of blocks yielded
+    /// by the iterator.
+    pub fn chain(&self, hash: block::Hash) -> Iter<'_> { ... }
+}
+
+impl Iterator for Iter<'_>  {
+    type Item = Arc<Block>;
+    ...
+}
+impl ExactSizeIterator for Iter<'_> { ... }
+impl FusedIterator for Iter<'_> {}
+```
+
+For further details, see [PR 1271].
+
+[PR 1271]: https://github.com/ZcashFoundation/zebra/pull/1271
 
 ## Request / Response API
 [request-response]: #request-response
@@ -753,7 +809,7 @@ CommitFinalizedBlock {
 }
 ```
 
-Commits a finalized block to the sled state, skipping contextual validation.
+Commits a finalized block to the rocksdb state, skipping contextual validation.
 This is exposed for use in checkpointing, which produces in-order finalized
 blocks. Returns `Response::Added(block::Hash)` with the hash of the
 committed block if successful.

@@ -1,0 +1,52 @@
+# Builder image
+FROM rust:buster as builder
+
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+	make cmake g++ gcc llvm libclang-dev clang ca-certificates
+
+RUN mkdir /zebra
+WORKDIR /zebra
+
+ARG SHORT_SHA
+ENV SHORT_SHA $SHORT_SHA
+
+ENV RUST_BACKTRACE full
+ENV CARGO_HOME /zebra/.cargo/
+
+RUN rustc -V; cargo -V; rustup -V
+
+COPY . .
+
+RUN cd zebrad/; cargo build --release --features enable-sentry
+
+
+# Runner image
+FROM debian:buster-slim AS zebrad-release
+
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+	ca-certificates
+
+COPY --from=builder /zebra/target/release/zebrad /
+
+ARG CHECKPOINT_SYNC=true
+ARG NETWORK=Mainnet
+
+RUN printf "[consensus]\n" >> /zebrad.toml
+RUN printf "checkpoint_sync = ${CHECKPOINT_SYNC}\n" >> /zebrad.toml
+RUN printf "[network]\n" >> /zebrad.toml
+RUN printf "network = '${NETWORK}'\n" >> /zebrad.toml
+RUN printf "[state]\n" >> /zebrad.toml
+RUN printf "cache_dir = '/zebrad-cache'\n" >> /zebrad.toml
+RUN printf "[tracing]\n" >> /zebrad.toml
+RUN printf "endpoint_addr = '0.0.0.0:3000'\n" >> /zebrad.toml
+RUN cat /zebrad.toml
+
+EXPOSE 3000 8233 18233
+
+ENV RUST_LOG debug
+ENV RUST_BACKTRACE full
+ENV SENTRY_DSN https://94059ee72a44420286310990b7c614b5@o485484.ingest.sentry.io/5540918
+
+CMD [ "/zebrad", "-c", "/zebrad.toml", "start" ]

@@ -43,6 +43,15 @@ pub struct ZebradConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TracingSection {
+    /// Whether to use colored terminal output, if available.
+    ///
+    /// Colored terminal output is automatically disabled if an output stream
+    /// is connected to a file. (Or another non-terminal device.)
+    ///
+    /// Defaults to `true`, which automatically enables colored output to
+    /// terminals.
+    pub use_color: bool,
+
     /// The filter used for tracing events.
     ///
     /// The filter is used to create a `tracing-subscriber`
@@ -101,6 +110,7 @@ pub struct TracingSection {
 impl Default for TracingSection {
     fn default() -> Self {
         Self {
+            use_color: true,
             filter: None,
             endpoint_addr: None,
             flamegraph: None,
@@ -132,10 +142,10 @@ impl Default for MetricsSection {
 pub struct SyncSection {
     /// The maximum number of concurrent block requests during sync.
     ///
-    /// This is set to a high value by default, so that the concurrency limit is
-    /// based only on the number of available peers. However, on a slow network,
-    /// making too many concurrent block requests can overwhelm the connection.
-    /// Lowering this value may help on slow or unreliable networks.
+    /// This is set to a low value by default, to avoid task and
+    /// network contention. Increasing this value may improve
+    /// performance on machines with many cores and a fast network
+    /// connection.
     pub max_concurrent_block_requests: usize,
 
     /// Controls how far ahead of the chain tip the syncer tries to
@@ -157,7 +167,7 @@ pub struct SyncSection {
 impl Default for SyncSection {
     fn default() -> Self {
         Self {
-            max_concurrent_block_requests: 1_000,
+            max_concurrent_block_requests: 50,
             lookahead_limit: 2_000,
         }
     }

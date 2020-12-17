@@ -6,6 +6,7 @@ use abscissa_core::{
     config,
     config::Configurable,
     terminal::component::Terminal,
+    terminal::ColorChoice,
     Application, Component, EntryPoint, FrameworkError, Shutdown, StandardPaths,
 };
 use application::fatal_error;
@@ -41,6 +42,20 @@ pub struct ZebradApp {
 
     /// Application state.
     state: application::State<Self>,
+}
+
+impl ZebradApp {
+    /// Are standard output and standard error both connected to ttys?
+    fn outputs_are_ttys() -> bool {
+        atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr)
+    }
+
+    pub fn git_commit() -> &'static str {
+        const GIT_COMMIT_VERGEN: &str = env!("VERGEN_SHA_SHORT");
+        const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
+
+        GIT_COMMIT_GCLOUD.unwrap_or(GIT_COMMIT_VERGEN)
+    }
 }
 
 /// Initialize a new application instance.
@@ -86,20 +101,24 @@ impl Application for ZebradApp {
         &mut self,
         command: &Self::Cmd,
     ) -> Result<Vec<Box<dyn Component<Self>>>, FrameworkError> {
-        let terminal = Terminal::new(self.term_colors(command));
-        // This MUST happen after `Terminal::new` to ensure our preferred panic
-        // handler is the last one installed
-        color_eyre::config::HookBuilder::default()
-            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
-            .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
-            .issue_filter(|kind| match kind {
-                color_eyre::ErrorKind::NonRecoverable(_) => true,
-                color_eyre::ErrorKind::Recoverable(error) => {
-                    !error.is::<tower::timeout::error::Elapsed>()
-                }
-            })
-            .install()
-            .unwrap();
+        // Automatically use color if we're outputting to a terminal
+        //
+        // The `abcissa` docs claim that abscissa implements `Auto`, but it
+        // does not - except in `color_backtrace` backtraces.
+        let mut term_colors = self.term_colors(command);
+        if term_colors == ColorChoice::Auto {
+            // We want to disable colors on a per-stream basis, but that feature
+            // can only be implemented inside the terminal component streams.
+            // Instead, if either output stream is not a terminal, disable
+            // colors.
+            //
+            // We'd also like to check `config.tracing.use_color` here, but the
+            // config has not been loaded yet.
+            if !Self::outputs_are_ttys() {
+                term_colors = ColorChoice::Never;
+            }
+        }
+        let terminal = Terminal::new(term_colors);
 
         Ok(vec![Box::new(terminal)])
     }
@@ -125,6 +144,65 @@ impl Application for ZebradApp {
             .unwrap_or_default();
 
         let config = command.process_config(config)?;
+
+        let theme = if Self::outputs_are_ttys() && config.tracing.use_color {
+            color_eyre::config::Theme::dark()
+        } else {
+            color_eyre::config::Theme::new()
+        };
+
+        // This MUST happen after `Terminal::new` to ensure our preferred panic
+        // handler is the last one installed
+        let builder = color_eyre::config::HookBuilder::default()
+            .theme(theme)
+            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
+            .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
+            .add_issue_metadata("git commit", Self::git_commit())
+            .issue_filter(|kind| match kind {
+                color_eyre::ErrorKind::NonRecoverable(_) => true,
+                color_eyre::ErrorKind::Recoverable(error) => {
+                    // type checks should be faster than string conversions
+                    if error.is::<tower::timeout::error::Elapsed>()
+                        || error.is::<tokio::time::error::Elapsed>()
+                    {
+                        return false;
+                    }
+
+                    let error_str = error.to_string();
+                    !error_str.contains("timed out") && !error_str.contains("duplicate hash")
+                }
+            });
+
+        let (panic_hook, eyre_hook) = builder.into_hooks();
+        eyre_hook.install().unwrap();
+
+        // The Sentry default config pulls in the DSN from the `SENTRY_DSN`
+        // environment variable.
+        #[cfg(feature = "enable-sentry")]
+        let guard = sentry::init(
+            sentry::ClientOptions {
+                debug: true,
+                release: Some(Self::git_commit().into()),
+                ..Default::default()
+            }
+            .add_integration(sentry_tracing::TracingIntegration::default()),
+        );
+
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let panic_report = panic_hook.panic_report(panic_info);
+            eprintln!("{}", panic_report);
+
+            #[cfg(feature = "enable-sentry")]
+            {
+                let event = crate::sentry::panic_event_from(panic_report);
+                sentry::capture_event(event);
+
+                if !guard.close(None) {
+                    warn!("unable to flush sentry events during panic");
+                }
+            }
+        }));
+
         self.config = Some(config);
 
         let cfg_ref = self
@@ -139,16 +217,24 @@ impl Application for ZebradApp {
             .map(ZebradCmd::is_server)
             .unwrap_or(false);
 
-        // Launch network endpoints for long-running commands
+        // Launch network endpoints only for long-running commands.
         if is_server {
-            let filter = cfg_ref.tracing.filter.as_deref().unwrap_or(default_filter);
-            let flame_root = cfg_ref.tracing.flamegraph.as_deref();
-            components.push(Box::new(Tracing::new(filter, flame_root)?));
+            // Override the default tracing filter based on the command-line verbosity.
+            let mut tracing_config = cfg_ref.tracing.clone();
+            tracing_config.filter = tracing_config
+                .filter
+                .or_else(|| Some(default_filter.to_owned()));
+
+            components.push(Box::new(Tracing::new(tracing_config)?));
             components.push(Box::new(TokioComponent::new()?));
             components.push(Box::new(TracingEndpoint::new(cfg_ref)?));
             components.push(Box::new(MetricsEndpoint::new(cfg_ref)?));
         } else {
-            components.push(Box::new(Tracing::new(default_filter, None)?));
+            // Don't apply the configured filter for short-lived commands.
+            let mut tracing_config = cfg_ref.tracing.clone();
+            tracing_config.filter = Some(default_filter.to_owned());
+            tracing_config.flamegraph = None;
+            components.push(Box::new(Tracing::new(tracing_config)?));
         }
 
         self.state.components.register(components)

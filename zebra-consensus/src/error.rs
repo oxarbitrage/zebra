@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-use zebra_chain::primitives::ed25519;
+use zebra_chain::{block, primitives::ed25519};
 
 use crate::BoxError;
 
@@ -28,8 +28,14 @@ pub enum TransactionError {
     #[error("coinbase input found in non-coinbase transaction")]
     CoinbaseInputFound,
 
-    #[error("coinbase transaction MUST NOT have any JoinSplit descriptions or Spend descriptions")]
-    CoinbaseHasJoinSplitOrSpend,
+    #[error("coinbase transaction MUST NOT have any JoinSplit descriptions")]
+    CoinbaseHasJoinSplit,
+
+    #[error("coinbase transaction MUST NOT have any Spend descriptions")]
+    CoinbaseHasSpend,
+
+    #[error("coinbase transaction MUST NOT have any Output descriptions pre-Heartwood")]
+    CoinbaseHasOutputPreHeartwood,
 
     #[error("coinbase transaction failed subsidy validation")]
     Subsidy(#[from] SubsidyError),
@@ -37,8 +43,11 @@ pub enum TransactionError {
     #[error("transaction version number MUST be >= 4")]
     WrongVersion,
 
-    #[error("at least one of tx_in_count, nShieldedSpend, and nJoinSplit MUST be nonzero")]
-    NoTransfer,
+    #[error("must have at least one input: transparent, shielded spend, or joinsplit")]
+    NoInputs,
+
+    #[error("must have at least one output: transparent, shielded output, or joinsplit")]
+    NoOutputs,
 
     #[error("if there are no Spends or Outputs, the value balance MUST be 0.")]
     BadBalance,
@@ -58,13 +67,20 @@ pub enum TransactionError {
 
     #[error("bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash")]
     RedJubjub(redjubjub::Error),
+
+    // temporary error type until #1186 is fixed
+    #[error("Downcast from BoxError to redjubjub::Error failed")]
+    InternalDowncastError(String),
 }
 
 impl From<BoxError> for TransactionError {
     fn from(err: BoxError) -> Self {
         match err.downcast::<redjubjub::Error>() {
             Ok(e) => TransactionError::RedJubjub(*e),
-            Err(e) => panic!(e),
+            Err(e) => TransactionError::InternalDowncastError(format!(
+                "downcast to redjubjub::Error failed, original error: {:?}",
+                e
+            )),
         }
     }
 }
@@ -82,6 +98,15 @@ pub enum BlockError {
 
     #[error("block has no transactions")]
     NoTransactions,
+
+    #[error("block has mismatched merkle root")]
+    BadMerkleRoot {
+        actual: block::merkle::Root,
+        expected: block::merkle::Root,
+    },
+
+    #[error("block contains duplicate transactions")]
+    DuplicateTransaction,
 
     #[error("block {0:?} is already in the chain at depth {1:?}")]
     AlreadyInChain(zebra_chain::block::Hash, u32),
@@ -108,10 +133,13 @@ pub enum BlockError {
         zebra_chain::work::difficulty::ExpandedDifficulty,
     ),
 
-    #[error("block {0:?} has a hash {1:?} that is easier than the difficulty threshold {2:?}")]
+    #[error(
+        "block {0:?} on {3:?} has a hash {1:?} that is easier than its difficulty threshold {2:?}"
+    )]
     DifficultyFilter(
         zebra_chain::block::Height,
         zebra_chain::block::Hash,
         zebra_chain::work::difficulty::ExpandedDifficulty,
+        zebra_chain::parameters::Network,
     ),
 }

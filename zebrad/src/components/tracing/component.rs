@@ -1,12 +1,11 @@
-use std::path::Path;
-
+use abscissa_core::{Component, FrameworkError, FrameworkErrorKind, Shutdown};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
     fmt::Formatter, layer::SubscriberExt, reload::Handle, util::SubscriberInitExt, EnvFilter,
     FmtSubscriber,
 };
 
-use abscissa_core::{Component, FrameworkError, FrameworkErrorKind, Shutdown};
+use crate::config::TracingSection;
 
 use super::flame;
 
@@ -18,10 +17,16 @@ pub struct Tracing {
 
 impl Tracing {
     /// Try to create a new [`Tracing`] component with the given `filter`.
-    pub fn new(filter: &str, flame_root: Option<&Path>) -> Result<Self, FrameworkError> {
+    pub fn new(config: TracingSection) -> Result<Self, FrameworkError> {
+        let filter = config.filter.unwrap_or_else(|| "".to_string());
+        let flame_root = &config.flamegraph;
+
+        // Only use color if tracing output is being sent to a terminal
+        let use_color = config.use_color && atty::is(atty::Stream::Stdout);
+
         // Construct a tracing subscriber with the supplied filter and enable reloading.
         let builder = FmtSubscriber::builder()
-            .with_ansi(true)
+            .with_ansi(use_color)
             .with_env_filter(filter)
             .with_filter_reloading();
         let filter_handle = builder.reload_handle();
@@ -53,7 +58,7 @@ impl Tracing {
     /// Reload the currently-active filter with the supplied value.
     ///
     /// This can be used to provide a dynamic tracing filter endpoint.
-    pub fn reload_filter(&mut self, filter: impl Into<EnvFilter>) {
+    pub fn reload_filter(&self, filter: impl Into<EnvFilter>) {
         self.filter_handle
             .reload(filter)
             .expect("the subscriber is not dropped before the component is");
@@ -72,7 +77,7 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
     }
 
     fn version(&self) -> abscissa_core::Version {
-        abscissa_core::Version::parse("3.0.0-alpha.0").unwrap()
+        abscissa_core::Version::parse("1.0.0-alpha.0").unwrap()
     }
 
     fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {

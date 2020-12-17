@@ -1,3 +1,7 @@
+//! Transaction checks.
+//!
+//! Code in this file can freely assume that no pre-V4 transactions are present.
+
 use std::convert::TryFrom;
 
 use zebra_chain::{
@@ -21,50 +25,52 @@ pub fn validate_joinsplit_sig(
         .map_err(TransactionError::Ed25519)
 }
 
-/// Check that at least one of tx_in_count, nShieldedSpend, and nJoinSplit MUST
-/// be non-zero.
+/// Checks that the transaction has inputs and outputs.
+///
+/// More specifically:
+///
+/// * at least one of tx_in_count, nShieldedSpend, and nJoinSplit MUST be non-zero.
+/// * at least one of tx_out_count, nShieldedOutput, and nJoinSplit MUST be non-zero.
 ///
 /// https://zips.z.cash/protocol/canopy.pdf#txnencodingandconsensus
-pub fn some_money_is_spent(tx: &Transaction) -> Result<(), TransactionError> {
+pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
+    // The consensus rule is written in terms of numbers, but our transactions
+    // hold enum'd data. Mixing pattern matching and numerical checks is risky,
+    // so convert everything to counts and sum up.
     match tx {
         Transaction::V4 {
             inputs,
-            joinsplit_data: Some(joinsplit_data),
-            shielded_data: Some(shielded_data),
+            outputs,
+            joinsplit_data,
+            shielded_data,
             ..
         } => {
-            if !inputs.is_empty()
-                || joinsplit_data.joinsplits().count() > 0
-                || shielded_data.spends().count() > 0
-            {
-                Ok(())
-            } else {
-                Err(TransactionError::NoTransfer)
-            }
-        }
-        _ => Err(TransactionError::WrongVersion),
-    }
-}
+            let tx_in_count = inputs.len();
+            let tx_out_count = outputs.len();
+            let n_joinsplit = joinsplit_data
+                .as_ref()
+                .map(|d| d.joinsplits().count())
+                .unwrap_or(0);
+            let n_shielded_spend = shielded_data
+                .as_ref()
+                .map(|d| d.spends().count())
+                .unwrap_or(0);
+            let n_shielded_output = shielded_data
+                .as_ref()
+                .map(|d| d.outputs().count())
+                .unwrap_or(0);
 
-/// Check that a transaction with one or more transparent inputs from coinbase
-/// transactions has no transparent outputs.
-///
-/// Note that inputs from coinbase transactions include Founders’ Reward
-/// outputs.
-///
-/// https://zips.z.cash/protocol/canopy.pdf#consensusfrombitcoin
-pub fn any_coinbase_inputs_no_transparent_outputs(
-    tx: &Transaction,
-) -> Result<(), TransactionError> {
-    match tx {
-        Transaction::V4 { outputs, .. } => {
-            if !tx.contains_coinbase_input() || !outputs.is_empty() {
-                Ok(())
+            if tx_in_count + n_shielded_spend + n_joinsplit == 0 {
+                Err(TransactionError::NoInputs)
+            } else if tx_out_count + n_shielded_output + n_joinsplit == 0 {
+                Err(TransactionError::NoOutputs)
             } else {
-                Err(TransactionError::NoTransfer)
+                Ok(())
             }
         }
-        _ => Err(TransactionError::WrongVersion),
+        Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
+            unreachable!("tx version is checked first")
+        }
     }
 }
 
@@ -86,22 +92,30 @@ pub fn shielded_balances_match(
 
 /// Check that a coinbase tx does not have any JoinSplit or Spend descriptions.
 ///
-/// https://zips.z.cash/protocol/canopy.pdf#consensusfrombitcoin
-pub fn coinbase_tx_does_not_spend_shielded(tx: &Transaction) -> Result<(), TransactionError> {
-    match tx {
-        Transaction::V4 {
-            joinsplit_data: Some(joinsplit_data),
-            shielded_data: Some(shielded_data),
-            ..
-        } => {
-            if !tx.is_coinbase()
-                || (joinsplit_data.joinsplits().count() == 0 && shielded_data.spends().count() == 0)
-            {
-                Ok(())
-            } else {
-                Err(TransactionError::CoinbaseHasJoinSplitOrSpend)
+/// https://zips.z.cash/protocol/canopy.pdf#txnencodingandconsensus
+pub fn coinbase_tx_no_joinsplit_or_spend(tx: &Transaction) -> Result<(), TransactionError> {
+    if tx.is_coinbase() {
+        match tx {
+            // Check if there is any JoinSplitData.
+            Transaction::V4 {
+                joinsplit_data: Some(_),
+                ..
+            } => Err(TransactionError::CoinbaseHasJoinSplit),
+
+            // The ShieldedData contains both Spends and Outputs, and Outputs
+            // are allowed post-Heartwood, so we have to count Spends.
+            Transaction::V4 {
+                shielded_data: Some(shielded_data),
+                ..
+            } if shielded_data.spends().count() > 0 => Err(TransactionError::CoinbaseHasSpend),
+
+            Transaction::V4 { .. } => Ok(()),
+
+            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
+                unreachable!("tx version is checked first")
             }
         }
-        _ => Err(TransactionError::WrongVersion),
+    } else {
+        Ok(())
     }
 }

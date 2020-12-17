@@ -67,7 +67,7 @@ impl StartCmd {
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(20)
-            .service(Inbound::new(setup_rx, state.clone()));
+            .service(Inbound::new(setup_rx, state.clone(), verifier.clone()));
 
         let (peer_set, address_book) = zebra_network::init(config.network.clone(), inbound).await;
         setup_tx
@@ -75,7 +75,7 @@ impl StartCmd {
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;
 
         info!("initializing syncer");
-        let mut syncer = ChainSync::new(&config, peer_set, state, verifier);
+        let syncer = ChainSync::new(&config, peer_set, state, verifier);
 
         syncer.sync().await
     }

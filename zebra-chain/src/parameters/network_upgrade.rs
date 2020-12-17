@@ -8,6 +8,8 @@ use crate::parameters::{Network, Network::*};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::*;
 
+use chrono::{DateTime, Duration, Utc};
+
 /// A Zcash network upgrade.
 ///
 /// Network upgrades can change the Zcash network protocol or consensus rules in
@@ -91,10 +93,36 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Sapling, ConsensusBranchId(0x76b809bb)),
     (Blossom, ConsensusBranchId(0x2bb40e60)),
     (Heartwood, ConsensusBranchId(0xf5b9230b)),
-    // As of 24 September 2020. Could change before mainnet activation.
-    // See ZIP 251 for any updates.
     (Canopy, ConsensusBranchId(0xe9ff75a6)),
 ];
+
+/// The target block spacing before Blossom.
+const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
+
+/// The target block spacing after Blossom activation.
+const POST_BLOSSOM_POW_TARGET_SPACING: i64 = 75;
+
+/// The averaging window for difficulty threshold arithmetic mean calculations.
+///
+/// `PoWAveragingWindow` in the Zcash specification.
+pub const POW_AVERAGING_WINDOW: usize = 17;
+
+/// The multiplier used to derive the testnet minimum difficulty block time gap
+/// threshold.
+///
+/// Based on https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network
+const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+
+/// The start height for the testnet minimum difficulty consensus rule.
+///
+/// Based on https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network
+const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
+
+/// The activation height for the block maximum time rule on Testnet.
+///
+/// Part of the block header consensus rules in the Zcash specification at
+/// https://zips.z.cash/protocol/protocol.pdf#blockheader
+pub const TESTNET_MAX_TIME_START_HEIGHT: block::Height = block::Height(653_606);
 
 impl NetworkUpgrade {
     /// Returns a BTreeMap of activation heights and network upgrades for
@@ -162,6 +190,110 @@ impl NetworkUpgrade {
     /// Returns None if this network upgrade has no consensus branch id.
     pub fn branch_id(&self) -> Option<ConsensusBranchId> {
         NetworkUpgrade::branch_id_list().get(&self).cloned()
+    }
+
+    /// Returns the target block spacing for the network upgrade.
+    ///
+    /// Based on `PRE_BLOSSOM_POW_TARGET_SPACING` and
+    /// `POST_BLOSSOM_POW_TARGET_SPACING` from the Zcash specification.
+    pub fn target_spacing(&self) -> Duration {
+        let spacing_seconds = match self {
+            Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
+            Blossom | Heartwood | Canopy => POST_BLOSSOM_POW_TARGET_SPACING,
+        };
+
+        Duration::seconds(spacing_seconds)
+    }
+
+    /// Returns the target block spacing for `network` and `height`.
+    ///
+    /// See [`target_spacing()`] for details.
+    pub fn target_spacing_for_height(network: Network, height: block::Height) -> Duration {
+        NetworkUpgrade::current(network, height).target_spacing()
+    }
+
+    /// Returns the minimum difficulty block spacing for `network` and `height`.
+    /// Returns `None` if the testnet minimum difficulty consensus rule is not active.
+    ///
+    /// Based on https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network
+    ///
+    /// `zcashd` requires a gap that's strictly greater than 6 times the target
+    /// threshold, but ZIP-205 and ZIP-208 are ambiguous. See bug #1276.
+    pub fn minimum_difficulty_spacing_for_height(
+        network: Network,
+        height: block::Height,
+    ) -> Option<Duration> {
+        match (network, height) {
+            (Network::Testnet, height) if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT => None,
+            (Network::Mainnet, _) => None,
+            (Network::Testnet, _) => {
+                let network_upgrade = NetworkUpgrade::current(network, height);
+                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
+            }
+        }
+    }
+
+    /// Returns true if the gap between `block_time` and `previous_block_time` is
+    /// greater than the Testnet minimum difficulty time gap. This time gap
+    /// depends on the `network` and `block_height`.
+    ///
+    /// Returns false on Mainnet, when `block_height` is less than the minimum
+    /// difficulty start height, and when the time gap is too small.
+    ///
+    /// `block_time` can be less than, equal to, or greater than
+    /// `previous_block_time`, because block times are provided by miners.
+    ///
+    /// Implements the Testnet minimum difficulty adjustment from ZIPs 205 and 208.
+    ///
+    /// Spec Note: Some parts of ZIPs 205 and 208 previously specified an incorrect
+    /// check for the time gap. This function implements the correct "greater than"
+    /// check.
+    pub fn is_testnet_min_difficulty_block(
+        network: Network,
+        block_height: block::Height,
+        block_time: DateTime<Utc>,
+        previous_block_time: DateTime<Utc>,
+    ) -> bool {
+        let block_time_gap = block_time - previous_block_time;
+        if let Some(min_difficulty_gap) =
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(network, block_height)
+        {
+            block_time_gap > min_difficulty_gap
+        } else {
+            false
+        }
+    }
+
+    /// Returns the averaging window timespan for the network upgrade.
+    ///
+    /// `AveragingWindowTimespan` from the Zcash specification.
+    pub fn averaging_window_timespan(&self) -> Duration {
+        self.target_spacing() * (POW_AVERAGING_WINDOW as _)
+    }
+
+    /// Returns the averaging window timespan for `network` and `height`.
+    ///
+    /// See [`averaging_window_timespan()`] for details.
+    pub fn averaging_window_timespan_for_height(
+        network: Network,
+        height: block::Height,
+    ) -> Duration {
+        NetworkUpgrade::current(network, height).averaging_window_timespan()
+    }
+
+    /// Returns true if the maximum block time rule is active for `network` and `height`.
+    ///
+    /// Always returns true if `network` is the Mainnet.
+    /// If `network` is the Testnet, the `height` should be at least
+    /// TESTNET_MAX_TIME_START_HEIGHT to return true.
+    /// Returns false otherwise.
+    ///
+    /// Part of the consensus rules at https://zips.z.cash/protocol/protocol.pdf#blockheader
+    pub fn is_max_block_time_enforced(network: Network, height: block::Height) -> bool {
+        match network {
+            Network::Mainnet => true,
+            Network::Testnet => height >= TESTNET_MAX_TIME_START_HEIGHT,
+        }
     }
 }
 

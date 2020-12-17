@@ -13,25 +13,37 @@
 
 #![warn(warnings, missing_docs, trivial_casts, unused_qualifications)]
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 #![allow(clippy::try_err)]
+// Disable some broken or unwanted clippy nightly lints
+#![allow(clippy::unknown_clippy_lints)]
+#![allow(clippy::field_reassign_with_default)]
 
 use color_eyre::eyre::Result;
 use eyre::WrapErr;
 use tempdir::TempDir;
 
-use std::{borrow::Borrow, env, fs, io::Write, time::Duration};
+use std::{convert::TryInto, env, fs, io::Write, path::Path, path::PathBuf, time::Duration};
 
 use zebra_chain::{
     block::Height,
-    parameters::Network::{self, *},
+    parameters::{
+        Network::{self, *},
+        NetworkUpgrade,
+    },
 };
 use zebra_test::{command::TestDirExt, prelude::*};
 use zebrad::config::ZebradConfig;
 
+/// The amount of time we wait after launching `zebrad`.
+///
+/// Previously, this value was 1 second, which caused occasional
+/// `tracing_endpoint` test failures on some machines.
+const LAUNCH_DELAY: Duration = Duration::from_secs(3);
+
 fn default_test_config() -> Result<ZebradConfig> {
     let mut config = ZebradConfig::default();
     config.state = zebra_state::Config::ephemeral();
-    config.state.memory_cache_bytes = 256000000;
     config.network.listen_addr = "127.0.0.1:0".parse()?;
 
     Ok(config)
@@ -51,7 +63,7 @@ fn testdir() -> Result<TempDir> {
 /// directory for `zebrad`.
 trait ZebradTestDirExt
 where
-    Self: Borrow<TempDir> + Sized,
+    Self: AsRef<Path> + Sized,
 {
     /// Spawn `zebrad` with `args` as a child process in this test directory,
     /// potentially taking ownership of the tempdir for the duration of the
@@ -69,11 +81,11 @@ where
 
 impl<T> ZebradTestDirExt for T
 where
-    Self: TestDirExt + Borrow<TempDir> + Sized,
+    Self: TestDirExt + AsRef<Path> + Sized,
 {
     fn spawn_child(self, args: &[&str]) -> Result<TestChild<Self>> {
-        let tempdir = self.borrow();
-        let default_config_path = tempdir.path().join("zebrad.toml");
+        let path = self.as_ref();
+        let default_config_path = path.join("zebrad.toml");
 
         if default_config_path.exists() {
             let mut extra_args: Vec<_> = Vec::new();
@@ -92,7 +104,7 @@ where
     }
 
     fn with_config(self, mut config: ZebradConfig) -> Result<Self> {
-        let dir = self.borrow().path();
+        let dir = self.as_ref();
 
         if !config.state.ephemeral {
             let cache_dir = dir.join("state");
@@ -107,7 +119,7 @@ where
     }
 
     fn replace_config(self, mut config: ZebradConfig) -> Result<Self> {
-        let dir = self.borrow().path();
+        let dir = self.as_ref();
 
         if !config.state.ephemeral {
             let cache_dir = dir.join("state");
@@ -135,6 +147,7 @@ where
 #[test]
 fn generate_no_args() -> Result<()> {
     zebra_test::init();
+
     let child = testdir()?
         .with_config(default_test_config()?)?
         .spawn_child(&["generate"])?;
@@ -166,6 +179,7 @@ macro_rules! assert_with_context {
 #[test]
 fn generate_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?;
     let testdir = &testdir;
 
@@ -206,6 +220,7 @@ fn generate_args() -> Result<()> {
 #[test]
 fn help_no_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
 
     let child = testdir.spawn_child(&["help"])?;
@@ -224,6 +239,7 @@ fn help_no_args() -> Result<()> {
 #[test]
 fn help_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?;
     let testdir = &testdir;
 
@@ -243,13 +259,14 @@ fn help_args() -> Result<()> {
 #[test]
 fn start_no_args() -> Result<()> {
     zebra_test::init();
+
     // start caches state, so run one of the start tests with persistent state
     let testdir = testdir()?.with_config(persistent_test_config()?)?;
 
     let mut child = testdir.spawn_child(&["-v", "start"])?;
 
-    // Run the program and kill it at 1 second
-    std::thread::sleep(Duration::from_secs(1));
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
 
     let output = child.wait_with_output()?;
@@ -266,13 +283,14 @@ fn start_no_args() -> Result<()> {
 #[test]
 fn start_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
     let testdir = &testdir;
 
     // Any free argument is valid
     let mut child = testdir.spawn_child(&["start", "argument"])?;
-    // Run the program and kill it at 1 second
-    std::thread::sleep(Duration::from_secs(1));
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
     let output = child.wait_with_output()?;
 
@@ -292,20 +310,21 @@ fn start_args() -> Result<()> {
 #[test]
 fn persistent_mode() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(persistent_test_config()?)?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(&["-v", "start"])?;
 
-    // Run the program and kill it at 1 second
-    std::thread::sleep(Duration::from_secs(1));
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
     let output = child.wait_with_output()?;
 
     // Make sure the command was killed
     output.assert_was_killed()?;
 
-    // Check that we have persistent sled database
+    // Check that we have persistent rocksdb database
     let cache_dir = testdir.path().join("state");
     assert_with_context!(cache_dir.read_dir()?.count() > 0, &output);
 
@@ -315,13 +334,14 @@ fn persistent_mode() -> Result<()> {
 #[test]
 fn ephemeral_mode() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
     let testdir = &testdir;
 
     // Any free argument is valid
     let mut child = testdir.spawn_child(&["start", "argument"])?;
-    // Run the program and kill it at 1 second
-    std::thread::sleep(Duration::from_secs(1));
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
     let output = child.wait_with_output()?;
 
@@ -355,8 +375,8 @@ fn misconfigured_ephemeral_mode() -> Result<()> {
     let mut child = dir
         .with_config(config)?
         .spawn_child(&["start", "argument"])?;
-    // Run the program and kill it at 1 second
-    std::thread::sleep(Duration::from_secs(1));
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
     let output = child.wait_with_output()?;
 
@@ -379,6 +399,7 @@ fn misconfigured_ephemeral_mode() -> Result<()> {
 #[test]
 fn app_no_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
 
     let child = testdir.spawn_child(&[])?;
@@ -393,6 +414,7 @@ fn app_no_args() -> Result<()> {
 #[test]
 fn version_no_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
 
     let child = testdir.spawn_child(&["version"])?;
@@ -407,6 +429,7 @@ fn version_no_args() -> Result<()> {
 #[test]
 fn version_args() -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?.with_config(default_test_config()?)?;
     let testdir = &testdir;
 
@@ -435,6 +458,7 @@ fn valid_generated_config_test() -> Result<()> {
 
 fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
     zebra_test::init();
+
     let testdir = testdir()?;
     let testdir = &testdir;
 
@@ -451,9 +475,9 @@ fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
     // Check if the file was created
     assert_with_context!(generated_config_path.exists(), &output);
 
-    // Run command using temp dir and kill it at 1 second
+    // Run command using temp dir and kill it after a few seconds
     let mut child = testdir.spawn_child(&[command])?;
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
 
     let output = child.wait_with_output()?;
@@ -523,12 +547,12 @@ fn restart_stop_at_height() -> Result<()> {
         SMALL_CHECKPOINT_TIMEOUT,
         None,
     )?;
-    // if stopping corrupts the sled database, zebrad might hang here
-    // if stopping does not sync the sled database, the logs will contain OnCommit
+    // if stopping corrupts the rocksdb database, zebrad might hang here
+    // if stopping does not sync the rocksdb database, the logs will contain OnCommit
     sync_until(
         Height(0),
         Mainnet,
-        "called_from=OnLoad",
+        "state is already at the configured height",
         STOP_ON_LOAD_TIMEOUT,
         Some(reuse_tempdir),
     )?;
@@ -631,15 +655,117 @@ fn sync_until(
     Ok(child.dir)
 }
 
+fn cached_sapling_test_config() -> Result<ZebradConfig> {
+    let mut config = persistent_test_config()?;
+    config.consensus.checkpoint_sync = true;
+    config.state.cache_dir = "/zebrad-cache".into();
+    Ok(config)
+}
+
+fn create_cached_database_height(network: Network, height: Height) -> Result<()> {
+    println!("Creating cached database");
+    // 8 hours
+    let timeout = Duration::from_secs(60 * 60 * 8);
+
+    // Use a persistent state, so we can handle large syncs
+    let mut config = cached_sapling_test_config()?;
+    // TODO: add convenience methods?
+    config.network.network = network;
+    config.state.debug_stop_at_height = Some(height.0);
+    let dir = PathBuf::from("/zebrad-cache");
+
+    fs::File::create(dir.join("zebrad.toml"))?.write_all(toml::to_string(&config)?.as_bytes())?;
+
+    let mut child = dir
+        .spawn_child(&["start"])?
+        .with_timeout(timeout)
+        .bypass_test_capture(true);
+
+    let network = format!("network: {},", network);
+    child.expect_stdout(&network)?;
+    child.expect_stdout(STOP_AT_HEIGHT_REGEX)?;
+    child.kill()?;
+
+    Ok(())
+}
+
+fn create_cached_database(network: Network) -> Result<()> {
+    let height = NetworkUpgrade::Sapling.activation_height(network).unwrap();
+    create_cached_database_height(network, height)
+}
+
+fn sync_past_sapling(network: Network) -> Result<()> {
+    let height = NetworkUpgrade::Sapling.activation_height(network).unwrap() + 1200;
+    create_cached_database_height(network, height.unwrap())
+}
+
+// These tests are ignored because they're too long running to run during our
+// traditional CI, and they depend on persistent state that cannot be made
+// available in github actions or google cloud build. Instead we run these tests
+// directly in a vm we spin up on google compute engine, where we can mount
+// drives populated by the first two tests, snapshot those drives, and then use
+// those to more quickly run the second two tests.
+
+// Sync up to the sapling activation height on mainnet and stop.
+#[cfg_attr(feature = "test_sync_to_sapling_mainnet", test)]
+fn sync_to_sapling_mainnet() {
+    zebra_test::init();
+    let network = Mainnet;
+    create_cached_database(network).unwrap();
+}
+// Sync to the sapling activation height testnet and stop.
+#[cfg_attr(feature = "test_sync_to_sapling_testnet", test)]
+fn sync_to_sapling_testnet() {
+    zebra_test::init();
+    let network = Testnet;
+    create_cached_database(network).unwrap();
+}
+
+/// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on mainnet.
+///
+/// This assumes that the config'd state is already synced at or near Sapling
+/// activation on mainnet. If the state has already synced past Sapling
+/// activation by 1200 blocks, it will fail.
+#[cfg_attr(feature = "test_sync_past_sapling_mainnet", test)]
+fn sync_past_sapling_mainnet() {
+    zebra_test::init();
+    let network = Mainnet;
+    sync_past_sapling(network).unwrap();
+}
+
+/// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on testnet.
+///
+/// This assumes that the config'd state is already synced at or near Sapling
+/// activation on testnet. If the state has already synced past Sapling
+/// activation by 1200 blocks, it will fail.
+#[cfg_attr(feature = "test_sync_past_sapling_testnet", test)]
+fn sync_past_sapling_testnet() {
+    zebra_test::init();
+    let network = Testnet;
+    sync_past_sapling(network).unwrap();
+}
+
+/// Returns a random port
+///
+/// Does not check if the port is already in use. It's impossible to do this
+/// check in a reliable, cross-platform way.
+fn random_port() -> u16 {
+    // Use the intersection of the IANA ephemeral port range, and the Linux
+    // ephemeral port range:
+    // https://en.wikipedia.org/wiki/Ephemeral_port#Range
+    rand::thread_rng().gen_range(49152, 60999)
+}
+
 #[tokio::test]
 async fn metrics_endpoint() -> Result<()> {
-    use hyper::{Client, Uri};
+    use hyper::Client;
 
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
-    let endpoint = "127.0.0.1:50001";
-    let url = "http://127.0.0.1:50001";
+    let port = random_port();
+    let endpoint = format!("127.0.0.1:{}", port);
+    let url = format!("http://{}", endpoint);
 
     // Write a configuration that has metrics endpoint_addr set
     let mut config = default_test_config()?;
@@ -651,19 +777,23 @@ async fn metrics_endpoint() -> Result<()> {
 
     let mut child = dir.spawn_child(&["start"])?;
 
-    // Run the program for a second before testing the endpoint
-    std::thread::sleep(Duration::from_secs(1));
+    // Run `zebrad` for a few seconds before testing the endpoint
+    // Since we're an async function, we have to use a sleep future, not thread sleep.
+    tokio::time::sleep(LAUNCH_DELAY).await;
 
     // Create an http client
     let client = Client::new();
 
     // Test metrics endpoint
-    let res = client.get(Uri::from_static(url)).await?;
+    let res = client.get(url.try_into().expect("url is valid")).await?;
     assert!(res.status().is_success());
     let body = hyper::body::to_bytes(res).await?;
-    assert!(std::str::from_utf8(&body)
-        .unwrap()
-        .contains("metrics snapshot"));
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("metrics response is valid UTF-8")
+            .contains("metrics snapshot"),
+        "metrics exporter returns data in the expected format"
+    );
 
     child.kill()?;
 
@@ -682,16 +812,16 @@ async fn metrics_endpoint() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn tracing_endpoint() -> Result<()> {
-    use hyper::{Body, Client, Request, Uri};
+    use hyper::{Body, Client, Request};
 
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
-    let endpoint = "127.0.0.1:50002";
-    let url_default = "http://127.0.0.1:50002";
-    let url_filter = "http://127.0.0.1:50002/filter";
+    let port = random_port();
+    let endpoint = format!("127.0.0.1:{}", port);
+    let url_default = format!("http://{}", endpoint);
+    let url_filter = format!("{}/filter", url_default);
 
     // Write a configuration that has tracing endpoint_addr option set
     let mut config = default_test_config()?;
@@ -703,14 +833,17 @@ async fn tracing_endpoint() -> Result<()> {
 
     let mut child = dir.spawn_child(&["start"])?;
 
-    // Run the program for a second before testing the endpoint
-    std::thread::sleep(Duration::from_secs(1));
+    // Run `zebrad` for a few seconds before testing the endpoint
+    // Since we're an async function, we have to use a sleep future, not thread sleep.
+    tokio::time::sleep(LAUNCH_DELAY).await;
 
     // Create an http client
     let client = Client::new();
 
     // Test tracing endpoint
-    let res = client.get(Uri::from_static(url_default)).await?;
+    let res = client
+        .get(url_default.try_into().expect("url_default is valid"))
+        .await?;
     assert!(res.status().is_success());
     let body = hyper::body::to_bytes(res).await?;
     assert!(std::str::from_utf8(&body).unwrap().contains(
@@ -718,12 +851,14 @@ async fn tracing_endpoint() -> Result<()> {
     ));
 
     // Set a filter and make sure it was changed
-    let request = Request::post(url_filter)
+    let request = Request::post(url_filter.clone())
         .body(Body::from("zebrad=debug"))
         .unwrap();
     let _post = client.request(request).await?;
 
-    let tracing_res = client.get(Uri::from_static(url_filter)).await?;
+    let tracing_res = client
+        .get(url_filter.try_into().expect("url_filter is valid"))
+        .await?;
     assert!(tracing_res.status().is_success());
     let tracing_body = hyper::body::to_bytes(tracing_res).await?;
     assert!(std::str::from_utf8(&tracing_body)

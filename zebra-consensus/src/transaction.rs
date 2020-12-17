@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -9,12 +10,14 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     FutureExt,
 };
-
 use tower::{Service, ServiceExt};
+use tracing::Instrument;
 
 use zebra_chain::{
-    parameters::NetworkUpgrade,
+    block,
+    parameters::{Network, NetworkUpgrade},
     transaction::{self, HashType, Transaction},
+    transparent,
 };
 
 use zebra_state as zs;
@@ -26,6 +29,7 @@ mod check;
 /// Asynchronous transaction verification.
 #[derive(Debug, Clone)]
 pub struct Verifier<ZS> {
+    network: Network,
     script_verifier: script::Verifier<ZS>,
     // spend_verifier: groth16::Verifier,
     // output_verifier: groth16::Verifier,
@@ -38,8 +42,11 @@ where
     ZS::Future: Send + 'static,
 {
     // XXX: how should this struct be constructed?
-    pub fn new(script_verifier: script::Verifier<ZS>) -> Self {
-        Self { script_verifier }
+    pub fn new(network: Network, script_verifier: script::Verifier<ZS>) -> Self {
+        Self {
+            network,
+            script_verifier,
+        }
     }
 }
 
@@ -51,9 +58,24 @@ where
 #[allow(dead_code)]
 pub enum Request {
     /// Verify the supplied transaction as part of a block.
-    Block(Arc<Transaction>),
+    Block {
+        /// The transaction itself.
+        transaction: Arc<Transaction>,
+        /// Additional UTXOs which are known at the time of verification.
+        known_utxos: Arc<HashMap<transparent::OutPoint, zs::Utxo>>,
+        /// The height of the block containing this transaction, used to
+        /// determine the applicable network upgrade.
+        height: block::Height,
+    },
     /// Verify the supplied transaction as part of the mempool.
-    Mempool(Arc<Transaction>),
+    Mempool {
+        /// The transaction itself.
+        transaction: Arc<Transaction>,
+        /// Additional UTXOs which are known at the time of verification.
+        known_utxos: Arc<HashMap<transparent::OutPoint, zs::Utxo>>,
+        /// The active NU in the context of this verification.
+        upgrade: NetworkUpgrade,
+    },
 }
 
 impl<ZS> Service<Request> for Verifier<ZS>
@@ -73,24 +95,38 @@ where
     // TODO: break up each chunk into its own method
     fn call(&mut self, req: Request) -> Self::Future {
         let is_mempool = match req {
-            Request::Block(_) => false,
-            Request::Mempool(_) => true,
+            Request::Block { .. } => false,
+            Request::Mempool { .. } => true,
         };
         if is_mempool {
             // XXX determine exactly which rules apply to mempool transactions
             unimplemented!();
         }
 
-        let tx = match req {
-            Request::Block(tx) => tx,
-            Request::Mempool(tx) => tx,
+        let (tx, known_utxos, upgrade) = match req {
+            Request::Block {
+                transaction,
+                known_utxos,
+                height,
+            } => {
+                let upgrade = NetworkUpgrade::current(self.network, height);
+                (transaction, known_utxos, upgrade)
+            }
+            Request::Mempool {
+                transaction,
+                known_utxos,
+                upgrade,
+            } => (transaction, known_utxos, upgrade),
         };
 
         let mut redjubjub_verifier = crate::primitives::redjubjub::VERIFIER.clone();
         let mut script_verifier = self.script_verifier.clone();
+        let span = tracing::debug_span!("tx", hash = %tx.hash());
         async move {
+            tracing::trace!(?tx);
             match &*tx {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
+                    tracing::debug!(?tx, "got transaction with wrong version");
                     Err(TransactionError::WrongVersion)
                 }
                 Transaction::V4 {
@@ -108,17 +144,16 @@ where
                     let mut async_checks = FuturesUnordered::new();
 
                     // Handle transparent inputs and outputs.
-                    // These are left unimplemented!() pending implementation
-                    // of the async script RFC.
-                    #[allow(clippy::if_same_then_else)] // delete when filled in
                     if tx.is_coinbase() {
                         // do something special for coinbase transactions
-                        check::coinbase_tx_does_not_spend_shielded(&tx)?;
+                        check::coinbase_tx_no_joinsplit_or_spend(&tx)?;
                     } else {
                         // otherwise, check no coinbase inputs
                         // feed all of the inputs to the script verifier
                         for input_index in 0..inputs.len() {
                             let rsp = script_verifier.ready_and().await?.call(script::Request {
+                                upgrade,
+                                known_utxos: known_utxos.clone(),
                                 transaction: tx.clone(),
                                 input_index,
                             });
@@ -127,13 +162,13 @@ where
                         }
                     }
 
-                    check::some_money_is_spent(&tx)?;
-                    check::any_coinbase_inputs_no_transparent_outputs(&tx)?;
+                    check::has_inputs_and_outputs(&tx)?;
 
+                    // TODO: rework this code #1377
                     let sighash = tx.sighash(
-                        NetworkUpgrade::Sapling, // TODO: pass this in
-                        HashType::ALL,           // TODO: check these
-                        None,                    // TODO: check these
+                        upgrade,
+                        HashType::ALL, // TODO: check these
+                        None,          // TODO: check these
                     );
 
                     if let Some(joinsplit_data) = joinsplit_data {
@@ -144,7 +179,8 @@ where
 
                         // Then, pass those items to self.joinsplit to verify them.
 
-                        check::validate_joinsplit_sig(joinsplit_data, sighash.as_bytes())?;
+                        // Ignore pending sighash check #1377
+                        let _ = check::validate_joinsplit_sig(joinsplit_data, sighash.as_bytes());
                     }
 
                     if let Some(shielded_data) = shielded_data {
@@ -159,12 +195,13 @@ where
                             // description while adding the resulting future to
                             // our collection of async checks that (at a
                             // minimum) must pass for the transaction to verify.
-                            let rsp = redjubjub_verifier
+                            let _rsp = redjubjub_verifier
                                 .ready_and()
                                 .await?
                                 .call((spend.rk, spend.spend_auth_sig, &sighash).into());
 
-                            async_checks.push(rsp.boxed());
+                            // Disable pending sighash check #1377
+                            //async_checks.push(rsp.boxed());
 
                             // TODO: prepare public inputs for spends, then create
                             // a groth16::Item and pass to self.spend
@@ -192,17 +229,20 @@ where
                         });
 
                         let bvk = shielded_data.binding_verification_key(*value_balance);
-                        let rsp = redjubjub_verifier
+                        let _rsp = redjubjub_verifier
                             .ready_and()
                             .await?
                             .call((bvk, shielded_data.binding_sig, &sighash).into())
                             .boxed();
-                        async_checks.push(rsp);
+
+                        // Disable pending sighash check #1377
+                        //async_checks.push(rsp);
                     }
 
                     // Finally, wait for all asynchronous checks to complete
                     // successfully, or fail verification if they error.
                     while let Some(check) = async_checks.next().await {
+                        tracing::trace!(?check, remaining = async_checks.len());
                         check?;
                     }
 
@@ -210,6 +250,7 @@ where
                 }
             }
         }
+        .instrument(span)
         .boxed()
     }
 }
