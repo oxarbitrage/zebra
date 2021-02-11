@@ -1,24 +1,15 @@
-// NOT A PLACE OF HONOR
-//
-// NO ESTEEMED DEED IS COMMEMORATED HERE
-//
-// NOTHING VALUED IS HERE
-//
-// What is here was dangerous and repulsive to us. This message is a warning
-// about danger.
-//
-// The danger is in a particular module... it increases towards a center... the
-// center of danger is pub async fn Connection::run the danger is still present,
-// in your time, as it was in ours.
-//
-// The danger is to the mind. The danger is unleashed only if you substantially
-// disturb this code. This code is best shunned and left encapsulated.
+//! Zcash peer connection protocol handing for Zebra.
+//!
+//! Maps the external Zcash/Bitcoin protocol to Zebra's internal request/response
+//! protocol.
+//!
+//! This module contains a lot of undocumented state, assumptions and invariants.
+//! And it's unclear if these assumptions match the `zcashd` implementation.
+//! It should be refactored into a cleaner set of request/response pairs (#1515).
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use futures::{
-    channel::{mpsc, oneshot},
     future::{self, Either},
     prelude::*,
     stream::Stream,
@@ -42,8 +33,12 @@ use crate::{
     BoxError,
 };
 
-use super::{ClientRequest, ErrorSlot, PeerError, SharedPeerError};
+use super::{
+    ClientRequestReceiver, ErrorSlot, InProgressClientRequest, MustUseOneshotSender, PeerError,
+    SharedPeerError,
+};
 
+#[derive(Debug)]
 pub(super) enum Handler {
     /// Indicates that the handler has finished processing the request.
     /// An error here is scoped to the request.
@@ -91,6 +86,10 @@ impl Handler {
                 }
             }
             (Handler::Peers, Message::Addr(addrs)) => Handler::Finished(Ok(Response::Peers(addrs))),
+            // `zcashd` returns requested transactions in a single batch of messages.
+            // Other transaction or non-transaction messages can come before or after the batch.
+            // After the transaction batch, `zcashd` sends `NotFound` if any transactions are missing:
+            // https://github.com/zcash/zcash/blob/e7b425298f6d9a54810cb7183f00be547e4d9415/src/main.cpp#L5617
             (
                 Handler::TransactionsByHash {
                     mut hashes,
@@ -98,20 +97,52 @@ impl Handler {
                 },
                 Message::Tx(transaction),
             ) => {
+                // assumptions:
+                //   - the transaction messages are sent in a single continous batch
+                //   - missing transaction hashes are included in a `NotFound` message
                 if hashes.remove(&transaction.hash()) {
+                    // we are in the middle of the continous transaction messages
                     transactions.push(transaction);
+                    if hashes.is_empty() {
+                        Handler::Finished(Ok(Response::Transactions(transactions)))
+                    } else {
+                        Handler::TransactionsByHash {
+                            hashes,
+                            transactions,
+                        }
+                    }
                 } else {
+                    // We got a transaction we didn't ask for. If the caller doesn't know any of the
+                    // transactions, they should have sent a `NotFound` with all the hashes, rather
+                    // than an unsolicited transaction.
+                    //
+                    // So either:
+                    // 1. The peer implements the protocol badly, skipping `NotFound`.
+                    //    We should cancel the request, so we don't hang waiting for transactions
+                    //    that will never arrive.
+                    // 2. The peer sent an unsolicited transaction.
+                    //    We should ignore the transaction, and wait for the actual response.
+                    //
+                    // We end the request, so we don't hang on bad peers (case 1). But we keep the
+                    // connection open, so the inbound service can process transactions from good
+                    // peers (case 2).
                     ignored_msg = Some(Message::Tx(transaction));
-                }
-                if hashes.is_empty() {
-                    Handler::Finished(Ok(Response::Transactions(transactions)))
-                } else {
-                    Handler::TransactionsByHash {
-                        hashes,
-                        transactions,
+                    if !transactions.is_empty() {
+                        // if our peers start sending mixed solicited and unsolicited transactions,
+                        // we should update this code to handle those responses
+                        error!("unexpected transaction from peer: transaction responses should be sent in a continuous batch, followed by notfound. Using partial received transactions as the peer response");
+                        // TODO: does the caller need a list of missing transactions? (#1515)
+                        Handler::Finished(Ok(Response::Transactions(transactions)))
+                    } else {
+                        // TODO: is it really an error if we ask for a transaction hash, but the peer
+                        // doesn't know it? Should we close the connection on that kind of error?
+                        // Should we fake a NotFound response here? (#1515)
+                        let items = hashes.iter().map(|h| InventoryHash::Tx(*h)).collect();
+                        Handler::Finished(Err(PeerError::NotFound(items)))
                     }
                 }
             }
+            // `zcashd` peers actually return this response
             (
                 Handler::TransactionsByHash {
                     hashes,
@@ -119,23 +150,46 @@ impl Handler {
                 },
                 Message::NotFound(items),
             ) => {
-                let hash_in_hashes = |item: &InventoryHash| {
-                    if let InventoryHash::Tx(hash) = item {
-                        hashes.contains(hash)
-                    } else {
-                        false
-                    }
-                };
-                if items.iter().all(hash_in_hashes) {
-                    Handler::Finished(Err(PeerError::NotFound(items)))
+                // assumptions:
+                //   - the peer eventually returns a transaction or a `NotFound` entry
+                //     for each hash
+                //   - all `NotFound` entries are contained in a single message
+                //   - the `NotFound` message comes after the transaction messages
+                //
+                // If we're in sync with the peer, then the `NotFound` should contain the remaining
+                // hashes from the handler. If we're not in sync with the peer, we should return
+                // what we got so far, and log an error.
+                let missing_transactions: HashSet<_> = items
+                    .iter()
+                    .filter_map(|inv| match &inv {
+                        InventoryHash::Tx(tx) => Some(tx),
+                        _ => None,
+                    })
+                    .cloned()
+                    .collect();
+                if missing_transactions != hashes {
+                    trace!(?items, ?missing_transactions, ?hashes);
+                    // if these errors are noisy, we should replace them with debugs
+                    error!("unexpected notfound message from peer: all remaining transaction hashes should be listed in the notfound. Using partial received transactions as the peer response");
+                }
+                if missing_transactions.len() != items.len() {
+                    trace!(?items, ?missing_transactions, ?hashes);
+                    error!("unexpected notfound message from peer: notfound contains duplicate hashes or non-transaction hashes. Using partial received transactions as the peer response");
+                }
+
+                if !transactions.is_empty() {
+                    // TODO: does the caller need a list of missing transactions? (#1515)
+                    Handler::Finished(Ok(Response::Transactions(transactions)))
                 } else {
-                    ignored_msg = Some(Message::NotFound(items));
-                    Handler::TransactionsByHash {
-                        hashes,
-                        transactions,
-                    }
+                    // TODO: is it really an error if we ask for a transaction hash, but the peer
+                    // doesn't know it? Should we close the connection on that kind of error? (#1515)
+                    Handler::Finished(Err(PeerError::NotFound(items)))
                 }
             }
+            // `zcashd` returns requested blocks in a single batch of messages.
+            // Other blocks or non-blocks messages can come before or after the batch.
+            // `zcashd` silently skips missing blocks, rather than sending a final `NotFound` message.
+            // https://github.com/zcash/zcash/blob/e7b425298f6d9a54810cb7183f00be547e4d9415/src/main.cpp#L5523
             (
                 Handler::BlocksByHash {
                     mut hashes,
@@ -143,30 +197,80 @@ impl Handler {
                 },
                 Message::Block(block),
             ) => {
+                // assumptions:
+                //   - the block messages are sent in a single continuous batch
+                //   - missing blocks are silently skipped
+                //     (there is no `NotFound` message at the end of the batch)
                 if hashes.remove(&block.hash()) {
+                    // we are in the middle of the continuous block messages
                     blocks.push(block);
+                    if hashes.is_empty() {
+                        Handler::Finished(Ok(Response::Blocks(blocks)))
+                    } else {
+                        Handler::BlocksByHash { hashes, blocks }
+                    }
                 } else {
+                    // We got a block we didn't ask for.
+                    //
+                    // So either:
+                    // 1. The peer doesn't know any of the blocks we asked for.
+                    //    We should cancel the request, so we don't hang waiting for blocks that
+                    //    will never arrive.
+                    // 2. The peer sent an unsolicited block.
+                    //    We should ignore that block, and wait for the actual response.
+                    //
+                    // We end the request, so we don't hang on forked or lagging peers (case 1).
+                    // But we keep the connection open, so the inbound service can process blocks
+                    // from good peers (case 2).
                     ignored_msg = Some(Message::Block(block));
-                }
-                if hashes.is_empty() {
-                    Handler::Finished(Ok(Response::Blocks(blocks)))
-                } else {
-                    Handler::BlocksByHash { hashes, blocks }
+                    if !blocks.is_empty() {
+                        // TODO: does the caller need a list of missing blocks? (#1515)
+                        Handler::Finished(Ok(Response::Blocks(blocks)))
+                    } else {
+                        // TODO: is it really an error if we ask for a block hash, but the peer
+                        // doesn't know it? Should we close the connection on that kind of error?
+                        // Should we fake a NotFound response here? (#1515)
+                        let items = hashes.iter().map(|h| InventoryHash::Block(*h)).collect();
+                        Handler::Finished(Err(PeerError::NotFound(items)))
+                    }
                 }
             }
+            // peers are allowed to return this response, but `zcashd` never does
             (Handler::BlocksByHash { hashes, blocks }, Message::NotFound(items)) => {
-                let hash_in_hashes = |item: &InventoryHash| {
-                    if let InventoryHash::Block(hash) = item {
-                        hashes.contains(hash)
-                    } else {
-                        false
-                    }
-                };
-                if items.iter().all(hash_in_hashes) {
-                    Handler::Finished(Err(PeerError::NotFound(items)))
+                // assumptions:
+                //   - the peer eventually returns a block or a `NotFound` entry
+                //     for each hash
+                //   - all `NotFound` entries are contained in a single message
+                //   - the `NotFound` message comes after the block messages
+                //
+                // If we're in sync with the peer, then the `NotFound` should contain the remaining
+                // hashes from the handler. If we're not in sync with the peer, we should return
+                // what we got so far, and log an error.
+                let missing_blocks: HashSet<_> = items
+                    .iter()
+                    .filter_map(|inv| match &inv {
+                        InventoryHash::Block(b) => Some(b),
+                        _ => None,
+                    })
+                    .cloned()
+                    .collect();
+                if missing_blocks != hashes {
+                    trace!(?items, ?missing_blocks, ?hashes);
+                    // if these errors are noisy, we should replace them with debugs
+                    error!("unexpected notfound message from peer: all remaining block hashes should be listed in the notfound. Using partial received blocks as the peer response");
+                }
+                if missing_blocks.len() != items.len() {
+                    trace!(?items, ?missing_blocks, ?hashes);
+                    error!("unexpected notfound message from peer: notfound contains duplicate hashes or non-block hashes. Using partial received blocks as the peer response");
+                }
+
+                if !blocks.is_empty() {
+                    // TODO: does the caller need a list of missing blocks? (#1515)
+                    Handler::Finished(Ok(Response::Blocks(blocks)))
                 } else {
-                    ignored_msg = Some(Message::NotFound(items));
-                    Handler::BlocksByHash { hashes, blocks }
+                    // TODO: is it really an error if we ask for a block hash, but the peer
+                    // doesn't know it? Should we close the connection on that kind of error? (#1515)
+                    Handler::Finished(Err(PeerError::NotFound(items)))
                 }
             }
             (Handler::FindBlocks, Message::Inv(items))
@@ -202,13 +306,15 @@ impl Handler {
     }
 }
 
+#[derive(Debug)]
+#[must_use = "AwaitingResponse.tx.send() must be called before drop"]
 pub(super) enum State {
     /// Awaiting a client request or a peer message.
     AwaitingRequest,
     /// Awaiting a peer message we can interpret as a client request.
     AwaitingResponse {
         handler: Handler,
-        tx: oneshot::Sender<Result<Response, SharedPeerError>>,
+        tx: MustUseOneshotSender<Result<Response, SharedPeerError>>,
         span: tracing::Span,
     },
     /// A failure has occurred and we are shutting down the connection.
@@ -223,7 +329,9 @@ pub struct Connection<S, Tx> {
     /// other state handling.
     pub(super) request_timer: Option<Sleep>,
     pub(super) svc: S,
-    pub(super) client_rx: mpsc::Receiver<ClientRequest>,
+    /// A `mpsc::Receiver<ClientRequest>` that converts its results to
+    /// `InProgressClientRequest`
+    pub(super) client_rx: ClientRequestReceiver,
     /// A slot for an error shared between the Connection and the Client that uses it.
     pub(super) error_slot: ErrorSlot,
     //pub(super) peer_rx: Rx,
@@ -268,7 +376,7 @@ where
                         Either::Left((None, _)) => {
                             self.fail_with(PeerError::ConnectionClosed);
                         }
-                        Either::Left((Some(Err(e)), _)) => self.fail_with(e.into()),
+                        Either::Left((Some(Err(e)), _)) => self.fail_with(e),
                         Either::Left((Some(Ok(msg)), _)) => {
                             self.handle_message_as_request(msg).await
                         }
@@ -302,7 +410,7 @@ where
                         .await
                     {
                         Either::Left((None, _)) => self.fail_with(PeerError::ConnectionClosed),
-                        Either::Left((Some(Err(e)), _)) => self.fail_with(e.into()),
+                        Either::Left((Some(Err(e)), _)) => self.fail_with(e),
                         Either::Left((Some(Ok(peer_msg)), _cancel)) => {
                             // Try to process the message using the handler.
                             // This extremely awkward construction avoids
@@ -315,7 +423,11 @@ where
                                 State::AwaitingResponse {
                                     ref mut handler, ..
                                 } => span.in_scope(|| handler.process_message(peer_msg)),
-                                _ => unreachable!(),
+                                _ => unreachable!("unexpected state after AwaitingResponse: {:?}, peer_msg: {:?}, client_receiver: {:?}",
+                                                  self.state,
+                                                  peer_msg,
+                                                  self.client_rx,
+                                ),
                             };
                             // If the message was not consumed, check whether it
                             // should be handled as a request.
@@ -336,7 +448,10 @@ where
                                         State::AwaitingRequest
                                     }
                                     pending @ State::AwaitingResponse { .. } => pending,
-                                    _ => unreachable!(),
+                                    _ => unreachable!(
+                                        "unexpected failed connection state while AwaitingResponse: client_receiver: {:?}",
+                                        self.client_rx
+                                    ),
                                 };
                             }
                         }
@@ -357,7 +472,10 @@ where
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
-                                _ => unreachable!(),
+                                _ => unreachable!(
+                                    "unexpected failed connection state while AwaitingResponse: client_receiver: {:?}",
+                                    self.client_rx
+                                ),
                             };
                         }
                         Either::Right((Either::Right(_), _peer_fut)) => {
@@ -370,10 +488,10 @@ where
                 // requests before we can return and complete the future.
                 State::Failed => {
                     match self.client_rx.next().await {
-                        Some(ClientRequest { tx, span, .. }) => {
+                        Some(InProgressClientRequest { tx, span, .. }) => {
                             trace!(
                                 parent: &span,
-                                "erroring pending request to failed connection"
+                                "sending an error response to a pending request on a failed connection"
                             );
                             let e = self
                                 .error_slot
@@ -391,18 +509,38 @@ where
     }
 
     /// Marks the peer as having failed with error `e`.
-    fn fail_with(&mut self, e: PeerError) {
-        debug!(%e, "failing peer service with error");
+    fn fail_with<E>(&mut self, e: E)
+    where
+        E: Into<SharedPeerError>,
+    {
+        let e = e.into();
+        debug!(%e,
+               connection_state = ?self.state,
+               client_receiver = ?self.client_rx,
+               "failing peer service with error");
         // Update the shared error slot
         let mut guard = self
             .error_slot
             .0
             .lock()
             .expect("mutex should be unpoisoned");
-        if guard.is_some() {
-            panic!("called fail_with on already-failed connection state");
+        if let Some(original_error) = guard.clone() {
+            // This panic typically happens due to these bugs:
+            // * we mark a connection as failed without using fail_with
+            // * we call fail_with without checking for a failed connection
+            //   state
+            //
+            // See the original bug #1510 and PR #1531, and the later bug #1599
+            // and PR #1600.
+            panic!(
+                "calling fail_with on already-failed connection state: failed connections must stop processing pending requests and responses, then close the connection. state: {:?} original error: {:?} new error: {:?} client receiver: {:?}",
+                self.state,
+                original_error,
+                e,
+                self.client_rx
+            );
         } else {
-            *guard = Some(e.into());
+            *guard = Some(e);
         }
         // Drop the guard immediately to release the mutex.
         std::mem::drop(guard);
@@ -425,11 +563,11 @@ where
     /// remote peer.
     ///
     /// NOTE: the caller should use .instrument(msg.span) to instrument the function.
-    async fn handle_client_request(&mut self, req: ClientRequest) {
+    async fn handle_client_request(&mut self, req: InProgressClientRequest) {
         trace!(?req.request);
         use Request::*;
         use State::*;
-        let ClientRequest { request, tx, span } = req;
+        let InProgressClientRequest { request, tx, span } = req;
 
         if tx.is_canceled() {
             metrics::counter!("peer.canceled", 1);
@@ -437,126 +575,186 @@ where
             return;
         }
 
-        // XXX(hdevalence) this is truly horrible, but let's fix it later
-
-        // Inner match returns Result with the new state or an error.
-        // Outer match updates state or fails.
-        match match (&self.state, request) {
-            (Failed, _) => panic!("failed connection cannot handle requests"),
-            (AwaitingResponse { .. }, _) => panic!("tried to update pending request"),
-            (AwaitingRequest, Peers) => self
-                .peer_tx
-                .send(Message::GetAddr)
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::Peers,
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, Ping(nonce)) => self
-                .peer_tx
-                .send(Message::Ping(nonce))
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::Ping(nonce),
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, BlocksByHash(hashes)) => self
-                .peer_tx
-                .send(Message::GetData(
-                    hashes.iter().map(|h| (*h).into()).collect(),
-                ))
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::BlocksByHash {
-                        blocks: Vec::with_capacity(hashes.len()),
-                        hashes,
+        // These matches return a Result with (new_state, Option<Sender>) or an (error, Sender)
+        let new_state_result = match (&self.state, request) {
+            (Failed, request) => panic!(
+                "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
+                request,
+                self.client_rx
+            ),
+            (pending @ AwaitingResponse { .. }, request) => panic!(
+                "tried to process new request: {:?} while awaiting a response: {:?}, client_receiver: {:?}",
+                request,
+                pending,
+                self.client_rx
+            ),
+            (AwaitingRequest, Peers) => match self.peer_tx.send(Message::GetAddr).await {
+                Ok(()) => Ok((
+                    AwaitingResponse {
+                        handler: Handler::Peers,
+                        tx,
+                        span,
                     },
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, TransactionsByHash(hashes)) => self
-                .peer_tx
-                .send(Message::GetData(
-                    hashes.iter().map(|h| (*h).into()).collect(),
-                ))
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::TransactionsByHash {
-                        transactions: Vec::with_capacity(hashes.len()),
-                        hashes,
+                    None,
+                )),
+                Err(e) => Err((e, tx)),
+            },
+            (AwaitingRequest, Ping(nonce)) => match self.peer_tx.send(Message::Ping(nonce)).await {
+                Ok(()) => Ok((
+                    AwaitingResponse {
+                        handler: Handler::Ping(nonce),
+                        tx,
+                        span,
                     },
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, FindBlocks { known_blocks, stop }) => self
-                .peer_tx
-                .send(Message::GetBlocks { known_blocks, stop })
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::FindBlocks,
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, FindHeaders { known_blocks, stop }) => self
-                .peer_tx
-                .send(Message::GetHeaders { known_blocks, stop })
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::FindHeaders,
-                    tx,
-                    span,
-                }),
-            (AwaitingRequest, MempoolTransactions) => self
-                .peer_tx
-                .send(Message::Mempool)
-                .await
-                .map_err(|e| e.into())
-                .map(|()| AwaitingResponse {
-                    handler: Handler::MempoolTransactions,
-                    tx,
-                    span,
-                }),
+                    None,
+                )),
+                Err(e) => Err((e, tx)),
+            },
+            (AwaitingRequest, BlocksByHash(hashes)) => {
+                match self
+                    .peer_tx
+                    .send(Message::GetData(
+                        hashes.iter().map(|h| (*h).into()).collect(),
+                    ))
+                    .await
+                {
+                    Ok(()) => Ok((
+                        AwaitingResponse {
+                            handler: Handler::BlocksByHash {
+                                blocks: Vec::with_capacity(hashes.len()),
+                                hashes,
+                            },
+                            tx,
+                            span,
+                        },
+                        None,
+                    )),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, TransactionsByHash(hashes)) => {
+                match self
+                    .peer_tx
+                    .send(Message::GetData(
+                        hashes.iter().map(|h| (*h).into()).collect(),
+                    ))
+                    .await
+                {
+                    Ok(()) => Ok((
+                        AwaitingResponse {
+                            handler: Handler::TransactionsByHash {
+                                transactions: Vec::with_capacity(hashes.len()),
+                                hashes,
+                            },
+                            tx,
+                            span,
+                        },
+                        None,
+                    )),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
+                match self
+                    .peer_tx
+                    .send(Message::GetBlocks { known_blocks, stop })
+                    .await
+                {
+                    Ok(()) => Ok((
+                        AwaitingResponse {
+                            handler: Handler::FindBlocks,
+                            tx,
+                            span,
+                        },
+                        None,
+                    )),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, FindHeaders { known_blocks, stop }) => {
+                match self
+                    .peer_tx
+                    .send(Message::GetHeaders { known_blocks, stop })
+                    .await
+                {
+                    Ok(()) => Ok((
+                        AwaitingResponse {
+                            handler: Handler::FindHeaders,
+                            tx,
+                            span,
+                        },
+                        None,
+                    )),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, MempoolTransactions) => {
+                match self.peer_tx.send(Message::Mempool).await {
+                    Ok(()) => Ok((
+                        AwaitingResponse {
+                            handler: Handler::MempoolTransactions,
+                            tx,
+                            span,
+                        },
+                        None,
+                    )),
+                    Err(e) => Err((e, tx)),
+                }
+            }
             (AwaitingRequest, PushTransaction(transaction)) => {
+                match self.peer_tx.send(Message::Tx(transaction)).await {
+                    Ok(()) => Ok((AwaitingRequest, Some(tx))),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, AdvertiseTransactions(hashes)) => {
+                match self
+                    .peer_tx
+                    .send(Message::Inv(hashes.iter().map(|h| (*h).into()).collect()))
+                    .await
+                {
+                    Ok(()) => Ok((AwaitingRequest, Some(tx))),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+            (AwaitingRequest, AdvertiseBlock(hash)) => {
+                match self.peer_tx.send(Message::Inv(vec![hash.into()])).await {
+                    Ok(()) => Ok((AwaitingRequest, Some(tx))),
+                    Err(e) => Err((e, tx)),
+                }
+            }
+        };
+        // Updates state or fails. Sends the error on the Sender if it is Some.
+        match new_state_result {
+            Ok((AwaitingRequest, Some(tx))) => {
                 // Since we're not waiting for further messages, we need to
                 // send a response before dropping tx.
                 let _ = tx.send(Ok(Response::Nil));
-                self.peer_tx
-                    .send(Message::Tx(transaction))
-                    .await
-                    .map_err(|e| e.into())
-                    .map(|()| AwaitingRequest)
+                self.state = AwaitingRequest;
+                self.request_timer = Some(sleep(constants::REQUEST_TIMEOUT));
             }
-            (AwaitingRequest, AdvertiseTransactions(hashes)) => {
-                let _ = tx.send(Ok(Response::Nil));
-                self.peer_tx
-                    .send(Message::Inv(hashes.iter().map(|h| (*h).into()).collect()))
-                    .await
-                    .map_err(|e| e.into())
-                    .map(|()| AwaitingRequest)
-            }
-            (AwaitingRequest, AdvertiseBlock(hash)) => {
-                let _ = tx.send(Ok(Response::Nil));
-                self.peer_tx
-                    .send(Message::Inv(vec![hash.into()]))
-                    .await
-                    .map_err(|e| e.into())
-                    .map(|()| AwaitingRequest)
-            }
-        } {
-            Ok(new_state) => {
+            Ok((new_state @ AwaitingResponse { .. }, None)) => {
                 self.state = new_state;
                 self.request_timer = Some(sleep(constants::REQUEST_TIMEOUT));
             }
-            Err(e) => self.fail_with(e),
-        }
+            Err((e, tx)) => {
+                let e = SharedPeerError::from(e);
+                let _ = tx.send(Err(e.clone()));
+                self.fail_with(e);
+            }
+            // unreachable states
+            Ok((Failed, tx)) => unreachable!(
+                "failed client requests must use fail_with(error) to reach a Failed state. tx: {:?}",
+                tx
+            ),
+            Ok((AwaitingRequest, None)) => unreachable!(
+                "successful AwaitingRequest states must send a response on tx, but tx is None",
+            ),
+            Ok((new_state @ AwaitingResponse { .. }, Some(tx))) => unreachable!(
+                "successful AwaitingResponse states must keep tx, but tx is Some: {:?} for: {:?}",
+                tx, new_state,
+            ),
+        };
     }
 
     // This function has its own span, because we're creating a new work
@@ -568,7 +766,7 @@ where
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
                 if let Err(e) = self.peer_tx.send(Message::Pong(nonce)).await {
-                    self.fail_with(e.into());
+                    self.fail_with(e);
                 }
                 return;
             }
@@ -675,7 +873,9 @@ where
 
         if self.svc.ready_and().await.is_err() {
             // Treat all service readiness errors as Overloaded
+            // TODO: treat `TryRecvError::Closed` in `Inbound::poll_ready` as a fatal error (#1655)
             self.fail_with(PeerError::Overloaded);
+            return;
         }
 
         let rsp = match self.svc.call(req).await {
@@ -685,8 +885,14 @@ where
                     metrics::counter!("pool.closed.loadshed", 1);
                     self.fail_with(PeerError::Overloaded);
                 } else {
-                    // We could send a reject to the remote peer.
-                    error!(%e);
+                    // We could send a reject to the remote peer, but that might cause
+                    // them to disconnect, and we might be using them to sync blocks.
+                    // For similar reasons, we don't want to fail_with() here - we
+                    // only close the connection if the peer is doing something wrong.
+                    error!(%e,
+                           connection_state = ?self.state,
+                           client_receiver = ?self.client_rx,
+                           "error processing peer request");
                 }
                 return;
             }
@@ -697,14 +903,14 @@ where
             Response::Nil => { /* generic success, do nothing */ }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
-                    self.fail_with(e.into());
+                    self.fail_with(e);
                 }
             }
             Response::Transactions(transactions) => {
                 // Generate one tx message per transaction.
                 for transaction in transactions.into_iter() {
                     if let Err(e) = self.peer_tx.send(Message::Tx(transaction)).await {
-                        self.fail_with(e.into());
+                        self.fail_with(e);
                     }
                 }
             }
@@ -712,7 +918,7 @@ where
                 // Generate one block message per block.
                 for block in blocks.into_iter() {
                     if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
-                        self.fail_with(e.into());
+                        self.fail_with(e);
                     }
                 }
             }
@@ -722,12 +928,12 @@ where
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
                     .await
                 {
-                    self.fail_with(e.into())
+                    self.fail_with(e)
                 }
             }
             Response::BlockHeaders(headers) => {
                 if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
-                    self.fail_with(e.into())
+                    self.fail_with(e)
                 }
             }
             Response::TransactionHashes(hashes) => {
@@ -736,7 +942,7 @@ where
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
                     .await
                 {
-                    self.fail_with(e.into())
+                    self.fail_with(e)
                 }
             }
         }

@@ -15,19 +15,18 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    future::Future,
     ops::{Bound, Bound::*},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
-use futures_util::FutureExt;
+use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tower::{Service, ServiceExt};
-
 use tracing::instrument;
+
 use zebra_chain::{
     block::{self, Block},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
@@ -87,6 +86,14 @@ pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 /// 1 hash to verify the tip, and discards 1-2 hashes to work around `zcashd`
 /// bugs. So the most efficient gap is slightly less than 500 blocks.
 pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 400;
+
+/// We limit the memory usage and download contention for each checkpoint,
+/// based on the cumulative size of the serialized blocks in the chain.
+///
+/// Deserialized blocks (in memory) are slightly larger than serialized blocks
+/// (on the network or disk). But they should be within a constant factor of the
+/// serialized size.
+pub const MAX_CHECKPOINT_BYTE_COUNT: u64 = 32 * 1024 * 1024;
 
 /// A checkpointing block verifier.
 ///
@@ -203,8 +210,8 @@ where
                 if height >= checkpoint_list.max_height() {
                     (None, Progress::FinalCheckpoint)
                 } else {
-                    metrics::gauge!("checkpoint.verified.height", height.0 as i64);
-                    metrics::gauge!("checkpoint.processing.next.height", height.0 as i64);
+                    metrics::gauge!("checkpoint.verified.height", height.0 as f64);
+                    metrics::gauge!("checkpoint.processing.next.height", height.0 as f64);
                     (Some(hash), Progress::InitialTip(height))
                 }
             }
@@ -298,7 +305,7 @@ where
         }
         metrics::gauge!(
             "checkpoint.queued.continuous.height",
-            pending_height.0 as i64
+            pending_height.0 as f64
         );
 
         // Now find the start of the checkpoint range
@@ -320,11 +327,11 @@ where
         if let Some(block::Height(target_checkpoint)) = target_checkpoint {
             metrics::gauge!(
                 "checkpoint.processing.next.height",
-                target_checkpoint as i64
+                target_checkpoint as f64
             );
         } else {
             // Use the start height if there is no potential next checkpoint
-            metrics::gauge!("checkpoint.processing.next.height", start_height.0 as i64);
+            metrics::gauge!("checkpoint.processing.next.height", start_height.0 as f64);
             metrics::counter!("checkpoint.waiting.count", 1);
         }
 
@@ -393,12 +400,12 @@ where
     /// Increase the current checkpoint height to `verified_height`,
     fn update_progress(&mut self, verified_height: block::Height) {
         if let Some(max_height) = self.queued.keys().next_back() {
-            metrics::gauge!("checkpoint.queued.max.height", max_height.0 as i64);
+            metrics::gauge!("checkpoint.queued.max.height", max_height.0 as f64);
         } else {
-            // use -1 as a sentinel value for "None", because 0 is a valid height
-            metrics::gauge!("checkpoint.queued.max.height", -1);
+            // use f64::NAN as a sentinel value for "None", because 0 is a valid height
+            metrics::gauge!("checkpoint.queued.max.height", f64::NAN);
         }
-        metrics::gauge!("checkpoint.queued_slots", self.queued.len() as i64);
+        metrics::gauge!("checkpoint.queued_slots", self.queued.len() as f64);
 
         // Ignore blocks that are below the previous checkpoint, or otherwise
         // have invalid heights.
@@ -413,10 +420,10 @@ where
 
         // Ignore heights that aren't checkpoint heights
         if verified_height == self.checkpoint_list.max_height() {
-            metrics::gauge!("checkpoint.verified.height", verified_height.0 as i64);
+            metrics::gauge!("checkpoint.verified.height", verified_height.0 as f64);
             self.verifier_progress = FinalCheckpoint;
         } else if self.checkpoint_list.contains(verified_height) {
-            metrics::gauge!("checkpoint.verified.height", verified_height.0 as i64);
+            metrics::gauge!("checkpoint.verified.height", verified_height.0 as f64);
             self.verifier_progress = PreviousCheckpoint(verified_height);
             // We're done with the initial tip hash now
             self.initial_tip_hash = None;
@@ -525,7 +532,7 @@ where
                 .keys()
                 .next_back()
                 .expect("queued has at least one entry")
-                .0 as i64
+                .0 as f64
         );
 
         let is_checkpoint = self.checkpoint_list.contains(height);
@@ -785,7 +792,7 @@ where
 
 #[derive(Debug, Error)]
 pub enum VerifyCheckpointError {
-    #[error("checkpoint request after checkpointing finished")]
+    #[error("checkpoint request after the final checkpoint has been verified")]
     Finished,
     #[error("block at {height:?} is higher than the maximum checkpoint {max_height:?}")]
     TooHigh {
@@ -824,6 +831,8 @@ pub enum VerifyCheckpointError {
         expected: block::Hash,
         found: block::Hash,
     },
+    #[error("zebra is shutting down")]
+    ShuttingDown,
 }
 
 /// The CheckpointVerifier service implementation.
@@ -853,7 +862,7 @@ where
         let rx = self.queue_block(block.clone());
         self.process_checkpoint_range();
 
-        metrics::gauge!("checkpoint.queued_slots", self.queued.len() as i64);
+        metrics::gauge!("checkpoint.queued_slots", self.queued.len() as f64);
 
         // Because the checkpoint verifier duplicates state from the state
         // service (it tracks which checkpoints have been verified), we must
@@ -871,22 +880,25 @@ where
         // commit-if-verified logic. This task will always execute, except if
         // the program is interrupted, in which case there is no longer a
         // checkpoint verifier to keep in sync with the state.
-        let mut state_service = self.state_service.clone();
+        let state_service = self.state_service.clone();
         let commit_finalized_block = tokio::spawn(async move {
             let hash = rx
                 .await
+                .map_err(Into::into)
+                .map_err(VerifyCheckpointError::CommitFinalized)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
             // Once we get a verified hash, we must commit it to the chain state
             // as a finalized block, or exit the program, so .expect rather than
             // propagate errors from the state service.
+            //
+            // We use a `ServiceExt::oneshot`, so that every state service
+            // `poll_ready` has a corresponding `call`. See #1593.
             match state_service
-                .ready_and()
+                .oneshot(zs::Request::CommitFinalizedBlock(block.into()))
+                .map_err(VerifyCheckpointError::CommitFinalized)
                 .await
-                .expect("Verified checkpoints must be committed transactionally")
-                .call(zs::Request::CommitFinalizedBlock(block.into()))
-                .await
-                .expect("Verified checkpoints must be committed transactionally")
+                .expect("state service commit block failed: verified checkpoints must be committed transactionally")
             {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
@@ -897,9 +909,19 @@ where
         });
 
         async move {
-            commit_finalized_block
-                .await
-                .expect("commit_finalized_block should not panic")
+            let result = commit_finalized_block.await;
+            // Avoid a panic on shutdown
+            //
+            // When `zebrad` is terminated using Ctrl-C, the `commit_finalized_block` task
+            // can return a `JoinError::Cancelled`. We expect task cancellation on shutdown,
+            // so we don't need to panic here. The persistent state is correct even when the
+            // task is cancelled, because block data is committed inside transactions, in
+            // height order.
+            if zebra_chain::shutdown::is_shutting_down() {
+                Err(VerifyCheckpointError::ShuttingDown)
+            } else {
+                result.expect("commit_finalized_block should not panic")
+            }
         }
         .boxed()
     }

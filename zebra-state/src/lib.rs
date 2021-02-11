@@ -6,12 +6,17 @@
 #![warn(missing_docs)]
 #![allow(clippy::try_err)]
 // Disable some broken or unwanted clippy nightly lints
+// Build without warnings on nightly 2021-01-17 and later and stable 1.51 and later
+#![allow(unknown_lints)]
+// Disable old lint warnings on nightly until 1.51 is stable
+#![allow(renamed_and_removed_lints)]
+// Use the old lint name to build without warnings on stable until 1.51 is stable
 #![allow(clippy::unknown_clippy_lints)]
-#![allow(clippy::field_reassign_with_default)]
+// The actual lints we want to disable
 #![allow(clippy::unnecessary_wraps)]
 
 mod config;
-mod constants;
+pub mod constants;
 mod error;
 mod request;
 mod response;

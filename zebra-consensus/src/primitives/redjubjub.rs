@@ -62,9 +62,7 @@ pub struct Verifier {
 impl Default for Verifier {
     fn default() -> Self {
         let batch = batch::Verifier::default();
-        // This bound should be big enough to avoid RecvErrors
-        // when tasks wait on results for a long time.
-        let (tx, _) = channel(512);
+        let (tx, _) = channel(super::BROADCAST_BUFFER_SIZE);
         Self { tx, batch }
     }
 }

@@ -20,6 +20,7 @@ use zebra_chain::{
     transparent,
 };
 
+use zebra_script::CachedFfiTransaction;
 use zebra_state as zs;
 
 use crate::{error::TransactionError, script, BoxError};
@@ -43,9 +44,14 @@ where
 {
     // XXX: how should this struct be constructed?
     pub fn new(network: Network, script_verifier: script::Verifier<ZS>) -> Self {
+        // let (spend_verifier, output_verifier, joinsplit_verifier) = todo!();
+
         Self {
             network,
             script_verifier,
+            // spend_verifier,
+            // output_verifier,
+            // joinsplit_verifier,
         }
     }
 }
@@ -73,7 +79,8 @@ pub enum Request {
         transaction: Arc<Transaction>,
         /// Additional UTXOs which are known at the time of verification.
         known_utxos: Arc<HashMap<transparent::OutPoint, zs::Utxo>>,
-        /// The active NU in the context of this verification.
+        /// Bug: this field should be the next block height, because some
+        /// consensus rules depend on the exact height. See #1683.
         upgrade: NetworkUpgrade,
     },
 }
@@ -150,11 +157,14 @@ where
                     } else {
                         // otherwise, check no coinbase inputs
                         // feed all of the inputs to the script verifier
+                        let cached_ffi_transaction =
+                            Arc::new(CachedFfiTransaction::new(tx.clone()));
+
                         for input_index in 0..inputs.len() {
                             let rsp = script_verifier.ready_and().await?.call(script::Request {
                                 upgrade,
                                 known_utxos: known_utxos.clone(),
-                                transaction: tx.clone(),
+                                cached_ffi_transaction: cached_ffi_transaction.clone(),
                                 input_index,
                             });
 

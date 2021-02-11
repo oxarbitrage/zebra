@@ -115,16 +115,7 @@ where
     );
     let peer_set = Buffer::new(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
 
-    // Connect the tx end to the 3 peer sources:
-
-    // 1. Initial peers, specified in the config.
-    let add_guard = tokio::spawn(add_initial_peers(
-        config.initial_peers(),
-        connector.clone(),
-        peerset_tx.clone(),
-    ));
-
-    // 2. Incoming peer connections, via a listener.
+    // 1. Incoming peer connections, via a listener.
 
     // Warn if we're configured using the wrong network port.
     // TODO: use the right port if the port is unspecified
@@ -143,6 +134,21 @@ where
     }
 
     let listen_guard = tokio::spawn(listen(config.listen_addr, listener, peerset_tx.clone()));
+
+    // 2. Initial peers, specified in the config.
+    let initial_peers_fut = {
+        let config = config.clone();
+        let connector = connector.clone();
+        let peerset_tx = peerset_tx.clone();
+        async move {
+            let initial_peers = config.initial_peers().await;
+            // Connect the tx end to the 3 peer sources:
+            add_initial_peers(initial_peers, connector, peerset_tx).await
+        }
+        .boxed()
+    };
+
+    let add_guard = tokio::spawn(initial_peers_fut);
 
     // 3. Outgoing peers we connect to in response to load.
     let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
@@ -188,9 +194,10 @@ where
     S::Future: Send + 'static,
 {
     info!(?initial_peers, "Connecting to initial peer set");
-    use tower::util::CallAllUnordered;
-    let addr_stream = futures::stream::iter(initial_peers.into_iter());
-    let mut handshakes = CallAllUnordered::new(connector, addr_stream);
+    let mut handshakes = initial_peers
+        .iter()
+        .map(|request| connector.clone().oneshot(*request))
+        .collect::<futures::stream::FuturesUnordered<_>>();
 
     while let Some(handshake_result) = handshakes.next().await {
         tx.send(handshake_result).await?;
@@ -211,7 +218,18 @@ where
     S: Service<(TcpStream, SocketAddr), Response = peer::Client, Error = BoxError> + Clone,
     S::Future: Send + 'static,
 {
-    let listener = TcpListener::bind(addr).await?;
+    let listener_result = TcpListener::bind(addr).await;
+
+    let listener = match listener_result {
+        Ok(l) => l,
+        Err(e) => panic!(
+            "Opening Zcash network protocol listener {:?} failed: {:?}. \
+             Hint: Check if another zebrad or zcashd process is running. \
+             Try changing the network listen_addr in the Zebra config.",
+            addr, e,
+        ),
+    };
+
     let local_addr = listener.local_addr()?;
     info!("Opened Zcash protocol endpoint at {}", local_addr);
     loop {
@@ -272,7 +290,13 @@ where
     let mut crawl_timer = tokio::time::interval(new_peer_interval);
 
     loop {
-        metrics::gauge!("crawler.in_flight_handshakes", handshakes.len() as i64 - 1);
+        metrics::gauge!(
+            "crawler.in_flight_handshakes",
+            handshakes
+                .len()
+                .checked_sub(1)
+                .expect("the pool always contains an unresolved future") as f64
+        );
         // This is a little awkward because there's no select3.
         match select(
             select(demand_rx.next(), crawl_timer.next()),

@@ -30,7 +30,7 @@ use crate::{
     BoxError, Config,
 };
 
-use super::{Client, Connection, ErrorSlot, HandshakeError};
+use super::{Client, Connection, ErrorSlot, HandshakeError, PeerError};
 
 /// A [`Service`] that handshakes with a remote peer and constructs a
 /// client/server pair.
@@ -192,9 +192,9 @@ where
         let (tcp_stream, addr) = req;
 
         let connector_span = span!(Level::INFO, "connector", addr = ?addr);
-        // set parent: None for the peer connection span, as it should exist
-        // independently of its creation source (inbound connection, crawler,
-        // initial peer, ...)
+        // set the peer connection span's parent to the global span, as it
+        // should exist independently of its creation source (inbound
+        // connection, crawler, initial peer, ...)
         let connection_span = span!(parent: &self.parent_span, Level::INFO, "peer", addr = ?addr);
 
         // Clone these upfront, so they can be moved into the future.
@@ -315,12 +315,13 @@ where
             //  auto currentEpoch = CurrentEpoch(GetHeight(), consensusParams);
             //  if (pfrom->nVersion < consensusParams.vUpgrades[currentEpoch].nProtocolVersion)
             //
-            // For approximately 1.5 days before a network upgrade, we also need to:
-            //  - avoid old peers, and
-            //  - prefer updated peers.
-            // For example, we could reject old peers with probability 0.5.
+            // For approximately 1.5 days before a network upgrade, zcashd also:
+            //  - avoids old peers, and
+            //  - prefers updated peers.
+            // We haven't decided if we need this behaviour in Zebra yet (see #706).
             //
-            // At the network upgrade, we also need to disconnect from old peers.
+            // At the network upgrade, we also need to disconnect from old peers (see #1334).
+            //
             // TODO: replace min_for_upgrade(network, MIN_NETWORK_UPGRADE) with
             //       current_min(network, height) where network is the
             //       configured network, and height is the best tip's block
@@ -434,7 +435,7 @@ where
             let server = Connection {
                 state: connection::State::AwaitingRequest,
                 svc: inbound_service,
-                client_rx: server_rx,
+                client_rx: server_rx.into(),
                 error_slot: slot,
                 peer_tx,
                 request_timer: None,
@@ -450,7 +451,7 @@ where
             let heartbeat_span = tracing::debug_span!(parent: connection_span, "heartbeat");
             tokio::spawn(
                 async move {
-                    use super::client::ClientRequest;
+                    use super::ClientRequest;
                     use futures::future::Either;
 
                     let mut shutdown_rx = shutdown_rx;
@@ -463,19 +464,48 @@ where
                                 let (tx, rx) = oneshot::channel();
                                 let request = Request::Ping(Nonce::default());
                                 tracing::trace!(?request, "queueing heartbeat request");
-                                if server_tx
-                                    .send(ClientRequest {
-                                        request,
-                                        tx,
-                                        span: tracing::Span::current(),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::trace!(
-                                        "error sending heartbeat request, shutting down"
-                                    );
-                                    return;
+                                match server_tx.try_send(ClientRequest {
+                                    request,
+                                    tx,
+                                    span: tracing::Span::current(),
+                                }) {
+                                    Ok(()) => {
+                                        match server_tx.flush().await {
+                                            Ok(()) => {}
+                                            Err(e) => {
+                                                // We can't get the client request for this failure,
+                                                // so we can't send an error back here. But that's ok,
+                                                // because:
+                                                //   - this error never happens (or it's very rare)
+                                                //   - if the flush() fails, the server hasn't
+                                                //     received the request
+                                                tracing::warn!(
+                                                    "flushing client request failed: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::trace!(
+                                            ?e,
+                                            "error sending heartbeat request, shutting down"
+                                        );
+                                        if e.is_disconnected() {
+                                            let ClientRequest { tx, .. } = e.into_inner();
+                                            let _ =
+                                                tx.send(Err(PeerError::ConnectionClosed.into()));
+                                        } else if e.is_full() {
+                                            // TODO: wait for the sink to be ready, or wait for a timeout,
+                                            // then close the connection with an overloaded error (#1551)
+                                            let ClientRequest { tx, .. } = e.into_inner();
+                                            let _ = tx.send(Err(PeerError::Overloaded.into()));
+                                        } else {
+                                            // we need to map unexpected error types to PeerErrors
+                                            panic!("unexpected try_send error: {:?}", e);
+                                        }
+                                        return;
+                                    }
                                 }
                                 // Heartbeats are checked internally to the
                                 // connection logic, but we need to wait on the

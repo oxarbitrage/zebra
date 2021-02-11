@@ -2,6 +2,7 @@
 //! output for given argument combinations matches what is expected.
 //!
 //! ### Note on port conflict
+//!
 //! If the test child has a cache or port conflict with another test, or a
 //! running zebrad or zcashd, then it will panic. But the acceptance tests
 //! expect it to run until it is killed.
@@ -15,15 +16,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 #![allow(clippy::try_err)]
-// Disable some broken or unwanted clippy nightly lints
-#![allow(clippy::unknown_clippy_lints)]
-#![allow(clippy::field_reassign_with_default)]
 
 use color_eyre::eyre::Result;
 use eyre::WrapErr;
 use tempdir::TempDir;
 
-use std::{convert::TryInto, env, fs, io::Write, path::Path, path::PathBuf, time::Duration};
+use std::{collections::HashSet, convert::TryInto, env, path::Path, path::PathBuf, time::Duration};
 
 use zebra_chain::{
     block::Height,
@@ -32,6 +30,8 @@ use zebra_chain::{
         NetworkUpgrade,
     },
 };
+use zebra_network::constants::PORT_IN_USE_ERROR;
+use zebra_state::constants::LOCK_FILE_ERROR;
 use zebra_test::{command::TestDirExt, prelude::*};
 use zebrad::config::ZebradConfig;
 
@@ -42,11 +42,16 @@ use zebrad::config::ZebradConfig;
 const LAUNCH_DELAY: Duration = Duration::from_secs(3);
 
 fn default_test_config() -> Result<ZebradConfig> {
-    let mut config = ZebradConfig::default();
-    config.state = zebra_state::Config::ephemeral();
-    config.network.listen_addr = "127.0.0.1:0".parse()?;
-
-    Ok(config)
+    let auto_port_ipv4_local = zebra_network::Config {
+        listen_addr: "127.0.0.1:0".parse()?,
+        ..zebra_network::Config::default()
+    };
+    let local_ephemeral = ZebradConfig {
+        state: zebra_state::Config::ephemeral(),
+        network: auto_port_ipv4_local,
+        ..ZebradConfig::default()
+    };
+    Ok(local_ephemeral)
 }
 
 fn persistent_test_config() -> Result<ZebradConfig> {
@@ -68,15 +73,47 @@ where
     /// Spawn `zebrad` with `args` as a child process in this test directory,
     /// potentially taking ownership of the tempdir for the duration of the
     /// child process.
+    ///
+    /// If there is a config in the test directory, pass it to `zebrad`.
     fn spawn_child(self, args: &[&str]) -> Result<TestChild<Self>>;
 
-    /// Add the given config to the test directory and use it for all
-    /// subsequently spawned processes.
-    fn with_config(self, config: ZebradConfig) -> Result<Self>;
+    /// Create a config file and use it for all subsequently spawned processes.
+    /// Returns an error if the config already exists.
+    ///
+    /// If needed:
+    ///   - recursively create directories for the config and state
+    ///   - set `config.cache_dir` based on `self`
+    fn with_config(self, config: &mut ZebradConfig) -> Result<Self>;
 
-    /// Overwrite any existing config the test directory and use it for all
-    /// subsequently spawned processes.
-    fn replace_config(self, config: ZebradConfig) -> Result<Self>;
+    /// Create a config file with the exact contents of `config`, and use it for
+    /// all subsequently spawned processes. Returns an error if the config
+    /// already exists.
+    ///
+    /// If needed:
+    ///   - recursively create directories for the config and state
+    fn with_exact_config(self, config: &ZebradConfig) -> Result<Self>;
+
+    /// Overwrite any existing config file, and use the newly written config for
+    /// all subsequently spawned processes.
+    ///
+    /// If needed:
+    ///   - recursively create directories for the config and state
+    ///   - set `config.cache_dir` based on `self`
+    fn replace_config(self, config: &mut ZebradConfig) -> Result<Self>;
+
+    /// `cache_dir` config update helper.
+    ///
+    /// If needed:
+    ///   - set the cache_dir in the config.
+    fn cache_config_update_helper(self, config: &mut ZebradConfig) -> Result<Self>;
+
+    /// Config writing helper.
+    ///
+    /// If needed:
+    ///   - recursively create directories for the config and state,
+    ///
+    /// Then write out the config.
+    fn write_config_helper(self, config: &ZebradConfig) -> Result<Self>;
 }
 
 impl<T> ZebradTestDirExt for T
@@ -88,14 +125,13 @@ where
         let default_config_path = path.join("zebrad.toml");
 
         if default_config_path.exists() {
-            let mut extra_args: Vec<_> = Vec::new();
-            extra_args.push("-c");
-            extra_args.push(
+            let mut extra_args: Vec<_> = vec![
+                "-c",
                 default_config_path
                     .as_path()
                     .to_str()
                     .expect("Path is valid Unicode"),
-            );
+            ];
             extra_args.extend_from_slice(args);
             self.spawn_child_with_command(env!("CARGO_BIN_EXE_zebrad"), &extra_args)
         } else {
@@ -103,41 +139,57 @@ where
         }
     }
 
-    fn with_config(self, mut config: ZebradConfig) -> Result<Self> {
-        let dir = self.as_ref();
+    fn with_config(self, config: &mut ZebradConfig) -> Result<Self> {
+        self.cache_config_update_helper(config)?
+            .write_config_helper(config)
+    }
 
-        if !config.state.ephemeral {
-            let cache_dir = dir.join("state");
-            fs::create_dir(&cache_dir)?;
-            config.state.cache_dir = cache_dir;
+    fn with_exact_config(self, config: &ZebradConfig) -> Result<Self> {
+        self.write_config_helper(config)
+    }
+
+    fn replace_config(self, config: &mut ZebradConfig) -> Result<Self> {
+        use std::fs;
+        use std::io::ErrorKind;
+
+        // Remove any existing config before writing a new one
+        let dir = self.as_ref();
+        let config_file = dir.join("zebrad.toml");
+        match fs::remove_file(config_file) {
+            Ok(()) => {}
+            // If the config file doesn't exist, that's ok
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => Err(e)?,
         }
 
-        fs::File::create(dir.join("zebrad.toml"))?
-            .write_all(toml::to_string(&config)?.as_bytes())?;
+        self.cache_config_update_helper(config)?
+            .write_config_helper(config)
+    }
+
+    fn cache_config_update_helper(self, config: &mut ZebradConfig) -> Result<Self> {
+        if !config.state.ephemeral {
+            let dir = self.as_ref();
+            let cache_dir = dir.join("state");
+            config.state.cache_dir = cache_dir;
+        }
 
         Ok(self)
     }
 
-    fn replace_config(self, mut config: ZebradConfig) -> Result<Self> {
+    fn write_config_helper(self, config: &ZebradConfig) -> Result<Self> {
+        use std::fs;
+        use std::io::Write;
+
         let dir = self.as_ref();
 
         if !config.state.ephemeral {
             let cache_dir = dir.join("state");
-
-            // Create dir, ignoring existing directories
-            match fs::create_dir(&cache_dir) {
-                Ok(_) => {}
-                Err(e) if (e.kind() == std::io::ErrorKind::AlreadyExists) => {}
-                Err(e) => Err(e)?,
-            };
-
-            config.state.cache_dir = cache_dir;
+            fs::create_dir_all(&cache_dir)?;
+        } else {
+            fs::create_dir_all(&dir)?;
         }
 
         let config_file = dir.join("zebrad.toml");
-
-        // Remove any existing config before writing a new one
-        let _ = fs::remove_file(config_file.clone());
         fs::File::create(config_file)?.write_all(toml::to_string(&config)?.as_bytes())?;
 
         Ok(self)
@@ -149,7 +201,7 @@ fn generate_no_args() -> Result<()> {
     zebra_test::init();
 
     let child = testdir()?
-        .with_config(default_test_config()?)?
+        .with_config(&mut default_test_config()?)?
         .spawn_child(&["generate"])?;
 
     let output = child.wait_with_output()?;
@@ -161,6 +213,10 @@ fn generate_no_args() -> Result<()> {
     Ok(())
 }
 
+/// Panics if `$pred` is false, with an error report containing:
+///   * context from `$source`, and
+///   * an optional wrapper error, using `$fmt_arg`+ as a format string and
+///     arguments.
 macro_rules! assert_with_context {
     ($pred:expr, $source:expr) => {
         if !$pred {
@@ -170,6 +226,19 @@ macro_rules! assert_with_context {
             let report = color_eyre::eyre::eyre!("failed assertion")
                 .section(stringify!($pred).header("Predicate:"))
                 .context_from($source);
+
+            panic!("Error: {:?}", report);
+        }
+    };
+    ($pred:expr, $source:expr, $($fmt_arg:tt)+) => {
+        if !$pred {
+            use color_eyre::Section as _;
+            use color_eyre::SectionExt as _;
+            use zebra_test::command::ContextFrom as _;
+            let report = color_eyre::eyre::eyre!("failed assertion")
+                .section(stringify!($pred).header("Predicate:"))
+                .context_from($source)
+                .wrap_err(format!($($fmt_arg)+));
 
             panic!("Error: {:?}", report);
         }
@@ -208,11 +277,16 @@ fn generate_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_success()?;
 
-    // Check if the temp dir still exist
-    assert_with_context!(testdir.path().exists(), &output);
-
-    // Check if the file was created
-    assert_with_context!(generated_config_path.exists(), &output);
+    assert_with_context!(
+        testdir.path().exists(),
+        &output,
+        "test temp directory not found"
+    );
+    assert_with_context!(
+        generated_config_path.exists(),
+        &output,
+        "generated config file not found"
+    );
 
     Ok(())
 }
@@ -221,7 +295,7 @@ fn generate_args() -> Result<()> {
 fn help_no_args() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(default_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config()?)?;
 
     let child = testdir.spawn_child(&["help"])?;
     let output = child.wait_with_output()?;
@@ -261,7 +335,7 @@ fn start_no_args() -> Result<()> {
     zebra_test::init();
 
     // start caches state, so run one of the start tests with persistent state
-    let testdir = testdir()?.with_config(persistent_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut persistent_test_config()?)?;
 
     let mut child = testdir.spawn_child(&["-v", "start"])?;
 
@@ -284,11 +358,10 @@ fn start_no_args() -> Result<()> {
 fn start_args() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(default_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config()?)?;
     let testdir = &testdir;
 
-    // Any free argument is valid
-    let mut child = testdir.spawn_child(&["start", "argument"])?;
+    let mut child = testdir.spawn_child(&["start"])?;
     // Run the program and kill it after a few seconds
     std::thread::sleep(LAUNCH_DELAY);
     child.kill()?;
@@ -311,7 +384,7 @@ fn start_args() -> Result<()> {
 fn persistent_mode() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(persistent_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut persistent_test_config()?)?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(&["-v", "start"])?;
@@ -324,73 +397,147 @@ fn persistent_mode() -> Result<()> {
     // Make sure the command was killed
     output.assert_was_killed()?;
 
-    // Check that we have persistent rocksdb database
     let cache_dir = testdir.path().join("state");
-    assert_with_context!(cache_dir.read_dir()?.count() > 0, &output);
-
-    Ok(())
-}
-
-#[test]
-fn ephemeral_mode() -> Result<()> {
-    zebra_test::init();
-
-    let testdir = testdir()?.with_config(default_test_config()?)?;
-    let testdir = &testdir;
-
-    // Any free argument is valid
-    let mut child = testdir.spawn_child(&["start", "argument"])?;
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(LAUNCH_DELAY);
-    child.kill()?;
-    let output = child.wait_with_output()?;
-
-    // Make sure the command was killed
-    output.assert_was_killed()?;
-
-    let cache_dir = testdir.path().join("state");
-    assert_with_context!(!cache_dir.exists(), &output);
-
-    Ok(())
-}
-
-#[test]
-fn misconfigured_ephemeral_mode() -> Result<()> {
-    zebra_test::init();
-
-    let dir = TempDir::new("zebrad_tests")?;
-    let cache_dir = dir.path().join("state");
-    fs::create_dir(&cache_dir)?;
-
-    // Write a configuration that has both cache_dir and ephemeral options set
-    let mut config = default_test_config()?;
-    // Although cache_dir has a default value, we set it a new temp directory
-    // to test that it is empty later.
-    config.state.cache_dir = cache_dir.clone();
-
-    fs::File::create(dir.path().join("zebrad.toml"))?
-        .write_all(toml::to_string(&config)?.as_bytes())?;
-
-    // Any free argument is valid
-    let mut child = dir
-        .with_config(config)?
-        .spawn_child(&["start", "argument"])?;
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(LAUNCH_DELAY);
-    child.kill()?;
-    let output = child.wait_with_output()?;
-
-    // Make sure the command was killed
-    output.assert_was_killed()?;
-
-    // Check that ephemeral takes precedence over cache_dir
     assert_with_context!(
-        cache_dir
-            .read_dir()
-            .expect("cache_dir should still exist")
-            .count()
-            == 0,
-        &output
+        cache_dir.read_dir()?.count() > 0,
+        &output,
+        "state directory empty despite persistent state config"
+    );
+
+    Ok(())
+}
+
+/// The cache_dir config used in the ephemeral mode tests
+#[derive(Debug, PartialEq, Eq)]
+enum EphemeralConfig {
+    /// the cache_dir config is left at its default value
+    Default,
+    /// the cache_dir config is set to a path in the tempdir
+    MisconfiguredCacheDir,
+}
+
+/// The check performed by the ephemeral mode tests
+#[derive(Debug, PartialEq, Eq)]
+enum EphemeralCheck {
+    /// an existing directory is not deleted
+    ExistingDirectory,
+    /// a missing directory is not created
+    MissingDirectory,
+}
+
+#[test]
+fn ephemeral_existing_directory() -> Result<()> {
+    ephemeral(EphemeralConfig::Default, EphemeralCheck::ExistingDirectory)
+}
+
+#[test]
+fn ephemeral_missing_directory() -> Result<()> {
+    ephemeral(EphemeralConfig::Default, EphemeralCheck::MissingDirectory)
+}
+
+#[test]
+fn misconfigured_ephemeral_existing_directory() -> Result<()> {
+    ephemeral(
+        EphemeralConfig::MisconfiguredCacheDir,
+        EphemeralCheck::ExistingDirectory,
+    )
+}
+
+#[test]
+fn misconfigured_ephemeral_missing_directory() -> Result<()> {
+    ephemeral(
+        EphemeralConfig::MisconfiguredCacheDir,
+        EphemeralCheck::MissingDirectory,
+    )
+}
+
+fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck) -> Result<()> {
+    use std::fs;
+    use std::io::ErrorKind;
+
+    zebra_test::init();
+
+    let mut config = default_test_config()?;
+    let run_dir = TempDir::new("zebrad_tests")?;
+
+    let ignored_cache_dir = run_dir.path().join("state");
+    if cache_dir_config == EphemeralConfig::MisconfiguredCacheDir {
+        // Write a configuration that sets both the cache_dir and ephemeral options
+        config.state.cache_dir = ignored_cache_dir.clone();
+    }
+    if cache_dir_check == EphemeralCheck::ExistingDirectory {
+        // We set the cache_dir config to a newly created empty temp directory,
+        // then make sure that it is empty after the test
+        fs::create_dir(&ignored_cache_dir)?;
+    }
+
+    let mut child = run_dir
+        .path()
+        .with_config(&mut config)?
+        .spawn_child(&["start"])?;
+    // Run the program and kill it after a few seconds
+    std::thread::sleep(LAUNCH_DELAY);
+    child.kill()?;
+    let output = child.wait_with_output()?;
+
+    // Make sure the command was killed
+    output.assert_was_killed()?;
+
+    let expected_run_dir_file_names = match cache_dir_check {
+        // we created the state directory, so it should still exist
+        EphemeralCheck::ExistingDirectory => {
+            assert_with_context!(
+                ignored_cache_dir
+                    .read_dir()
+                    .expect("ignored_cache_dir should still exist")
+                    .count()
+                    == 0,
+                &output,
+                "ignored_cache_dir not empty for ephemeral {:?} {:?}: {:?}",
+                cache_dir_config,
+                cache_dir_check,
+                ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
+            );
+
+            ["state", "zebrad.toml"].iter()
+        }
+
+        // we didn't create the state directory, so it should not exist
+        EphemeralCheck::MissingDirectory => {
+            assert_with_context!(
+                ignored_cache_dir
+                    .read_dir()
+                    .expect_err("ignored_cache_dir should not exist")
+                    .kind()
+                    == ErrorKind::NotFound,
+                &output,
+                "unexpected creation of ignored_cache_dir for ephemeral {:?} {:?}: the cache dir exists and contains these files: {:?}",
+                cache_dir_config,
+                cache_dir_check,
+                ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
+            );
+
+            ["zebrad.toml"].iter()
+        }
+    };
+
+    let expected_run_dir_file_names = expected_run_dir_file_names.map(Into::into).collect();
+    let run_dir_file_names = run_dir
+        .path()
+        .read_dir()
+        .expect("run_dir should still exist")
+        .map(|dir_entry| dir_entry.expect("run_dir is readable").file_name())
+        // ignore directory list order, because it can vary based on the OS and filesystem
+        .collect::<HashSet<_>>();
+
+    assert_with_context!(
+        run_dir_file_names == expected_run_dir_file_names,
+        &output,
+        "run_dir not empty for ephemeral {:?} {:?}: expected {:?}, actual: {:?}",
+        cache_dir_config,
+        cache_dir_check,
+        expected_run_dir_file_names,
+        run_dir_file_names
     );
 
     Ok(())
@@ -400,7 +547,7 @@ fn misconfigured_ephemeral_mode() -> Result<()> {
 fn app_no_args() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(default_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config()?)?;
 
     let child = testdir.spawn_child(&[])?;
     let output = child.wait_with_output()?;
@@ -415,7 +562,7 @@ fn app_no_args() -> Result<()> {
 fn version_no_args() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(default_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config()?)?;
 
     let child = testdir.spawn_child(&["version"])?;
     let output = child.wait_with_output()?;
@@ -430,7 +577,7 @@ fn version_no_args() -> Result<()> {
 fn version_args() -> Result<()> {
     zebra_test::init();
 
-    let testdir = testdir()?.with_config(default_test_config()?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config()?)?;
     let testdir = &testdir;
 
     // unexpected free argument `argument`
@@ -472,8 +619,11 @@ fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_success()?;
 
-    // Check if the file was created
-    assert_with_context!(generated_config_path.exists(), &output);
+    assert_with_context!(
+        generated_config_path.exists(),
+        &output,
+        "generated config file not found"
+    );
 
     // Run command using temp dir and kill it after a few seconds
     let mut child = testdir.spawn_child(&[command])?;
@@ -488,11 +638,16 @@ fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
     // [Note on port conflict](#Note on port conflict)
     output.assert_was_killed().wrap_err("Possible port or cache conflict. Are there other acceptance test, zebrad, or zcashd processes running?")?;
 
-    // Check if the temp dir still exists
-    assert_with_context!(testdir.path().exists(), &output);
-
-    // Check if the created config file still exists
-    assert_with_context!(generated_config_path.exists(), &output);
+    assert_with_context!(
+        testdir.path().exists(),
+        &output,
+        "test temp directory not found"
+    );
+    assert_with_context!(
+        generated_config_path.exists(),
+        &output,
+        "generated config file not found"
+    );
 
     Ok(())
 }
@@ -630,7 +785,7 @@ fn sync_until(
         // This message is captured by the test runner, use
         // `cargo test -- --nocapture` to see it.
         eprintln!("Skipping network test because '$ZEBRA_SKIP_NETWORK_TESTS' is set.");
-        return Ok(testdir()?);
+        return testdir();
     }
 
     // Use a persistent state, so we can handle large syncs
@@ -640,15 +795,15 @@ fn sync_until(
     config.state.debug_stop_at_height = Some(height.0);
 
     let tempdir = if let Some(reuse_tempdir) = reuse_tempdir {
-        reuse_tempdir.replace_config(config)?
+        reuse_tempdir.replace_config(&mut config)?
     } else {
-        testdir()?.with_config(config)?
+        testdir()?.with_config(&mut config)?
     };
 
     let mut child = tempdir.spawn_child(&["start"])?.with_timeout(timeout);
 
-    // TODO: is there a way to check for testnet or mainnet here?
-    // For example: "network=Mainnet" or "network=Testnet"
+    let network = format!("network: {},", network);
+    child.expect_stdout(&network)?;
     child.expect_stdout(stop_regex)?;
     child.kill()?;
 
@@ -672,11 +827,10 @@ fn create_cached_database_height(network: Network, height: Height) -> Result<()>
     // TODO: add convenience methods?
     config.network.network = network;
     config.state.debug_stop_at_height = Some(height.0);
+
     let dir = PathBuf::from("/zebrad-cache");
-
-    fs::File::create(dir.join("zebrad.toml"))?.write_all(toml::to_string(&config)?.as_bytes())?;
-
     let mut child = dir
+        .with_exact_config(&config)?
         .spawn_child(&["start"])?
         .with_timeout(timeout)
         .bypass_test_capture(true);
@@ -713,6 +867,7 @@ fn sync_to_sapling_mainnet() {
     let network = Mainnet;
     create_cached_database(network).unwrap();
 }
+
 // Sync to the sapling activation height testnet and stop.
 #[cfg_attr(feature = "test_sync_to_sapling_testnet", test)]
 fn sync_to_sapling_testnet() {
@@ -745,15 +900,39 @@ fn sync_past_sapling_testnet() {
     sync_past_sapling(network).unwrap();
 }
 
-/// Returns a random port
+/// Returns a random port number from the ephemeral port range.
 ///
 /// Does not check if the port is already in use. It's impossible to do this
 /// check in a reliable, cross-platform way.
-fn random_port() -> u16 {
+///
+/// ## Usage
+///
+/// If you want a once-off random unallocated port, use
+/// `random_unallocated_port`. Don't use this function if you don't need
+/// to - it has a small risk of port conflcits.
+///
+/// Use this function when you need to use the same random port multiple
+/// times. For example: setting up both ends of a connection, or re-using
+/// the same port multiple times.
+fn random_known_port() -> u16 {
     // Use the intersection of the IANA ephemeral port range, and the Linux
     // ephemeral port range:
     // https://en.wikipedia.org/wiki/Ephemeral_port#Range
     rand::thread_rng().gen_range(49152, 60999)
+}
+
+/// Returns the "magic" port number that tells the operating system to
+/// choose a random unallocated port.
+///
+/// The OS chooses a different port each time it opens a connection or
+/// listener with this magic port number.
+///
+/// ## Usage
+///
+/// See the usage note for `random_known_port`.
+#[allow(dead_code)]
+fn random_unallocated_port() -> u16 {
+    0
 }
 
 #[tokio::test]
@@ -763,7 +942,7 @@ async fn metrics_endpoint() -> Result<()> {
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
-    let port = random_port();
+    let port = random_known_port();
     let endpoint = format!("127.0.0.1:{}", port);
     let url = format!("http://{}", endpoint);
 
@@ -771,10 +950,7 @@ async fn metrics_endpoint() -> Result<()> {
     let mut config = default_test_config()?;
     config.metrics.endpoint_addr = Some(endpoint.parse().unwrap());
 
-    let dir = TempDir::new("zebrad_tests")?;
-    fs::File::create(dir.path().join("zebrad.toml"))?
-        .write_all(toml::to_string(&config)?.as_bytes())?;
-
+    let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
     let mut child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
@@ -801,7 +977,7 @@ async fn metrics_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     // Make sure metrics was started
-    output.stdout_contains(format!(r"Initializing metrics endpoint at {}", endpoint).as_str())?;
+    output.stdout_contains(format!(r"Opened metrics endpoint at {}", endpoint).as_str())?;
 
     // [Note on port conflict](#Note on port conflict)
     output
@@ -818,7 +994,7 @@ async fn tracing_endpoint() -> Result<()> {
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
-    let port = random_port();
+    let port = random_known_port();
     let endpoint = format!("127.0.0.1:{}", port);
     let url_default = format!("http://{}", endpoint);
     let url_filter = format!("{}/filter", url_default);
@@ -827,10 +1003,7 @@ async fn tracing_endpoint() -> Result<()> {
     let mut config = default_test_config()?;
     config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
 
-    let dir = TempDir::new("zebrad_tests")?;
-    fs::File::create(dir.path().join("zebrad.toml"))?
-        .write_all(toml::to_string(&config)?.as_bytes())?;
-
+    let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
     let mut child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
@@ -871,12 +1044,188 @@ async fn tracing_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     // Make sure tracing endpoint was started
-    output.stdout_contains(format!(r"Initializing tracing endpoint at {}", endpoint).as_str())?;
+    output.stdout_contains(format!(r"Opened tracing endpoint at {}", endpoint).as_str())?;
     // Todo: Match some trace level messages from output
 
     // [Note on port conflict](#Note on port conflict)
     output
         .assert_was_killed()
+        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+
+    Ok(())
+}
+
+/// Test will start 2 zebrad nodes one after the other using the same Zcash listener.
+/// It is expected that the first node spawned will get exclusive use of the port.
+/// The second node will panic with the Zcash listener conflict hint added in #1535.
+#[test]
+fn zcash_listener_conflict() -> Result<()> {
+    zebra_test::init();
+
+    // [Note on port conflict](#Note on port conflict)
+    let port = random_known_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+
+    // Write a configuration that has our created network listen_addr
+    let mut config = default_test_config()?;
+    config.network.listen_addr = listen_addr.parse().unwrap();
+    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let regex1 = format!(r"Opened Zcash protocol endpoint at {}", listen_addr);
+
+    // From another folder create a configuration with the same listener.
+    // `network.listen_addr` will be the same in the 2 nodes.
+    // (But since the config is ephemeral, they will have different state paths.)
+    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+
+    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
+
+    Ok(())
+}
+
+/// Start 2 zebrad nodes using the same metrics listener port, but different
+/// state directories and Zcash listener ports. The first node should get
+/// exclusive use of the port. The second node will panic with the Zcash metrics
+/// conflict hint added in #1535.
+#[test]
+fn zcash_metrics_conflict() -> Result<()> {
+    zebra_test::init();
+
+    // [Note on port conflict](#Note on port conflict)
+    let port = random_known_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+
+    // Write a configuration that has our created metrics endpoint_addr
+    let mut config = default_test_config()?;
+    config.metrics.endpoint_addr = Some(listen_addr.parse().unwrap());
+    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let regex1 = format!(r"Opened metrics endpoint at {}", listen_addr);
+
+    // From another folder create a configuration with the same endpoint.
+    // `metrics.endpoint_addr` will be the same in the 2 nodes.
+    // But they will have different Zcash listeners (auto port) and states (ephemeral)
+    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+
+    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
+
+    Ok(())
+}
+
+/// Start 2 zebrad nodes using the same tracing listener port, but different
+/// state directories and Zcash listener ports. The first node should get
+/// exclusive use of the port. The second node will panic with the Zcash tracing
+/// conflict hint added in #1535.
+#[test]
+fn zcash_tracing_conflict() -> Result<()> {
+    zebra_test::init();
+
+    // [Note on port conflict](#Note on port conflict)
+    let port = random_known_port();
+    let listen_addr = format!("127.0.0.1:{}", port);
+
+    // Write a configuration that has our created tracing endpoint_addr
+    let mut config = default_test_config()?;
+    config.tracing.endpoint_addr = Some(listen_addr.parse().unwrap());
+    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let regex1 = format!(r"Opened tracing endpoint at {}", listen_addr);
+
+    // From another folder create a configuration with the same endpoint.
+    // `tracing.endpoint_addr` will be the same in the 2 nodes.
+    // But they will have different Zcash listeners (auto port) and states (ephemeral)
+    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+
+    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
+
+    Ok(())
+}
+
+/// Start 2 zebrad nodes using the same state directory, but different Zcash
+/// listener ports. The first node should get exclusive access to the database.
+/// The second node will panic with the Zcash state conflict hint added in #1535.
+#[test]
+fn zcash_state_conflict() -> Result<()> {
+    zebra_test::init();
+
+    // A persistent config has a fixed temp state directory, but asks the OS to
+    // automatically choose an unused port
+    let mut config = persistent_test_config()?;
+    let dir_conflict = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+
+    // Windows problems with this match will be worked on at #1654
+    // We are matching the whole opened path only for unix by now.
+    let regex = if cfg!(unix) {
+        let mut dir_conflict_full = PathBuf::new();
+        dir_conflict_full.push(dir_conflict.path());
+        dir_conflict_full.push("state");
+        dir_conflict_full.push("state");
+        dir_conflict_full.push(format!(
+            "v{}",
+            zebra_state::constants::DATABASE_FORMAT_VERSION
+        ));
+        dir_conflict_full.push(config.network.network.to_string().to_lowercase());
+        format!(
+            "Opened Zebra state cache at {}",
+            dir_conflict_full.display()
+        )
+    } else {
+        String::from("Opened Zebra state cache at ")
+    };
+
+    check_config_conflict(
+        dir_conflict.path(),
+        regex.as_str(),
+        dir_conflict.path(),
+        LOCK_FILE_ERROR.as_str(),
+    )?;
+
+    Ok(())
+}
+
+/// Launch a node in `first_dir`, wait a few seconds, then launch a node in
+/// `second_dir`. Check that the first node's stdout contains
+/// `first_stdout_regex`, and the second node's stderr contains
+/// `second_stderr_regex`.
+fn check_config_conflict<T, U>(
+    first_dir: T,
+    first_stdout_regex: &str,
+    second_dir: U,
+    second_stderr_regex: &str,
+) -> Result<()>
+where
+    T: ZebradTestDirExt,
+    U: ZebradTestDirExt,
+{
+    // By DNS issues we want to skip all port conflict tests on macOS by now.
+    // Follow up at #1631
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
+    // Start the first node
+    let mut node1 = first_dir.spawn_child(&["start"])?;
+
+    // Wait a bit to spawn the second node, we want the first fully started.
+    std::thread::sleep(LAUNCH_DELAY);
+
+    // Spawn the second node
+    let node2 = second_dir.spawn_child(&["start"])?;
+
+    // Wait a few seconds and kill first node.
+    // Second node is terminated by panic, no need to kill.
+    std::thread::sleep(LAUNCH_DELAY);
+    node1.kill()?;
+
+    // In node1 we want to check for the success regex
+    let output1 = node1.wait_with_output()?;
+    output1.stdout_contains(first_stdout_regex)?;
+    output1
+        .assert_was_killed()
+        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+
+    // In the second node we look for the conflict regex
+    let output2 = node2.wait_with_output()?;
+    output2.stderr_contains(second_stderr_regex)?;
+    output2
+        .assert_was_not_killed()
         .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
 
     Ok(())

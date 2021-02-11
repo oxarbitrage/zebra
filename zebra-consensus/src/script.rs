@@ -3,7 +3,8 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tower::timeout::Timeout;
 use tracing::Instrument;
 
-use zebra_chain::{parameters::NetworkUpgrade, transaction::Transaction, transparent};
+use zebra_chain::{parameters::NetworkUpgrade, transparent};
+use zebra_script::CachedFfiTransaction;
 use zebra_state::Utxo;
 
 use crate::BoxError;
@@ -49,13 +50,9 @@ impl<ZS> Verifier<ZS> {
 /// A script verification request.
 #[derive(Debug)]
 pub struct Request {
-    /// Ideally, this would supply only an `Outpoint` and the unlock script,
-    /// rather than the entire `Transaction`, but we call a C++
-    /// implementation, and its FFI requires the entire transaction.
-    ///
-    /// This causes quadratic script verification behavior, so
-    /// at some future point, we need to reform this data.
-    pub transaction: Arc<Transaction>,
+    /// A cached transaction, in the format required by the script verifier FFI interface.
+    pub cached_ffi_transaction: Arc<CachedFfiTransaction>,
+    /// The index of an input in `cached_ffi_transaction`, used for verifying this request
     pub input_index: usize,
     /// A set of additional UTXOs known in the context of this verification request.
     ///
@@ -89,12 +86,12 @@ where
         use futures_util::FutureExt;
 
         let Request {
-            transaction,
+            cached_ffi_transaction,
             input_index,
             known_utxos,
             upgrade,
         } = req;
-        let input = &transaction.inputs()[input_index];
+        let input = &cached_ffi_transaction.inputs()[input_index];
         let branch_id = upgrade
             .branch_id()
             .expect("post-Sapling NUs have a consensus branch ID");
@@ -119,19 +116,9 @@ where
                     };
                     tracing::trace!(?utxo, "got UTXO");
 
-                    if transaction.inputs().len() < 20 {
-                        zebra_script::is_valid(
-                            transaction,
-                            branch_id,
-                            (input_index as u32, utxo.output),
-                        )?;
-                        tracing::trace!("script verification succeeded");
-                    } else {
-                        tracing::debug!(
-                            inputs.len = transaction.inputs().len(),
-                            "skipping verification of script with many inputs to avoid quadratic work until we fix zebra_script/zcash_script interface"
-                        );
-                    }
+                    cached_ffi_transaction
+                        .is_valid(branch_id, (input_index as u32, utxo.output))?;
+                    tracing::trace!("script verification succeeded");
 
                     Ok(())
                 }

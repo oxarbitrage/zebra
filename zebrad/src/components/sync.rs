@@ -18,7 +18,7 @@ use zebra_chain::{
 use zebra_network as zn;
 use zebra_state as zs;
 
-use crate::config::ZebradConfig;
+use crate::{config::ZebradConfig, BoxError};
 
 mod downloads;
 use downloads::{AlwaysHedge, Downloads};
@@ -32,34 +32,88 @@ const FANOUT: usize = 4;
 /// feed us bad hashes. But spurious failures of valid blocks cause the syncer to
 /// restart from the previous checkpoint, potentially re-downloading blocks.
 ///
-/// We also hedge requests, so we may retry up to twice this many times.
+/// We also hedge requests, so we may retry up to twice this many times. Hedged
+/// retries may be concurrent, inner retries are sequential.
 const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 2;
 
-/// A lower bound on the user-specified lookahead limit, set to two
-/// checkpoint intervals so that we're sure that the lookahead limit
-/// always contains at least one complete checkpoint interval.
+/// A lower bound on the user-specified lookahead limit.
+///
+/// Set to two checkpoint intervals, so that we're sure that the lookahead
+/// limit always contains at least one complete checkpoint.
 const MIN_LOOKAHEAD_LIMIT: usize = zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP * 2;
 
 /// Controls how long we wait for a tips response to return.
+///
+/// ## Correctness
+///
+/// If this timeout is removed (or set too high), the syncer will sometimes hang.
+///
+/// If this timeout is set too low, the syncer will sometimes get stuck in a
+/// failure loop.
 const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Controls how long we wait for a block download request to complete.
-const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// This timeout makes sure that the syncer doesn't hang when:
+///   - the lookahead queue is full, and
+///   - we are waiting for a request that is stuck.
+/// See [`BLOCK_VERIFY_TIMEOUT`] for details.
+///
+/// ## Correctness
+///
+/// If this timeout is removed (or set too high), the syncer will sometimes hang.
+///
+/// If this timeout is set too low, the syncer will sometimes get stuck in a
+/// failure loop.
+pub(super) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Controls how long we wait for a block verify request to complete.
+///
+/// This timeout makes sure that the syncer doesn't hang when:
+///  - the lookahead queue is full, and
+///  - all pending verifications:
+///    - are waiting on a missing download request,
+///    - are waiting on a download or verify request that has failed, but we have
+///      deliberately ignored the error,
+///    - are for blocks a long way ahead of the current tip, or
+///    - are for invalid blocks which will never verify, because they depend on
+///      missing blocks or transactions.
+/// These conditions can happen during normal operation - they are not bugs.
+///
+/// This timeout also mitigates or hides the following kinds of bugs:
+///  - all pending verifications:
+///    - are waiting on a download or verify request that has failed, but we have
+///      accidentally dropped the error,
+///    - are waiting on a download request that has hung inside Zebra,
+///    - are on tokio threads that are waiting for blocked operations.
+///
+/// ## Correctness
+///
+/// If this timeout is removed (or set too high), the syncer will sometimes hang.
+///
+/// If this timeout is set too low, the syncer will sometimes get stuck in a
+/// failure loop.
+pub(super) const BLOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Controls how long we wait to restart syncing after finishing a sync run.
 ///
-/// This timeout should be long enough to:
+/// This delay should be long enough to:
 ///   - allow zcashd peers to process pending requests. If the node only has a
 ///     few peers, we want to clear as much peer state as possible. In
 ///     particular, zcashd sends "next block range" hints, based on zcashd's
 ///     internal model of our sync progress. But we want to discard these hints,
-///     so they don't get confused with ObtainTips and ExtendTips responses.
+///     so they don't get confused with ObtainTips and ExtendTips responses, and
+///   - allow in-progress downloads to time out.
 ///
-/// This timeout is particularly important on instances with slow or unreliable
+/// This delay is particularly important on instances with slow or unreliable
 /// networks, and on testnet, which has a small number of slow peers.
-const SYNC_RESTART_TIMEOUT: Duration = Duration::from_secs(45);
-
-type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+///
+/// ## Correctness
+///
+/// If this delay is removed (or set too low), the syncer will
+/// sometimes get stuck in a failure loop, due to leftover downloads from
+/// previous sync runs.
+const SYNC_RESTART_DELAY: Duration = Duration::from_secs(61);
 
 /// Helps work around defects in the bitcoin protocol by checking whether
 /// the returned hashes actually extend a chain tip.
@@ -78,18 +132,37 @@ where
     ZV: Service<Arc<Block>, Response = block::Hash, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
 {
-    /// Used to perform ObtainTips and ExtendTips requests, with no retry logic
-    /// (failover is handled using fanout).
-    tip_network: Timeout<ZN>,
-    state: ZS,
-    prospective_tips: HashSet<CheckedTip>,
+    // Configuration
+    /// The genesis hash for the configured network
     genesis_hash: block::Hash,
+
+    /// The configured lookahead limit, after applying the minimum limit.
     lookahead_limit: usize,
+
+    // Services
+    /// A network service which is used to perform ObtainTips and ExtendTips
+    /// requests.
+    ///
+    /// Has no retry logic, because failover is handled using fanout.
+    tip_network: Timeout<ZN>,
+
+    /// A service which downloads and verifies blocks, using the provided
+    /// network and verifier services.
     downloads: Pin<
         Box<
-            Downloads<Hedge<ConcurrencyLimit<Retry<zn::RetryLimit, Timeout<ZN>>>, AlwaysHedge>, ZV>,
+            Downloads<
+                Hedge<ConcurrencyLimit<Retry<zn::RetryLimit, Timeout<ZN>>>, AlwaysHedge>,
+                Timeout<ZV>,
+            >,
         >,
     >,
+
+    /// The cached block chain state.
+    state: ZS,
+
+    // Internal sync state
+    /// The tips that the syncer is currently following.
+    prospective_tips: HashSet<CheckedTip>,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -135,15 +208,24 @@ where
             AlwaysHedge,
             20,
             0.95,
-            2 * SYNC_RESTART_TIMEOUT,
+            2 * SYNC_RESTART_DELAY,
+        );
+        // We apply a timeout to the verifier to avoid hangs due to missing earlier blocks.
+        let verifier = Timeout::new(verifier, BLOCK_VERIFY_TIMEOUT);
+        // Warn the user if we're ignoring their configured lookahead limit
+        assert!(
+            config.sync.lookahead_limit >= MIN_LOOKAHEAD_LIMIT,
+            "configured lookahead limit {} too low, must be at least {}",
+            config.sync.lookahead_limit,
+            MIN_LOOKAHEAD_LIMIT
         );
         Self {
-            tip_network,
-            state,
-            downloads: Box::pin(Downloads::new(block_network, verifier)),
-            prospective_tips: HashSet::new(),
             genesis_hash: genesis_hash(config.network.network),
-            lookahead_limit: std::cmp::max(config.sync.lookahead_limit, MIN_LOOKAHEAD_LIMIT),
+            lookahead_limit: config.sync.lookahead_limit,
+            tip_network,
+            downloads: Box::pin(Downloads::new(block_network, verifier)),
+            state,
+            prospective_tips: HashSet::new(),
         }
     }
 
@@ -159,11 +241,11 @@ where
 
         'sync: loop {
             if started_once {
-                tracing::info!(timeout = ?SYNC_RESTART_TIMEOUT, "waiting to restart sync");
+                tracing::info!(timeout = ?SYNC_RESTART_DELAY, "waiting to restart sync");
                 self.prospective_tips = HashSet::new();
                 self.downloads.cancel_all();
                 self.update_metrics();
-                sleep(SYNC_RESTART_TIMEOUT).await;
+                sleep(SYNC_RESTART_DELAY).await;
             } else {
                 started_once = true;
             }
@@ -269,7 +351,8 @@ where
             })
             .map_err(|e| eyre!(e))?;
 
-        tracing::debug!(?block_locator, "trying to obtain new chain tips");
+        tracing::info!("trying to obtain new chain tips");
+        tracing::debug!(?block_locator, "got block locator");
 
         let mut requests = FuturesUnordered::new();
         for _ in 0..FANOUT {
@@ -384,7 +467,7 @@ where
 
         let mut download_set = HashSet::new();
         for tip in tips {
-            tracing::debug!(?tip, "extending tip");
+            tracing::info!(?tip, "trying to extend chain tips");
             let mut responses = FuturesUnordered::new();
             for _ in 0..FANOUT {
                 responses.push(
@@ -537,7 +620,8 @@ where
     /// Returns `true` if the hash is present in the state, and `false`
     /// if the hash is not present in the state.
     ///
-    /// TODO: handle multiple tips in the state.
+    /// BUG: check if the hash is in any chain (#862)
+    /// Depth only checks the main chain.
     async fn state_contains(&mut self, hash: block::Hash) -> Result<bool, Report> {
         match self
             .state
@@ -568,6 +652,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use zebra_chain::parameters::NetworkUpgrade;
+
     use super::*;
 
     /// Make sure the timeout values are consistent with each other.
@@ -575,9 +661,45 @@ mod test {
     fn ensure_timeouts_consistent() {
         zebra_test::init();
 
+        // This constraint clears the download pipeline during a restart
         assert!(
-            BLOCK_DOWNLOAD_TIMEOUT.as_secs() * 2 < SYNC_RESTART_TIMEOUT.as_secs(),
+            SYNC_RESTART_DELAY.as_secs() > 2 * BLOCK_DOWNLOAD_TIMEOUT.as_secs(),
             "Sync restart should allow for pending and buffered requests to complete"
+        );
+
+        // This constraint avoids spurious failures due to block retries timing out.
+        // We multiply by 2, because the Hedge can wait up to BLOCK_DOWNLOAD_TIMEOUT
+        // seconds before retrying.
+        const BLOCK_DOWNLOAD_HEDGE_TIMEOUT: u64 =
+            2 * BLOCK_DOWNLOAD_RETRY_LIMIT as u64 * BLOCK_DOWNLOAD_TIMEOUT.as_secs();
+        assert!(
+            SYNC_RESTART_DELAY.as_secs() > BLOCK_DOWNLOAD_HEDGE_TIMEOUT,
+            "Sync restart should allow for block downloads to time out on every retry"
+        );
+
+        // This constraint avoids spurious failures due to block download timeouts
+        assert!(
+            BLOCK_VERIFY_TIMEOUT.as_secs()
+                > SYNC_RESTART_DELAY.as_secs()
+                    + BLOCK_DOWNLOAD_HEDGE_TIMEOUT
+                    + BLOCK_DOWNLOAD_TIMEOUT.as_secs(),
+            "Block verify should allow for a block timeout, a sync restart, and some block fetches"
+        );
+
+        // The minimum recommended network speed for Zebra, in bytes per second.
+        const MIN_NETWORK_SPEED_BYTES_PER_SEC: u64 = 10 * 1024 * 1024 / 8;
+
+        // This constraint avoids spurious failures when restarting large checkpoints
+        assert!(
+            BLOCK_VERIFY_TIMEOUT.as_secs() > SYNC_RESTART_DELAY.as_secs() + 2 * zebra_consensus::MAX_CHECKPOINT_BYTE_COUNT / MIN_NETWORK_SPEED_BYTES_PER_SEC,
+            "Block verify should allow for a full checkpoint download, a sync restart, then a full checkpoint re-download"
+        );
+
+        // This constraint avoids spurious failures after checkpointing has finished
+        assert!(
+            BLOCK_VERIFY_TIMEOUT.as_secs()
+                > 2 * NetworkUpgrade::Blossom.target_spacing().num_seconds() as u64,
+            "Block verify should allow for at least one new block to be generated and distributed"
         );
     }
 }

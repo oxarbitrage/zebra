@@ -7,14 +7,16 @@ use super::{
 
 use crate::semaphore::Semaphore;
 use futures_core::ready;
-use std::task::{Context, Poll};
+use std::{
+    fmt,
+    task::{Context, Poll},
+};
 use tokio::sync::{mpsc, oneshot};
 use tower::Service;
 
 /// Allows batch processing of requests.
 ///
 /// See the module documentation for more details.
-#[derive(Debug)]
 pub struct Batch<T, Request>
 where
     T: Service<BatchControl<Request>>,
@@ -33,6 +35,20 @@ where
     // limit how many items are in the channel.
     semaphore: Semaphore,
     handle: Handle,
+}
+
+impl<T, Request> fmt::Debug for Batch<T, Request>
+where
+    T: Service<BatchControl<Request>>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = std::any::type_name::<Self>();
+        f.debug_struct(name)
+            .field("tx", &self.tx)
+            .field("semaphore", &self.semaphore)
+            .field("handle", &self.handle)
+            .finish()
+    }
 }
 
 impl<T, Request> Batch<T, Request>
@@ -57,8 +73,12 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
-        // XXX(hdevalence): is this bound good
-        let bound = 1;
+        // The semaphore bound limits the maximum number of concurrent requests
+        // (specifically, requests which got a `Ready` from `poll_ready`, but haven't
+        // used their semaphore reservation in a `call` yet).
+        // We choose a bound that allows callers to check readiness for every item in
+        // a batch, then actually submit those items.
+        let bound = max_items;
         let (tx, rx) = mpsc::unbounded_channel();
         let (handle, worker) = Worker::new(service, rx, max_items, max_latency);
         tokio::spawn(worker.run());
@@ -94,6 +114,9 @@ where
         // Then, poll to acquire a semaphore permit. If we acquire a permit,
         // then there's enough buffer capacity to send a new request. Otherwise,
         // we need to wait for capacity.
+
+        // In tokio 0.3.7, `acquire_owned` panics if its semaphore returns an error,
+        // so we don't need to handle errors until we upgrade to tokio 1.0.
         ready!(self.semaphore.poll_acquire(cx));
 
         Poll::Ready(Ok(()))
