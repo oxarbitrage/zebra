@@ -7,7 +7,6 @@ mod joinsplit;
 mod lock_time;
 mod memo;
 mod serialize;
-mod shielded_data;
 mod sighash;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -19,11 +18,10 @@ pub use hash::Hash;
 pub use joinsplit::JoinSplitData;
 pub use lock_time::LockTime;
 pub use memo::Memo;
-pub use shielded_data::ShieldedData;
+pub use sapling::FieldNotPresent;
 pub use sighash::HashType;
 
 use crate::{
-    amount::Amount,
     block,
     parameters::NetworkUpgrade,
     primitives::{Bctv14Proof, Groth16Proof},
@@ -39,10 +37,10 @@ use crate::{
 /// blockchain).
 ///
 /// Zcash has a number of different transaction formats. They are represented
-/// internally by different enum variants. Because we checkpoint on Sapling
-/// activation, we do not parse any pre-Sapling transaction types.
+/// internally by different enum variants. Because we checkpoint on Canopy
+/// activation, we do not validate any pre-Sapling transaction types.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-// XXX consider boxing the Optional fields of V4 txs
+// XXX consider boxing the Optional fields of V4 and V5 txs
 #[allow(clippy::large_enum_variant)]
 pub enum Transaction {
     /// A fully transparent transaction (`version = 1`).
@@ -92,12 +90,24 @@ pub enum Transaction {
         lock_time: LockTime,
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
-        /// The net value of Sapling spend transfers minus output transfers.
-        value_balance: Amount,
         /// The JoinSplit data for this transaction, if any.
         joinsplit_data: Option<JoinSplitData<Groth16Proof>>,
-        /// The shielded data for this transaction, if any.
-        shielded_data: Option<ShieldedData>,
+        /// The sapling shielded data for this transaction, if any.
+        sapling_shielded_data: Option<sapling::ShieldedData<sapling::PerSpendAnchor>>,
+    },
+    /// A `version = 5` transaction, which supports `Sapling` and `Orchard`.
+    V5 {
+        /// The earliest time or block height that this transaction can be added to the
+        /// chain.
+        lock_time: LockTime,
+        /// The latest block height that this transaction can be added to the chain.
+        expiry_height: block::Height,
+        /// The transparent inputs to the transaction.
+        inputs: Vec<transparent::Input>,
+        /// The transparent outputs from the transaction.
+        outputs: Vec<transparent::Output>,
+        /// The rest of the transaction as bytes
+        rest: Vec<u8>,
     },
 }
 
@@ -114,6 +124,7 @@ impl Transaction {
             Transaction::V2 { ref inputs, .. } => inputs,
             Transaction::V3 { ref inputs, .. } => inputs,
             Transaction::V4 { ref inputs, .. } => inputs,
+            Transaction::V5 { ref inputs, .. } => inputs,
         }
     }
 
@@ -124,6 +135,7 @@ impl Transaction {
             Transaction::V2 { ref outputs, .. } => outputs,
             Transaction::V3 { ref outputs, .. } => outputs,
             Transaction::V4 { ref outputs, .. } => outputs,
+            Transaction::V5 { ref outputs, .. } => outputs,
         }
     }
 
@@ -134,6 +146,7 @@ impl Transaction {
             Transaction::V2 { lock_time, .. } => *lock_time,
             Transaction::V3 { lock_time, .. } => *lock_time,
             Transaction::V4 { lock_time, .. } => *lock_time,
+            Transaction::V5 { lock_time, .. } => *lock_time,
         }
     }
 
@@ -144,6 +157,7 @@ impl Transaction {
             Transaction::V2 { .. } => None,
             Transaction::V3 { expiry_height, .. } => Some(*expiry_height),
             Transaction::V4 { expiry_height, .. } => Some(*expiry_height),
+            Transaction::V5 { expiry_height, .. } => Some(*expiry_height),
         }
     }
 
@@ -174,8 +188,26 @@ impl Transaction {
                     .joinsplits()
                     .flat_map(|joinsplit| joinsplit.nullifiers.iter()),
             ),
+            // Maybe JoinSplits, maybe not, we're still deciding
+            Transaction::V5 { .. } => {
+                unimplemented!(
+                    "v5 transaction format as specified in ZIP-225 after decision on 2021-03-12"
+                )
+            }
             // No JoinSplits
-            _ => Box::new(std::iter::empty()),
+            Transaction::V1 { .. }
+            | Transaction::V2 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V3 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V4 {
+                joinsplit_data: None,
+                ..
+            } => Box::new(std::iter::empty()),
         }
     }
 
@@ -186,11 +218,20 @@ impl Transaction {
         match self {
             // JoinSplits with Groth Proofs
             Transaction::V4 {
-                shielded_data: Some(shielded_data),
+                sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            } => Box::new(shielded_data.nullifiers()),
+            } => Box::new(sapling_shielded_data.nullifiers()),
+            Transaction::V5 { .. } => {
+                unimplemented!("v5 transaction format as specified in ZIP-225")
+            }
             // No JoinSplits
-            _ => Box::new(std::iter::empty()),
+            Transaction::V1 { .. }
+            | Transaction::V2 { .. }
+            | Transaction::V3 { .. }
+            | Transaction::V4 {
+                sapling_shielded_data: None,
+                ..
+            } => Box::new(std::iter::empty()),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -175,7 +175,7 @@ impl ZcashSerialize for Input {
                 let total_len = height_len + data.as_ref().len();
                 writer.write_compactsize(total_len as u64)?;
                 write_coinbase_height(*height, &mut writer)?;
-                writer.write_all(&data.as_ref()[..])?;
+                writer.write_all(data.as_ref())?;
                 writer.write_u32::<LittleEndian>(*sequence)?;
             }
         }
@@ -196,8 +196,9 @@ impl ZcashDeserialize for Input {
             if len > 100 {
                 return Err(SerializationError::Parse("coinbase has too much data"));
             }
-            let mut data = Vec::with_capacity(len as usize);
-            (&mut reader).take(len).read_to_end(&mut data)?;
+            // Memory Denial of Service: this length has just been checked
+            let mut data = vec![0; len as usize];
+            reader.read_exact(&mut data[..])?;
             let (height, data) = parse_coinbase_height(data)?;
             let sequence = reader.read_u32::<LittleEndian>()?;
             Ok(Input::Coinbase {

@@ -1,10 +1,10 @@
 //! Blocks and block-related structures (heights, headers, etc.)
 #![allow(clippy::unit_arg)]
 
+mod commitment;
 mod hash;
 mod header;
 mod height;
-mod root_hash;
 mod serialize;
 
 pub mod merkle;
@@ -16,15 +16,21 @@ mod tests;
 
 use std::fmt;
 
+pub use commitment::{Commitment, CommitmentError};
 pub use hash::Hash;
-pub use header::BlockTimeError;
-pub use header::{CountedHeader, Header};
+pub use header::{BlockTimeError, CountedHeader, Header};
 pub use height::Height;
-pub use root_hash::RootHash;
+pub use serialize::MAX_BLOCK_BYTES;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{fmt::DisplayToDebug, parameters::Network, transaction::Transaction, transparent};
+use crate::{
+    fmt::DisplayToDebug,
+    parameters::Network,
+    serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    transaction::Transaction,
+    transparent,
+};
 
 /// A Zcash block, containing a header and a list of transactions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,20 +69,19 @@ impl Block {
         Hash::from(self)
     }
 
-    /// Get the parsed root hash for this block.
+    /// Get the parsed block [`Commitment`] for this block.
     ///
-    /// The interpretation of the root hash depends on the
+    /// The interpretation of the commitment depends on the
     /// configured `network`, and this block's height.
     ///
-    /// Returns None if this block does not have a block height.
-    pub fn root_hash(&self, network: Network) -> Option<RootHash> {
+    /// Returns an error if this block does not have a block height,
+    /// or if the commitment value is structurally invalid.
+    pub fn commitment(&self, network: Network) -> Result<Commitment, CommitmentError> {
         match self.coinbase_height() {
-            Some(height) => Some(RootHash::from_bytes(
-                self.header.root_bytes,
-                network,
-                height,
-            )),
-            None => None,
+            None => Err(CommitmentError::MissingBlockHeight {
+                block_hash: self.hash(),
+            }),
+            Some(height) => Commitment::from_bytes(self.header.commitment_bytes, network, height),
         }
     }
 }
@@ -84,5 +89,17 @@ impl Block {
 impl<'a> From<&'a Block> for Hash {
     fn from(block: &'a Block) -> Hash {
         (&block.header).into()
+    }
+}
+
+/// A serialized Block hash takes 32 bytes
+const BLOCK_HASH_SIZE: u64 = 32;
+
+/// The maximum number of hashes in a valid Zcash protocol message.
+impl TrustedPreallocate for Hash {
+    fn max_allocation() -> u64 {
+        // Every vector type requires a length field of at least one byte for de/serialization.
+        // Since a block::Hash takes 32 bytes, we can never receive more than (MAX_PROTOCOL_MESSAGE_LEN - 1) / 32 hashes in a single message
+        ((MAX_PROTOCOL_MESSAGE_LEN - 1) as u64) / BLOCK_HASH_SIZE
     }
 }

@@ -32,18 +32,22 @@ use zebra_chain::{
 };
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::constants::LOCK_FILE_ERROR;
-use zebra_test::{command::TestDirExt, prelude::*};
+use zebra_test::{
+    command::{ContextFrom, TestDirExt},
+    prelude::*,
+};
 use zebrad::config::ZebradConfig;
 
 /// The amount of time we wait after launching `zebrad`.
 ///
-/// Previously, this value was 1 second, which caused occasional
-/// `tracing_endpoint` test failures on some machines.
-const LAUNCH_DELAY: Duration = Duration::from_secs(3);
+/// Previously, this value was 3 seconds, which caused rare
+/// metrics or tracing test failures in Windows CI.
+const LAUNCH_DELAY: Duration = Duration::from_secs(10);
 
 fn default_test_config() -> Result<ZebradConfig> {
     let auto_port_ipv4_local = zebra_network::Config {
         listen_addr: "127.0.0.1:0".parse()?,
+        crawl_new_peer_interval: Duration::from_secs(30),
         ..zebra_network::Config::default()
     };
     let local_ephemeral = ZebradConfig {
@@ -659,7 +663,7 @@ const STOP_AT_HEIGHT_REGEX: &str = "stopping at configured height";
 
 const STOP_ON_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 // usually it's much shorter than this
-const SMALL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+const SMALL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Test if `zebrad` can sync the first checkpoint on mainnet.
@@ -702,8 +706,9 @@ fn restart_stop_at_height() -> Result<()> {
         SMALL_CHECKPOINT_TIMEOUT,
         None,
     )?;
-    // if stopping corrupts the rocksdb database, zebrad might hang here
-    // if stopping does not sync the rocksdb database, the logs will contain OnCommit
+    // if stopping corrupts the rocksdb database, zebrad might hang or crash here
+    // if stopping does not write the rocksdb database to disk, Zebra will
+    // sync, rather than stopping immediately at the configured height
     sync_until(
         Height(0),
         Mainnet,
@@ -742,22 +747,8 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
     Ok(())
 }
 
-/// Test if `zebrad` can sync some larger checkpoints on testnet.
-///
-/// This test does not run by default, see `sync_large_checkpoints_mainnet`
-/// for details.
-#[test]
-#[ignore]
-fn sync_large_checkpoints_testnet() -> Result<()> {
-    sync_until(
-        LARGE_CHECKPOINT_TEST_HEIGHT,
-        Testnet,
-        STOP_AT_HEIGHT_REGEX,
-        LARGE_CHECKPOINT_TIMEOUT,
-        None,
-    )
-    .map(|_tempdir| ())
-}
+// Todo: We had a `sync_large_checkpoints_testnet` here but it was removed because
+// the testnet is unreliable(#1222). Enable after we have more testnet instances(#1791).
 
 /// Sync `network` until `zebrad` reaches `height`, and ensure that
 /// the output contains `stop_regex`. If `reuse_tempdir` is supplied,
@@ -810,7 +801,7 @@ fn sync_until(
     Ok(child.dir)
 }
 
-fn cached_sapling_test_config() -> Result<ZebradConfig> {
+fn cached_canopy_test_config() -> Result<ZebradConfig> {
     let mut config = persistent_test_config()?;
     config.consensus.checkpoint_sync = true;
     config.state.cache_dir = "/zebrad-cache".into();
@@ -823,7 +814,7 @@ fn create_cached_database_height(network: Network, height: Height) -> Result<()>
     let timeout = Duration::from_secs(60 * 60 * 8);
 
     // Use a persistent state, so we can handle large syncs
-    let mut config = cached_sapling_test_config()?;
+    let mut config = cached_canopy_test_config()?;
     // TODO: add convenience methods?
     config.network.network = network;
     config.state.debug_stop_at_height = Some(height.0);
@@ -844,12 +835,12 @@ fn create_cached_database_height(network: Network, height: Height) -> Result<()>
 }
 
 fn create_cached_database(network: Network) -> Result<()> {
-    let height = NetworkUpgrade::Sapling.activation_height(network).unwrap();
+    let height = NetworkUpgrade::Canopy.activation_height(network).unwrap();
     create_cached_database_height(network, height)
 }
 
-fn sync_past_sapling(network: Network) -> Result<()> {
-    let height = NetworkUpgrade::Sapling.activation_height(network).unwrap() + 1200;
+fn sync_past_canopy(network: Network) -> Result<()> {
+    let height = NetworkUpgrade::Canopy.activation_height(network).unwrap() + 1200;
     create_cached_database_height(network, height.unwrap())
 }
 
@@ -860,17 +851,17 @@ fn sync_past_sapling(network: Network) -> Result<()> {
 // drives populated by the first two tests, snapshot those drives, and then use
 // those to more quickly run the second two tests.
 
-// Sync up to the sapling activation height on mainnet and stop.
-#[cfg_attr(feature = "test_sync_to_sapling_mainnet", test)]
-fn sync_to_sapling_mainnet() {
+// Sync up to the canopy activation height on mainnet and stop.
+#[cfg_attr(feature = "test_sync_to_canopy_mainnet", test)]
+fn sync_to_canopy_mainnet() {
     zebra_test::init();
     let network = Mainnet;
     create_cached_database(network).unwrap();
 }
 
-// Sync to the sapling activation height testnet and stop.
-#[cfg_attr(feature = "test_sync_to_sapling_testnet", test)]
-fn sync_to_sapling_testnet() {
+// Sync to the canopy activation height testnet and stop.
+#[cfg_attr(feature = "test_sync_to_canopy_testnet", test)]
+fn sync_to_canopy_testnet() {
     zebra_test::init();
     let network = Testnet;
     create_cached_database(network).unwrap();
@@ -878,26 +869,26 @@ fn sync_to_sapling_testnet() {
 
 /// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on mainnet.
 ///
-/// This assumes that the config'd state is already synced at or near Sapling
-/// activation on mainnet. If the state has already synced past Sapling
+/// This assumes that the config'd state is already synced at or near Canopy
+/// activation on mainnet. If the state has already synced past Canopy
 /// activation by 1200 blocks, it will fail.
-#[cfg_attr(feature = "test_sync_past_sapling_mainnet", test)]
-fn sync_past_sapling_mainnet() {
+#[cfg_attr(feature = "test_sync_past_canopy_mainnet", test)]
+fn sync_past_canopy_mainnet() {
     zebra_test::init();
     let network = Mainnet;
-    sync_past_sapling(network).unwrap();
+    sync_past_canopy(network).unwrap();
 }
 
 /// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on testnet.
 ///
-/// This assumes that the config'd state is already synced at or near Sapling
-/// activation on testnet. If the state has already synced past Sapling
+/// This assumes that the config'd state is already synced at or near Canopy
+/// activation on testnet. If the state has already synced past Canopy
 /// activation by 1200 blocks, it will fail.
-#[cfg_attr(feature = "test_sync_past_sapling_testnet", test)]
-fn sync_past_sapling_testnet() {
+#[cfg_attr(feature = "test_sync_past_canopy_testnet", test)]
+fn sync_past_canopy_testnet() {
     zebra_test::init();
     let network = Testnet;
-    sync_past_sapling(network).unwrap();
+    sync_past_canopy(network).unwrap();
 }
 
 /// Returns a random port number from the ephemeral port range.
@@ -915,10 +906,23 @@ fn sync_past_sapling_testnet() {
 /// times. For example: setting up both ends of a connection, or re-using
 /// the same port multiple times.
 fn random_known_port() -> u16 {
-    // Use the intersection of the IANA ephemeral port range, and the Linux
-    // ephemeral port range:
-    // https://en.wikipedia.org/wiki/Ephemeral_port#Range
-    rand::thread_rng().gen_range(49152, 60999)
+    // Use the intersection of the IANA/Windows/macOS ephemeral port range,
+    // and the Linux ephemeral port range:
+    //   - https://en.wikipedia.org/wiki/Ephemeral_port#Range
+    // excluding ports less than 53500, to avoid:
+    //   - typical Hyper-V reservations up to 52000:
+    //      - https://github.com/googlevr/gvr-unity-sdk/issues/1002
+    //      - https://github.com/docker/for-win/issues/3171
+    //   - the MOM-Clear port 51515
+    //      - https://docs.microsoft.com/en-us/troubleshoot/windows-server/networking/service-overview-and-network-port-requirements
+    //   - the LDAP Kerberos byte-swapped reservation 53249
+    //      - https://docs.microsoft.com/en-us/troubleshoot/windows-server/identity/ldap-kerberos-server-reset-tcp-sessions
+    //   - macOS and Windows sequential ephemeral port allocations,
+    //     starting from 49152:
+    //      - https://dataplane.org/ephemeralports.html
+    use rand::Rng;
+
+    rand::thread_rng().gen_range(53500..60999)
 }
 
 /// Returns the "magic" port number that tells the operating system to
@@ -951,7 +955,7 @@ async fn metrics_endpoint() -> Result<()> {
     config.metrics.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
-    let mut child = dir.spawn_child(&["start"])?;
+    let child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
     // Since we're an async function, we have to use a sleep future, not thread sleep.
@@ -961,9 +965,11 @@ async fn metrics_endpoint() -> Result<()> {
     let client = Client::new();
 
     // Test metrics endpoint
-    let res = client.get(url.try_into().expect("url is valid")).await?;
+    let res = client.get(url.try_into().expect("url is valid")).await;
+    let (res, child) = child.kill_on_error(res)?;
     assert!(res.status().is_success());
-    let body = hyper::body::to_bytes(res).await?;
+    let body = hyper::body::to_bytes(res).await;
+    let (body, mut child) = child.kill_on_error(body)?;
     assert!(
         std::str::from_utf8(&body)
             .expect("metrics response is valid UTF-8")
@@ -1004,7 +1010,7 @@ async fn tracing_endpoint() -> Result<()> {
     config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
-    let mut child = dir.spawn_child(&["start"])?;
+    let child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
     // Since we're an async function, we have to use a sleep future, not thread sleep.
@@ -1016,9 +1022,11 @@ async fn tracing_endpoint() -> Result<()> {
     // Test tracing endpoint
     let res = client
         .get(url_default.try_into().expect("url_default is valid"))
-        .await?;
+        .await;
+    let (res, child) = child.kill_on_error(res)?;
     assert!(res.status().is_success());
-    let body = hyper::body::to_bytes(res).await?;
+    let body = hyper::body::to_bytes(res).await;
+    let (body, child) = child.kill_on_error(body)?;
     assert!(std::str::from_utf8(&body).unwrap().contains(
         "This HTTP endpoint allows dynamic control of the filter applied to\ntracing events."
     ));
@@ -1027,13 +1035,16 @@ async fn tracing_endpoint() -> Result<()> {
     let request = Request::post(url_filter.clone())
         .body(Body::from("zebrad=debug"))
         .unwrap();
-    let _post = client.request(request).await?;
+    let post = client.request(request).await;
+    let (_post, child) = child.kill_on_error(post)?;
 
     let tracing_res = client
         .get(url_filter.try_into().expect("url_filter is valid"))
-        .await?;
+        .await;
+    let (tracing_res, child) = child.kill_on_error(tracing_res)?;
     assert!(tracing_res.status().is_success());
-    let tracing_body = hyper::body::to_bytes(tracing_res).await?;
+    let tracing_body = hyper::body::to_bytes(tracing_res).await;
+    let (tracing_body, mut child) = child.kill_on_error(tracing_body)?;
     assert!(std::str::from_utf8(&tracing_body)
         .unwrap()
         .contains("zebrad=debug"));
@@ -1059,7 +1070,7 @@ async fn tracing_endpoint() -> Result<()> {
 /// It is expected that the first node spawned will get exclusive use of the port.
 /// The second node will panic with the Zcash listener conflict hint added in #1535.
 #[test]
-fn zcash_listener_conflict() -> Result<()> {
+fn zebra_zcash_listener_conflict() -> Result<()> {
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -1087,7 +1098,7 @@ fn zcash_listener_conflict() -> Result<()> {
 /// exclusive use of the port. The second node will panic with the Zcash metrics
 /// conflict hint added in #1535.
 #[test]
-fn zcash_metrics_conflict() -> Result<()> {
+fn zebra_metrics_conflict() -> Result<()> {
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -1115,7 +1126,7 @@ fn zcash_metrics_conflict() -> Result<()> {
 /// exclusive use of the port. The second node will panic with the Zcash tracing
 /// conflict hint added in #1535.
 #[test]
-fn zcash_tracing_conflict() -> Result<()> {
+fn zebra_tracing_conflict() -> Result<()> {
     zebra_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -1142,7 +1153,7 @@ fn zcash_tracing_conflict() -> Result<()> {
 /// listener ports. The first node should get exclusive access to the database.
 /// The second node will panic with the Zcash state conflict hint added in #1535.
 #[test]
-fn zcash_state_conflict() -> Result<()> {
+fn zebra_state_conflict() -> Result<()> {
     zebra_test::init();
 
     // A persistent config has a fixed temp state directory, but asks the OS to
@@ -1194,39 +1205,66 @@ where
     T: ZebradTestDirExt,
     U: ZebradTestDirExt,
 {
-    // By DNS issues we want to skip all port conflict tests on macOS by now.
-    // Follow up at #1631
-    if cfg!(target_os = "macos") {
-        return Ok(());
-    }
-
     // Start the first node
-    let mut node1 = first_dir.spawn_child(&["start"])?;
+    let node1 = first_dir.spawn_child(&["start"])?;
 
     // Wait a bit to spawn the second node, we want the first fully started.
     std::thread::sleep(LAUNCH_DELAY);
 
     // Spawn the second node
-    let node2 = second_dir.spawn_child(&["start"])?;
+    let node2 = second_dir.spawn_child(&["start"]);
+    let (node2, mut node1) = node1.kill_on_error(node2)?;
 
     // Wait a few seconds and kill first node.
     // Second node is terminated by panic, no need to kill.
     std::thread::sleep(LAUNCH_DELAY);
-    node1.kill()?;
+    let node1_kill_res = node1.kill();
+    let (_, node2) = node2.kill_on_error(node1_kill_res)?;
 
     // In node1 we want to check for the success regex
-    let output1 = node1.wait_with_output()?;
-    output1.stdout_contains(first_stdout_regex)?;
+    // If there are any errors, we also want to print the node2 output.
+    let output1 = node1.wait_with_output();
+    // This mut is only used on some platforms, due to #1781.
+    #[allow(unused_mut)]
+    let (output1, mut node2) = node2.kill_on_error(output1)?;
+
+    // node2 should have panicked due to a conflict. Kill it here anyway, so it
+    // doesn't outlive the test on error.
+    //
+    // This code doesn't work on Windows or macOS. It's cleanup code that only
+    // runs when node2 doesn't panic as expected. So it's ok to skip it.
+    // See #1781.
+    #[cfg(target_os = "linux")]
+    if node2.is_running() {
+        use color_eyre::eyre::eyre;
+        return node2
+            .kill_on_error::<(), _>(Err(eyre!(
+                "conflicted node2 was still running, but the test expected a panic"
+            )))
+            .context_from(&output1)
+            .map(|_| ());
+    }
+    // Now we're sure both nodes are dead, and we have both their outputs
+    let output2 = node2.wait_with_output().context_from(&output1)?;
+
+    // Look for the success regex
+    output1
+        .stdout_contains(first_stdout_regex)
+        .context_from(&output2)?;
+    use color_eyre::Help;
     output1
         .assert_was_killed()
-        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+        .warning("Possible port conflict. Are there other acceptance tests running?")
+        .context_from(&output2)?;
 
     // In the second node we look for the conflict regex
-    let output2 = node2.wait_with_output()?;
-    output2.stderr_contains(second_stderr_regex)?;
+    output2
+        .stderr_contains(second_stderr_regex)
+        .context_from(&output1)?;
     output2
         .assert_was_not_killed()
-        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+        .warning("Possible port conflict. Are there other acceptance tests running?")
+        .context_from(&output1)?;
 
     Ok(())
 }

@@ -68,9 +68,9 @@ execute independently and are scheduled co-operatively using explicit yield
 points. Tasks are executed on the Tokio runtime, which can either be single-
 or multi-threaded.
 
-[ps_scan]: https://zips.z.cash/protocol/canopy.pdf#saplingscan
-[ps_keys]: https://zips.z.cash/protocol/canopy.pdf#addressesandkeys
-[ps_sapk]: https://zips.z.cash/protocol/canopy.pdf#saplingkeycomponents
+[ps_scan]: https://zips.z.cash/protocol/protocol.pdf#saplingscan
+[ps_keys]: https://zips.z.cash/protocol/protocol.pdf#addressesandkeys
+[ps_sapk]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
 [tokio-task]: https://docs.rs/tokio/0.2.22/tokio/task/index.html
 
 # Guide-level explanation
@@ -279,6 +279,10 @@ Supporting a wallet assumes risk.  Effort required to implement wallet functiona
     - light client protocol as currently implemented requires stack assumptions
       such as protobufs and a hardcoded lightserver to talk to
 
+- What about having one database per key?
+    - easy to reliably delete or backup all data related to a single key
+    - might use slightly more space/CPU
+    - slightly harder to delete all the keys
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
@@ -291,6 +295,20 @@ Supporting a wallet assumes risk.  Effort required to implement wallet functiona
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
+
+- mandatory sweeps for legacy keys
+    - blazingly fast wallet startup, to match `zebrad`'s blazingly fast sync
+    - generate unified address from a new seed phrase (or one provided by the user)
+    - user can just backup seed phrase rather than a set of private keys
+    - handles arbitrary keys from `zcashd` and other wallets, even if they weren't generated from a seed phrase
+    - handles Sprout funds without `zebra-client` having to support Sprout balances
+    - startup is incredibly fast
+        - sweep takes a few minutes to be confirmed
+        - scanning the entire chain could take hours
+        - if we know when the seed phrase was created, we can skip millions of blocks during scanning
+    - sweeps can also be initiated by the user for non-linkability / performance / refresh
+    - sweeps should handle the "block reward recipient" case where there are a lot of small outputs
+    - initial release could support mandatory sweeps, and future releases could support legacy keys
 
 - split `Client` component into subprocess
     - this helps somewhat but the benefit is reduced by our prexisting memory safety, thanks to Rust

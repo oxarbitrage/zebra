@@ -1,18 +1,18 @@
 //! Inventory items for the Bitcoin protocol.
 
-// XXX the exact optimal arrangement of all of these parts is a little unclear
-// until we have more pieces in place the optimal global arrangement of items is
-// a little unclear.
-
 use std::io::{Read, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use zebra_chain::{
     block,
-    serialization::{ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize},
+    serialization::{
+        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
+    },
     transaction,
 };
+
+use super::MAX_PROTOCOL_MESSAGE_LEN;
 
 /// An inventory hash which refers to some advertised or requested data.
 ///
@@ -79,5 +79,16 @@ impl ZcashDeserialize for InventoryHash {
             3 => Ok(InventoryHash::FilteredBlock(block::Hash(bytes))),
             _ => Err(SerializationError::Parse("invalid inventory code")),
         }
+    }
+}
+
+/// The serialized size of an [`InventoryHash`].
+pub(crate) const INV_HASH_SIZE: usize = 36;
+
+impl TrustedPreallocate for InventoryHash {
+    fn max_allocation() -> u64 {
+        // An Inventory hash takes 36 bytes, and we reserve at least one byte for the Vector length
+        // so we can never receive more than ((MAX_PROTOCOL_MESSAGE_LEN - 1) / 36) in a single message
+        ((MAX_PROTOCOL_MESSAGE_LEN - 1) / INV_HASH_SIZE) as u64
     }
 }

@@ -7,6 +7,11 @@ mod message;
 /// Newtype wrappers for primitive types.
 pub mod types;
 
-pub use codec::Codec;
+#[cfg(any(test, feature = "proptest-impl"))]
+mod arbitrary;
+#[cfg(test)]
+mod tests;
+
+pub use codec::{Codec, MAX_PROTOCOL_MESSAGE_LEN};
 pub use inv::InventoryHash;
 pub use message::Message;

@@ -2,7 +2,7 @@
 //!
 //! "The receiving key sk_enc, the incoming viewing key ivk = (apk,
 //! sk_enc), and the shielded payment address addr_pk = (a_pk, pk_enc) are
-//! derived from a_sk, as described in [‘Sprout Key Components’][ps]
+//! derived from a_sk, as described in ['Sprout Key Components'][ps]
 //!
 //! [ps]: https://zips.z.cash/protocol/protocol.pdf#sproutkeycomponents
 #![allow(clippy::unit_arg)]
@@ -89,9 +89,7 @@ impl ZcashDeserialize for SpendingKey {
         let network = match version_bytes {
             sk_magics::MAINNET => Network::Mainnet,
             sk_magics::TESTNET => Network::Testnet,
-            _ => panic!(SerializationError::Parse(
-                "bad sprout spending key version/type",
-            )),
+            _ => panic!("SerializationError: bad sprout spending key version/type"),
         };
 
         Ok(SpendingKey {
@@ -225,7 +223,7 @@ mod ivk_magics {
     pub const TESTNET: [u8; 3] = [0xA8, 0xAC, 0x0C];
 }
 
-/// The recipient’s possession of the associated incoming viewing key
+/// The recipient's possession of the associated incoming viewing key
 /// is used to reconstruct the original note and memo field.
 pub struct IncomingViewingKey {
     network: Network,
@@ -277,9 +275,7 @@ impl ZcashDeserialize for IncomingViewingKey {
         let network = match version_bytes {
             ivk_magics::MAINNET => Network::Mainnet,
             ivk_magics::TESTNET => Network::Testnet,
-            _ => panic!(SerializationError::Parse(
-                "bad sprout incoming viewing key network",
-            )),
+            _ => panic!("SerializationError: bad sprout incoming viewing key network"),
         };
 
         Ok(IncomingViewingKey {

@@ -21,7 +21,7 @@ use std::{
     str::FromStr,
 };
 
-use bech32::{self, FromBase32, ToBase32};
+use bech32::{self, FromBase32, ToBase32, Variant};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::{
@@ -206,7 +206,7 @@ impl fmt::Display for SpendingKey {
             _ => sk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32()).unwrap()
+        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32(), Variant::Bech32).unwrap()
     }
 }
 
@@ -215,7 +215,7 @@ impl FromStr for SpendingKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
-            Ok((hrp, bytes)) => {
+            Ok((hrp, bytes, Variant::Bech32)) => {
                 let decoded = Vec::<u8>::from_base32(&bytes).unwrap();
 
                 let mut decoded_bytes = [0u8; 32];
@@ -229,7 +229,7 @@ impl FromStr for SpendingKey {
                     bytes: decoded_bytes,
                 })
             }
-            Err(_) => Err(SerializationError::Parse("bech32 decoding error")),
+            _ => Err(SerializationError::Parse("bech32 decoding error")),
         }
     }
 }
@@ -527,7 +527,7 @@ impl fmt::Display for IncomingViewingKey {
             _ => ivk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, &self.scalar.to_bytes().to_base32()).unwrap()
+        bech32::encode_to_fmt(f, hrp, &self.scalar.to_bytes().to_base32(), Variant::Bech32).unwrap()
     }
 }
 
@@ -576,7 +576,7 @@ impl FromStr for IncomingViewingKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
-            Ok((hrp, bytes)) => {
+            Ok((hrp, bytes, Variant::Bech32)) => {
                 let decoded = Vec::<u8>::from_base32(&bytes).unwrap();
 
                 let mut scalar_bytes = [0u8; 32];
@@ -590,7 +590,7 @@ impl FromStr for IncomingViewingKey {
                     scalar: Scalar::from_bytes(&scalar_bytes).unwrap(),
                 })
             }
-            Err(_) => Err(SerializationError::Parse("bech32 decoding error")),
+            _ => Err(SerializationError::Parse("bech32 decoding error")),
         }
     }
 }
@@ -666,7 +666,7 @@ impl From<SpendingKey> for Diversifier {
     /// Derives a [_default diversifier_][4.2.2] from a SpendingKey.
     ///
     /// 'For each spending key, there is also a default diversified
-    /// payment address with a “random-looking” diversifier. This
+    /// payment address with a "random-looking" diversifier. This
     /// allows an implementation that does not expose diversified
     /// addresses as a user-visible feature, to use a default address
     /// that cannot be distinguished (without knowledge of the
@@ -795,8 +795,8 @@ mod fvk_hrp {
 /// spend authority.
 ///
 /// For incoming viewing keys on the production network, the
-/// Human-Readable Part is “zviews”. For incoming viewing keys on the
-/// test network, the Human-Readable Part is “zviewtestsapling”.
+/// Human-Readable Part is "zviews". For incoming viewing keys on the
+/// test network, the Human-Readable Part is "zviewtestsapling".
 ///
 /// https://zips.z.cash/protocol/protocol.pdf#saplingfullviewingkeyencoding
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -833,7 +833,7 @@ impl fmt::Display for FullViewingKey {
             _ => fvk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, bytes.get_ref().to_base32()).unwrap()
+        bech32::encode_to_fmt(f, hrp, bytes.get_ref().to_base32(), Variant::Bech32).unwrap()
     }
 }
 
@@ -842,7 +842,7 @@ impl FromStr for FullViewingKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
-            Ok((hrp, bytes)) => {
+            Ok((hrp, bytes, Variant::Bech32)) => {
                 let mut decoded_bytes = io::Cursor::new(Vec::<u8>::from_base32(&bytes).unwrap());
 
                 let authorizing_key_bytes = decoded_bytes.read_32_bytes()?;
@@ -861,7 +861,7 @@ impl FromStr for FullViewingKey {
                     outgoing_viewing_key: OutgoingViewingKey::from(outgoing_key_bytes),
                 })
             }
-            Err(_) => Err(SerializationError::Parse("bech32 decoding error")),
+            _ => Err(SerializationError::Parse("bech32 decoding error")),
         }
     }
 }
@@ -884,6 +884,12 @@ impl fmt::Debug for EphemeralPublicKey {
 }
 
 impl Eq for EphemeralPublicKey {}
+
+impl From<EphemeralPublicKey> for [u8; 32] {
+    fn from(nk: EphemeralPublicKey) -> [u8; 32] {
+        nk.0.to_bytes()
+    }
+}
 
 impl From<&EphemeralPublicKey> for [u8; 32] {
     fn from(nk: &EphemeralPublicKey) -> [u8; 32] {

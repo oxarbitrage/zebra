@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     amount::{Amount, NonNegative},
-    primitives::{x25519, ZkSnarkProof},
+    block::MAX_BLOCK_BYTES,
+    primitives::{x25519, Bctv14Proof, Groth16Proof, ZkSnarkProof},
     serialization::{
-        ReadZcashExt, SerializationError, WriteZcashExt, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashSerialize,
+        ReadZcashExt, SerializationError, TrustedPreallocate, WriteZcashExt, ZcashDeserialize,
+        ZcashDeserializeInto, ZcashSerialize,
     },
 };
 
@@ -39,7 +40,7 @@ pub struct JoinSplit<P: ZkSnarkProof> {
     /// JoinSplit description.
     pub random_seed: [u8; 32],
     /// A message authentication tag.
-    pub vmacs: [note::MAC; 2],
+    pub vmacs: [note::Mac; 2],
     /// A ZK JoinSplit proof, either a
     /// [`Groth16Proof`](crate::primitives::Groth16Proof) or a
     /// [`Bctv14Proof`](crate::primitives::Bctv14Proof).
@@ -86,8 +87,8 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
             ephemeral_key: x25519_dalek::PublicKey::from(reader.read_32_bytes()?),
             random_seed: reader.read_32_bytes()?,
             vmacs: [
-                note::MAC::zcash_deserialize(&mut reader)?,
-                note::MAC::zcash_deserialize(&mut reader)?,
+                note::Mac::zcash_deserialize(&mut reader)?,
+                note::Mac::zcash_deserialize(&mut reader)?,
             ],
             zkproof: P::zcash_deserialize(&mut reader)?,
             enc_ciphertexts: [
@@ -95,5 +96,43 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
                 note::EncryptedNote::zcash_deserialize(&mut reader)?,
             ],
         })
+    }
+}
+
+/// The size of a joinsplit, excluding the ZkProof
+///
+/// Excluding the ZkProof, a Joinsplit consists of an 8 byte vpub_old, an 8 byte vpub_new, a 32 byte anchor,
+/// two 32 byte nullifiers, two 32 byte committments, a 32 byte epheremral key, a 32 byte random seed
+/// two 32 byte vmacs, and two 601 byte encrypted ciphertexts.
+const JOINSPLIT_SIZE_WITHOUT_ZKPROOF: u64 =
+    8 + 8 + 32 + (32 * 2) + (32 * 2) + 32 + 32 + (32 * 2) + (601 * 2);
+/// The size of a version 2 or 3 joinsplit transaction, which uses a BCTV14 proof.
+///
+/// A BTCV14 proof takes 296 bytes, per the Zcash [protocol specification §7.2][ps]
+///
+/// [ps]: https://zips.z.cash/protocol/protocol.pdf#joinsplitencoding
+pub(crate) const BCTV14_JOINSPLIT_SIZE: u64 = JOINSPLIT_SIZE_WITHOUT_ZKPROOF + 296;
+/// The size of a version 4+ joinsplit transaction, which uses a Groth16 proof
+///
+/// A Groth16 proof takes 192 bytes, per the Zcash [protocol specification §7.2][ps]
+///
+/// [ps]: https://zips.z.cash/protocol/protocol.pdf#joinsplitencoding
+pub(crate) const GROTH16_JOINSPLIT_SIZE: u64 = JOINSPLIT_SIZE_WITHOUT_ZKPROOF + 192;
+
+impl TrustedPreallocate for JoinSplit<Bctv14Proof> {
+    fn max_allocation() -> u64 {
+        // The longest Vec<JoinSplit> we receive from an honest peer must fit inside a valid block.
+        // Since encoding the length of the vec takes at least one byte
+        // (MAX_BLOCK_BYTES - 1) / BCTV14_JOINSPLIT_SIZE is a loose upper bound on the max allocation
+        (MAX_BLOCK_BYTES - 1) / BCTV14_JOINSPLIT_SIZE
+    }
+}
+
+impl TrustedPreallocate for JoinSplit<Groth16Proof> {
+    // The longest Vec<JoinSplit> we receive from an honest peer must fit inside a valid block.
+    // Since encoding the length of the vec takes at least one byte
+    // (MAX_BLOCK_BYTES - 1) / GROTH16_JOINSPLIT_SIZE is a loose upper bound on the max allocation
+    fn max_allocation() -> u64 {
+        (MAX_BLOCK_BYTES - 1) / GROTH16_JOINSPLIT_SIZE
     }
 }

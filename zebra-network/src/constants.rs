@@ -49,6 +49,14 @@ pub const LIVE_PEER_DURATION: Duration = Duration::from_secs(60 + 20 + 20 + 20);
 /// connected peer.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The number of GetAddr requests sent when crawling for new peers.
+///
+/// ## SECURITY
+///
+/// The fanout should be greater than 1, to ensure that Zebra's address book is
+/// not dominated by a single peer.
+pub const GET_ADDR_FANOUT: usize = 2;
+
 /// Truncate timestamps in outbound address messages to this time interval.
 ///
 /// This is intended to prevent a peer from learning exactly when we received
@@ -61,7 +69,7 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: i64 = 30 * 60;
 ///
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 // XXX can we generate this from crate metadata?
-pub const USER_AGENT: &str = "/🦓Zebra🦓:1.0.0-alpha.2/";
+pub const USER_AGENT: &str = "/🦓Zebra🦓:1.0.0-alpha.6/";
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.

@@ -69,9 +69,6 @@ pub enum Setup {
 
     /// Network setup failed, because the setup channel permanently failed.
     /// The service keeps returning readiness errors for every request.
-    ///
-    /// We keep hold of the closed oneshot, so we can use it to create a
-    /// new error for each `poll_ready` call.
     FailedRecv { error: SharedRecvError },
 }
 
@@ -221,8 +218,8 @@ impl Service<zn::Request> for Inbound {
         //    "load shed directly" pattern from #1618.
         //  * currently, the state service is always ready, unless its buffer is full.
         //    So we might also want to propagate backpressure from its buffer.
-        //  * if we want to propagate backpressure, add a ReadyCache for each service, to ensure
-        //    that each poll_ready has a matching call. See #1593 for details.
+        //  * poll_ready needs to be implemented carefully, to avoid hangs or deadlocks.
+        //    See #1593 for details.
         Poll::Ready(result)
     }
 
@@ -247,7 +244,11 @@ impl Service<zn::Request> for Inbound {
             zn::Request::BlocksByHash(hashes) => {
                 // Correctness:
                 //
-                // We can't use `call_all` here, because it leaks buffer slots:
+                // We can't use `call_all` here, because it can hold one buffer slot per concurrent
+                // future, until the `CallAll` struct is dropped. We can't hold those slots in this
+                // future because:
+                // * we're not sure when the returned future will complete, and
+                // * we don't limit how many returned futures can be concurrently running
                 // https://github.com/tower-rs/tower/blob/master/tower/src/util/call_all/common.rs#L112
                 use futures::stream::TryStreamExt;
                 hashes

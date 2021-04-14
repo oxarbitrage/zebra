@@ -40,6 +40,21 @@ const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 2;
 ///
 /// Set to two checkpoint intervals, so that we're sure that the lookahead
 /// limit always contains at least one complete checkpoint.
+///
+/// ## Security
+///
+/// If a malicious node is chosen for an ObtainTips or ExtendTips request, it can
+/// provide up to 500 malicious block hashes. These block hashes will be
+/// distributed across all available peers. Assuming there are around 50 connected
+/// peers, the malicious node will receive approximately 10 of those block requests.
+///
+/// Malicious deserialized blocks can take up a large amount of RAM, see
+/// [`super::inbound::downloads::MAX_INBOUND_CONCURRENCY`] and #1880 for details.
+/// So we want to keep the lookahead limit reasonably small.
+///
+/// Once these malicious blocks start failing validation, the syncer will cancel all
+/// the pending download and verify tasks, drop all the blocks, and start a new
+/// ObtainTips with a new set of peers.
 const MIN_LOOKAHEAD_LIMIT: usize = zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP * 2;
 
 /// Controls how long we wait for a tips response to return.
@@ -351,7 +366,7 @@ where
             })
             .map_err(|e| eyre!(e))?;
 
-        tracing::info!("trying to obtain new chain tips");
+        tracing::info!(tip = ?block_locator.first().unwrap(), "trying to obtain new chain tips");
         tracing::debug!(?block_locator, "got block locator");
 
         let mut requests = FuturesUnordered::new();
@@ -466,8 +481,9 @@ where
         let tips = std::mem::take(&mut self.prospective_tips);
 
         let mut download_set = HashSet::new();
+        tracing::info!(tips = ?tips.len(), "trying to extend chain tips");
         for tip in tips {
-            tracing::info!(?tip, "trying to extend chain tips");
+            tracing::debug!(?tip, "asking peers to extend chain tip");
             let mut responses = FuturesUnordered::new();
             for _ in 0..FANOUT {
                 responses.push(

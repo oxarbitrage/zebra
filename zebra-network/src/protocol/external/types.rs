@@ -57,6 +57,8 @@ impl Version {
             (Mainnet, Heartwood) => 170_011,
             (Testnet, Canopy) => 170_012,
             (Mainnet, Canopy) => 170_013,
+            (Testnet, Nu5) => 170_014,
+            (Mainnet, Nu5) => 170_015,
         })
     }
 
@@ -76,6 +78,7 @@ bitflags! {
     /// Note that bits 24-31 are reserved for temporary experiments; other
     /// service bits should be allocated via the ZIP process.
     #[derive(Default)]
+    #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
     pub struct PeerServices: u64 {
         /// NODE_NETWORK means that the node is a full node capable of serving
         /// blocks, as opposed to a light client that makes network requests but
@@ -187,7 +190,7 @@ mod test {
         zebra_test::init();
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
-        assert!(highest_network_upgrade == Canopy || highest_network_upgrade == Heartwood,
+        assert!(highest_network_upgrade == Nu5 || highest_network_upgrade == Canopy,
                 "expected coverage of all network upgrades: add the new network upgrade to the list in this test");
 
         for &network_upgrade in &[
@@ -197,6 +200,7 @@ mod test {
             Blossom,
             Heartwood,
             Canopy,
+            Nu5,
         ] {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {

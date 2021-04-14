@@ -1,16 +1,18 @@
-use std::sync::Arc;
-
-use crate::parameters::Network;
-use crate::work::{difficulty::CompactDifficulty, equihash};
-
-use super::*;
-
-use crate::LedgerState;
-use chrono::{TimeZone, Utc};
 use proptest::{
     arbitrary::{any, Arbitrary},
     prelude::*,
 };
+
+use chrono::{TimeZone, Utc};
+use std::sync::Arc;
+
+use crate::{
+    parameters::Network,
+    work::{difficulty::CompactDifficulty, equihash},
+    LedgerState,
+};
+
+use super::*;
 
 impl Arbitrary for Block {
     type Parameters = LedgerState;
@@ -47,13 +49,22 @@ impl Block {
     }
 }
 
-impl Arbitrary for RootHash {
+impl Arbitrary for Commitment {
     type Parameters = ();
 
     fn arbitrary_with(_args: ()) -> Self::Strategy {
         (any::<[u8; 32]>(), any::<Network>(), any::<Height>())
-            .prop_map(|(root_bytes, network, block_height)| {
-                RootHash::from_bytes(root_bytes, network, block_height)
+            .prop_map(|(commitment_bytes, network, block_height)| {
+                match Commitment::from_bytes(commitment_bytes, network, block_height) {
+                    Ok(commitment) => commitment,
+                    // just fix up the reserved values when they fail
+                    Err(_) => Commitment::from_bytes(
+                        super::commitment::RESERVED_BYTES,
+                        network,
+                        block_height,
+                    )
+                    .expect("from_bytes only fails due to reserved bytes"),
+                }
             })
             .boxed()
     }
@@ -82,7 +93,7 @@ impl Arbitrary for Header {
                     version,
                     previous_block_hash,
                     merkle_root,
-                    root_bytes,
+                    commitment_bytes,
                     timestamp,
                     difficulty_threshold,
                     nonce,
@@ -91,7 +102,7 @@ impl Arbitrary for Header {
                     version,
                     previous_block_hash,
                     merkle_root,
-                    root_bytes,
+                    commitment_bytes,
                     time: Utc.timestamp(timestamp, 0),
                     difficulty_threshold,
                     nonce,

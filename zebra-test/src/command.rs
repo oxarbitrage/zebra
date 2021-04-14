@@ -51,7 +51,7 @@ impl CommandExt for Command {
             .wrap_err("failed to execute process")
             .with_section(command)?;
 
-        Ok(TestStatus { status, cmd })
+        Ok(TestStatus { cmd, status })
     }
 
     /// wrapper for `output` fn on `Command` that constructs informative error
@@ -160,6 +160,11 @@ pub struct TestChild<T> {
 
 impl<T> TestChild<T> {
     /// Kill the child process.
+    ///
+    /// ## BUGS
+    ///
+    /// On Windows (and possibly macOS), this function can return `Ok` for
+    /// processes that have panicked. See #1781.
     #[spandoc::spandoc]
     pub fn kill(&mut self) -> Result<()> {
         /// SPANDOC: Killing child process
@@ -320,13 +325,47 @@ impl<T> TestChild<T> {
         Err(report)
     }
 
+    /// Kill `child`, wait for its output, and use that output as the context for
+    /// an error report based on `error`.
+    #[instrument(skip(self, result))]
+    pub fn kill_on_error<V, E>(mut self, result: Result<V, E>) -> Result<(V, Self), Report>
+    where
+        E: Into<Report> + Send + Sync + 'static,
+    {
+        let mut error: Report = match result {
+            Ok(success) => return Ok((success, self)),
+            Err(error) => error.into(),
+        };
+
+        if self.is_running() {
+            let kill_res = self.kill();
+            if let Err(kill_err) = kill_res {
+                error = error.wrap_err(kill_err);
+            }
+        }
+
+        let output_res = self.wait_with_output();
+        let error = match output_res {
+            Err(output_err) => error.wrap_err(output_err),
+            Ok(output) => error.context_from(&output),
+        };
+
+        Err(error)
+    }
+
     fn past_deadline(&self) -> bool {
         self.deadline
             .map(|deadline| Instant::now() > deadline)
             .unwrap_or(false)
     }
 
-    fn is_running(&mut self) -> bool {
+    /// Is this process currently running?
+    ///
+    /// ## BUGS
+    ///
+    /// On Windows and macOS, this function can return `true` for processes that
+    /// have panicked. See #1781.
+    pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 }
@@ -451,30 +490,36 @@ impl<T> TestOutput<T> {
     /// reason.
     pub fn assert_was_killed(&self) -> Result<()> {
         if self.was_killed() {
-            Err(eyre!("command was killed")).context_from(self)?
+            Ok(())
+        } else {
+            Err(eyre!(
+                "command exited without a kill, but the test expected kill exit"
+            ))
+            .context_from(self)?
         }
-
-        Ok(())
     }
 
     /// Returns Ok if the program was not killed, Err(Report) if exit was by
     /// another reason.
     pub fn assert_was_not_killed(&self) -> Result<()> {
-        if !self.was_killed() {
-            Err(eyre!("command wasn't killed")).context_from(self)?
+        if self.was_killed() {
+            Err(eyre!(
+                "command was killed, but the test expected an exit without a kill"
+            ))
+            .context_from(self)?
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     #[cfg(not(unix))]
     fn was_killed(&self) -> bool {
-        self.output.status.code() != Some(1)
+        self.output.status.code() == Some(1)
     }
 
     #[cfg(unix)]
     fn was_killed(&self) -> bool {
-        self.output.status.signal() != Some(9)
+        self.output.status.signal() == Some(9)
     }
 }
 

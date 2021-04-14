@@ -1,10 +1,13 @@
 //! A Tokio codec mapping byte streams to Bitcoin message streams.
 
 use std::fmt;
-use std::io::{Cursor, Read, Write};
+use std::{
+    cmp::min,
+    io::{Cursor, Read, Write},
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -29,7 +32,7 @@ use super::{
 const HEADER_LEN: usize = 24usize;
 
 /// Maximum size of a protocol message body.
-const MAX_PROTOCOL_MESSAGE_LEN: usize = 2 * 1024 * 1024;
+pub use zebra_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
@@ -109,20 +112,15 @@ impl Encoder<Message> for Codec {
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
-        // XXX(HACK): this is inefficient and does an extra allocation.
-        // instead, we should have a size estimator for the message, reserve
-        // that much space, write the header (with zeroed checksum), then the body,
-        // then write the computed checksum in-place.  for now, just do an extra alloc.
 
-        let mut body = Vec::new();
-        self.write_body(&item, &mut body)?;
+        let body_length = self.body_length(&item);
 
-        if body.len() > self.builder.max_len {
+        if body_length > self.builder.max_len {
             return Err(Parse("body length exceeded maximum size"));
         }
 
         if let Some(label) = self.builder.metrics_label.clone() {
-            metrics::counter!("bytes.written", (body.len() + HEADER_LEN) as u64, "addr" =>  label);
+            metrics::counter!("zcash.net.out.bytes.total", (body_length + HEADER_LEN) as u64, "addr" => label);
         }
 
         use Message::*;
@@ -152,26 +150,58 @@ impl Encoder<Message> for Codec {
             FilterAdd { .. } => b"filteradd\0\0\0",
             FilterClear { .. } => b"filterclear\0",
         };
-        trace!(?item, len = body.len());
+        trace!(?item, len = body_length);
 
-        // XXX this should write directly into the buffer,
-        // but leave it for now until we fix the issue above.
-        let mut header = [0u8; HEADER_LEN];
-        let mut header_writer = Cursor::new(&mut header[..]);
-        header_writer.write_all(&Magic::from(self.builder.network).0[..])?;
-        header_writer.write_all(command)?;
-        header_writer.write_u32::<LittleEndian>(body.len() as u32)?;
-        header_writer.write_all(&sha256d::Checksum::from(&body[..]).0)?;
+        dst.reserve(HEADER_LEN + body_length);
+        let start_len = dst.len();
+        {
+            let dst = &mut dst.writer();
+            dst.write_all(&Magic::from(self.builder.network).0[..])?;
+            dst.write_all(command)?;
+            dst.write_u32::<LittleEndian>(body_length as u32)?;
 
-        dst.reserve(HEADER_LEN + body.len());
-        dst.extend_from_slice(&header);
-        dst.extend_from_slice(&body);
+            // We zero the checksum at first, and compute it later
+            // after the body has been written.
+            dst.write_u32::<LittleEndian>(0)?;
+
+            self.write_body(&item, dst)?;
+        }
+        let checksum = sha256d::Checksum::from(&dst[start_len + HEADER_LEN..]);
+        dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
     }
 }
 
 impl Codec {
+    /// Obtain the size of the body of a given message. This will match the
+    /// number of bytes written to the writer provided to `write_body` for the
+    /// same message.
+    ///
+    /// TODO: Replace with a size estimate, to avoid multiple serializations
+    /// for large data structures like lists, blocks, and transactions.
+    /// See #1774.
+    fn body_length(&self, msg: &Message) -> usize {
+        struct FakeWriter(usize);
+
+        impl std::io::Write for FakeWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = FakeWriter(0);
+        self.write_body(msg, &mut writer)
+            .expect("writer should never fail");
+        writer.0
+    }
+
     /// Write the body of the message into the given writer. This allows writing
     /// the message body prior to writing the header, so that the header can
     /// contain a checksum of the message body.
@@ -339,7 +369,7 @@ impl Decoder for Codec {
                 }
 
                 if let Some(label) = self.builder.metrics_label.clone() {
-                    metrics::counter!("bytes.read", (body_len + HEADER_LEN) as u64, "addr" =>  label);
+                    metrics::counter!("zcash.net.in.bytes.total", (body_len + HEADER_LEN) as u64, "addr" =>  label);
                 }
 
                 // Reserve buffer space for the expected body and the following header.
@@ -377,33 +407,43 @@ impl Decoder for Codec {
                     ));
                 }
 
-                let body_reader = Cursor::new(&body);
+                let mut body_reader = Cursor::new(&body);
                 match &command {
-                    b"version\0\0\0\0\0" => self.read_version(body_reader),
-                    b"verack\0\0\0\0\0\0" => self.read_verack(body_reader),
-                    b"ping\0\0\0\0\0\0\0\0" => self.read_ping(body_reader),
-                    b"pong\0\0\0\0\0\0\0\0" => self.read_pong(body_reader),
-                    b"reject\0\0\0\0\0\0" => self.read_reject(body_reader),
-                    b"addr\0\0\0\0\0\0\0\0" => self.read_addr(body_reader),
-                    b"getaddr\0\0\0\0\0" => self.read_getaddr(body_reader),
-                    b"block\0\0\0\0\0\0\0" => self.read_block(body_reader),
-                    b"getblocks\0\0\0" => self.read_getblocks(body_reader),
-                    b"headers\0\0\0\0\0" => self.read_headers(body_reader),
-                    b"getheaders\0\0" => self.read_getheaders(body_reader),
-                    b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(body_reader),
-                    b"getdata\0\0\0\0\0" => self.read_getdata(body_reader),
-                    b"notfound\0\0\0\0" => self.read_notfound(body_reader),
-                    b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(body_reader),
-                    b"mempool\0\0\0\0\0" => self.read_mempool(body_reader),
-                    b"filterload\0\0" => self.read_filterload(body_reader, body_len),
-                    b"filteradd\0\0\0" => self.read_filteradd(body_reader),
-                    b"filterclear\0" => self.read_filterclear(body_reader),
+                    b"version\0\0\0\0\0" => self.read_version(&mut body_reader),
+                    b"verack\0\0\0\0\0\0" => self.read_verack(&mut body_reader),
+                    b"ping\0\0\0\0\0\0\0\0" => self.read_ping(&mut body_reader),
+                    b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
+                    b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
+                    b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
+                    b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
+                    b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                    b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
+                    b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
+                    b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
+                    b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(&mut body_reader),
+                    b"getdata\0\0\0\0\0" => self.read_getdata(&mut body_reader),
+                    b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
+                    b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
+                    b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
+                    b"filterload\0\0" => self.read_filterload(&mut body_reader, body_len),
+                    b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
+                    b"filterclear\0" => self.read_filterclear(&mut body_reader),
                     _ => return Err(Parse("unknown command")),
                 }
                 // We need Ok(Some(msg)) to signal that we're done decoding.
                 // This is also convenient for tracing the parse result.
                 .map(|msg| {
-                    trace!("finished message decoding");
+                    // bitcoin allows extra data at the end of most messages,
+                    // so that old nodes can still read newer message formats,
+                    // and ignore any extra fields
+                    let extra_bytes = body.len() as u64 - body_reader.position();
+                    if extra_bytes == 0 {
+                        trace!(?extra_bytes, %msg, "finished message decoding");
+                    } else {
+                        // log when there are extra bytes, so we know when we need to
+                        // upgrade message formats
+                        debug!(?extra_bytes, %msg, "extra data after decoding message");
+                    }
                     Some(msg)
                 })
             }
@@ -427,7 +467,7 @@ impl Codec {
                 reader.read_socket_addr()?,
             ),
             nonce: Nonce(reader.read_u64::<LittleEndian>()?),
-            user_agent: reader.read_string()?,
+            user_agent: String::zcash_deserialize(&mut reader)?,
             start_height: block::Height(reader.read_u32::<LittleEndian>()?),
             relay: match reader.read_u8()? {
                 0 => false,
@@ -451,7 +491,7 @@ impl Codec {
 
     fn read_reject<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
         Ok(Message::Reject {
-            message: reader.read_string()?,
+            message: String::zcash_deserialize(&mut reader)?,
             ccode: match reader.read_u8()? {
                 0x01 => RejectReason::Malformed,
                 0x10 => RejectReason::Invalid,
@@ -464,7 +504,7 @@ impl Codec {
                 0x50 => RejectReason::Other,
                 _ => return Err(Error::Parse("invalid RejectReason value in ccode field")),
             },
-            reason: reader.read_string()?,
+            reason: String::zcash_deserialize(&mut reader)?,
             // Sometimes there's data, sometimes there isn't. There's no length
             // field, this is just implicitly encoded by the body_len.
             // Apparently all existing implementations only supply 32 bytes of
@@ -539,8 +579,8 @@ impl Codec {
         Ok(Message::NotFound(Vec::zcash_deserialize(reader)?))
     }
 
-    fn read_tx<R: Read>(&self, rdr: R) -> Result<Message, Error> {
-        Ok(Message::Tx(Transaction::zcash_deserialize(rdr)?.into()))
+    fn read_tx<R: Read>(&self, reader: R) -> Result<Message, Error> {
+        Ok(Message::Tx(Transaction::zcash_deserialize(reader)?.into()))
     }
 
     fn read_mempool<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
@@ -548,14 +588,14 @@ impl Codec {
     }
 
     fn read_filterload<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
+        const MAX_FILTERLOAD_LENGTH: usize = 36000;
+        const FILTERLOAD_REMAINDER_LENGTH: usize = 4 + 4 + 1;
+
         if !(FILTERLOAD_REMAINDER_LENGTH <= body_len
-            && body_len <= FILTERLOAD_REMAINDER_LENGTH + MAX_FILTER_LENGTH)
+            && body_len <= FILTERLOAD_REMAINDER_LENGTH + MAX_FILTERLOAD_LENGTH)
         {
             return Err(Error::Parse("Invalid filterload message body length."));
         }
-
-        const MAX_FILTER_LENGTH: usize = 36000;
-        const FILTERLOAD_REMAINDER_LENGTH: usize = 4 + 4 + 1;
 
         let filter_length: usize = body_len - FILTERLOAD_REMAINDER_LENGTH;
 
@@ -570,13 +610,16 @@ impl Codec {
         })
     }
 
-    fn read_filteradd<R: Read>(&self, reader: R) -> Result<Message, Error> {
-        let mut bytes = Vec::new();
+    fn read_filteradd<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
+        const MAX_FILTERADD_LENGTH: usize = 520;
 
-        // Maximum size of data is 520 bytes.
-        reader.take(520).read_exact(&mut bytes)?;
+        let filter_length: usize = min(body_len, MAX_FILTERADD_LENGTH);
 
-        Ok(Message::FilterAdd { data: bytes })
+        // Memory Denial of Service: this length has just been bounded
+        let mut filter_bytes = vec![0; filter_length];
+        reader.read_exact(&mut filter_bytes)?;
+
+        Ok(Message::FilterAdd { data: filter_bytes })
     }
 
     fn read_filterclear<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
