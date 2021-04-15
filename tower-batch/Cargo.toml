@@ -6,7 +6,7 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
-futures = "0.3.13"
+futures = "0.3.14"
 futures-core = "0.3.13"
 pin-project = "0.4.27"
 tokio = { version = "0.3.6", features = ["time", "sync", "stream", "tracing", "macros"] }
@@ -15,7 +15,7 @@ tracing = "0.1.25"
 tracing-futures = "0.2.5"
 
 [dev-dependencies]
-color-eyre = "0.5.10"
+color-eyre = "0.5.11"
 ed25519-zebra = "2.2.0"
 rand = "0.8"
 tokio = { version = "0.3.6", features = ["full"]}

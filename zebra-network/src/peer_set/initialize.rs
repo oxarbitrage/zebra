@@ -13,6 +13,7 @@ use futures::{
     future::{self, FutureExt},
     sink::SinkExt,
     stream::{FuturesUnordered, StreamExt},
+    TryFutureExt,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -352,8 +353,10 @@ where
         );
 
         let crawler_action = tokio::select! {
-            a = handshakes.next() => a.expect("handshakes never terminates, because it contains a future that never resolves"),
-            a = crawl_timer.next() => a.expect("timers never terminate"),
+            next_handshake_res = handshakes.next() => next_handshake_res.expect(
+                "handshakes never terminates, because it contains a future that never resolves"
+            ),
+            next_timer = crawl_timer.next() => next_timer.expect("timers never terminate"),
             // turn the demand into an action, based on the crawler's current state
             _ = demand_rx.next() => {
                 if handshakes.len() > 50 {
@@ -445,8 +448,6 @@ where
         + 'static,
     C::Future: Send + 'static,
 {
-    use CrawlerAction::*;
-
     // CORRECTNESS
     //
     // To avoid hangs, the dialer must only await:
@@ -461,14 +462,22 @@ where
     // the handshake has timeouts, so it shouldn't hang
     connector
         .call(candidate.addr)
-        .map(move |res| match res {
+        .map_err(|e| (candidate, e))
+        .map(Into::into)
+        .await
+}
+
+impl From<Result<Change<SocketAddr, Client>, (MetaAddr, BoxError)>> for CrawlerAction {
+    fn from(dial_result: Result<Change<SocketAddr, Client>, (MetaAddr, BoxError)>) -> Self {
+        use CrawlerAction::*;
+        match dial_result {
             Ok(peer_set_change) => HandshakeConnected { peer_set_change },
-            Err(e) => {
+            Err((candidate, e)) => {
                 debug!(?candidate.addr, ?e, "failed to connect to candidate");
                 HandshakeFailed {
                     failed_addr: candidate,
                 }
             }
-        })
-        .await
+        }
+    }
 }
