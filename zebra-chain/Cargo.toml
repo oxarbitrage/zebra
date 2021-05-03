@@ -48,7 +48,7 @@ redjubjub = "0.4"
 bincode = "1"
 color-eyre = "0.5.11"
 spandoc = "0.2"
-tracing = "0.1.25"
+tracing = "0.1.26"
 proptest = "0.10"
 proptest-derive = "0.3"
 
