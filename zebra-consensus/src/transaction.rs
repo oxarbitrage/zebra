@@ -79,7 +79,7 @@ pub enum Request {
         /// The transaction itself.
         transaction: Arc<Transaction>,
         /// Additional UTXOs which are known at the time of verification.
-        known_utxos: Arc<HashMap<transparent::OutPoint, zs::Utxo>>,
+        known_utxos: Arc<HashMap<transparent::OutPoint, transparent::utxo::Utxo>>,
         /// The height of the block containing this transaction.
         height: block::Height,
     },
@@ -109,7 +109,7 @@ impl Request {
     }
 
     /// The set of additional known unspent transaction outputs that's in this request.
-    pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, zs::Utxo>> {
+    pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::utxo::Utxo>> {
         match self {
             Request::Block { known_utxos, .. } => known_utxos.clone(),
             Request::Mempool { .. } => HashMap::new().into(),
@@ -170,6 +170,11 @@ where
 
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
+            }
+
+            // check the value pool
+            if tx.value_balance(&req.known_utxos()).remaining_transaction_value().is_err() {
+                return Err(TransactionError::BadBalance);
             }
 
             // [Canopy onward]: `vpub_old` MUST be zero.

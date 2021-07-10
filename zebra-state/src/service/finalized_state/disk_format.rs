@@ -195,7 +195,7 @@ impl FromDisk for block::Height {
     }
 }
 
-impl IntoDisk for Utxo {
+impl IntoDisk for transparent::utxo::Utxo {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
@@ -209,7 +209,7 @@ impl IntoDisk for Utxo {
     }
 }
 
-impl FromDisk for Utxo {
+impl FromDisk for transparent::utxo::Utxo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let (meta_bytes, output_bytes) = bytes.as_ref().split_at(5);
         let height = block::Height(u32::from_be_bytes(meta_bytes[0..4].try_into().unwrap()));
@@ -395,6 +395,6 @@ mod tests {
     fn roundtrip_transparent_output() {
         zebra_test::init();
 
-        proptest!(|(val in any::<Utxo>())| assert_value_properties(val));
+        proptest!(|(val in any::<transparent::utxo::Utxo>())| assert_value_properties(val));
     }
 }

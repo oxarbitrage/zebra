@@ -262,6 +262,10 @@ where
 
         key_bytes.into()
     }
+
+    pub fn value_balance(&self) -> Amount {
+        self.value_balance
+    }
 }
 
 impl<AnchorV> TransferData<AnchorV>

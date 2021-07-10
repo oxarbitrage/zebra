@@ -34,7 +34,7 @@ pub enum Response {
     Block(Option<Arc<Block>>),
 
     /// The response to a `AwaitUtxo` request.
-    Utxo(Utxo),
+    Utxo(zebra_chain::transparent::utxo::Utxo),
 
     /// The response to a `FindBlockHashes` request.
     BlockHashes(Vec<block::Hash>),

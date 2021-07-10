@@ -10,6 +10,8 @@ use zebra_chain::{
 
 use super::*;
 
+use zebra_chain::transparent::utxo::new_outputs;
+
 /// Mocks computation done during semantic validation
 pub trait Prepare {
     fn prepare(self) -> PreparedBlock;
@@ -21,7 +23,7 @@ impl Prepare for Arc<Block> {
         let hash = block.hash();
         let height = block.coinbase_height().unwrap();
         let transaction_hashes = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let new_outputs = crate::utxo::new_outputs(&block);
+        let new_outputs = new_outputs(&block);
 
         PreparedBlock {
             block,

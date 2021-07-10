@@ -5,6 +5,7 @@ mod address;
 mod keys;
 mod script;
 mod serialize;
+pub mod utxo;
 
 pub use address::Address;
 pub use script::Script;
@@ -18,9 +19,12 @@ mod arbitrary;
 mod prop;
 
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block, transaction,
+    value_balance::ValueBalance,
 };
+
+use std::collections::HashMap;
 
 /// Arbitrary data inserted by miners into a coinbase transaction.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,6 +105,20 @@ pub enum Input {
     },
 }
 
+impl Input {
+    /// Add smeting
+    pub fn value_balance(&self, utxos: &HashMap<OutPoint, utxo::Utxo>) -> Amount<NonNegative> {
+        use std::convert::TryFrom;
+        match self {
+            Input::PrevOut {outpoint, ..} => utxos[outpoint].output.value,
+            _ => {
+                let zero = Amount::<NonNegative>::from(Amount::<NonNegative>::try_from(0).unwrap());
+                zero
+            }, 
+        }
+    }
+}
+
 /// A transparent output from a transaction.
 ///
 /// The most fundamental building block of a transaction is a
@@ -122,4 +140,11 @@ pub struct Output {
 
     /// The lock script defines the conditions under which this output can be spent.
     pub lock_script: Script,
+}
+
+impl Output {
+    /// Get the amount from the output
+    pub fn value_balance(&self) -> Amount<NonNegative> {
+        self.value
+    }
 }

@@ -8,7 +8,7 @@ use zebra_chain::transparent;
 use crate::{BoxError, Response, Utxo};
 
 #[derive(Debug, Default)]
-pub struct PendingUtxos(HashMap<transparent::OutPoint, broadcast::Sender<Utxo>>);
+pub struct PendingUtxos(HashMap<transparent::OutPoint, broadcast::Sender<transparent::utxo::Utxo>>);
 
 impl PendingUtxos {
     /// Returns a future that will resolve to the `transparent::Output` pointed
@@ -37,7 +37,7 @@ impl PendingUtxos {
 
     /// Notify all requests waiting for the [`Utxo`] pointed to by the given
     /// [`transparent::OutPoint`] that the [`Utxo`] has arrived.
-    pub fn respond(&mut self, outpoint: &transparent::OutPoint, utxo: Utxo) {
+    pub fn respond(&mut self, outpoint: &transparent::OutPoint, utxo: transparent::utxo::Utxo) {
         if let Some(sender) = self.0.remove(outpoint) {
             // Adding the outpoint as a field lets us crossreference
             // with the trace of the verification that made the request.
@@ -47,7 +47,7 @@ impl PendingUtxos {
     }
 
     /// Check the list of pending UTXO requests against the supplied UTXO index.
-    pub fn check_against(&mut self, utxos: &HashMap<transparent::OutPoint, Utxo>) {
+    pub fn check_against(&mut self, utxos: &HashMap<transparent::OutPoint, transparent::utxo::Utxo>) {
         for (outpoint, utxo) in utxos.iter() {
             if let Some(sender) = self.0.remove(outpoint) {
                 tracing::trace!(?outpoint, "found pending UTXO");

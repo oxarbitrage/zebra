@@ -155,6 +155,20 @@ impl From<Amount<NonNegative>> for u64 {
     }
 }
 
+impl From<Amount<NonNegative>> for Amount<NegativeAllowed> {
+    fn from(amount: Amount<NonNegative>) -> Self {
+        Amount::try_from(amount.0).unwrap()
+        //amount.0 as _
+    }
+}
+
+impl From<Amount<NegativeAllowed>> for Amount<NonNegative> {
+    fn from(amount: Amount<NegativeAllowed>) -> Self {
+        Amount::try_from(amount.0).unwrap()
+        //amount.0 as _
+    }
+}
+
 impl<C> From<Amount<C>> for jubjub::Fr {
     fn from(a: Amount<C>) -> jubjub::Fr {
         // TODO: this isn't constant time -- does that matter?

@@ -236,7 +236,7 @@ where
 fn new_outputs(
     block: &Block,
     transaction_hashes: &[transaction::Hash],
-) -> Arc<HashMap<transparent::OutPoint, zs::Utxo>> {
+) -> Arc<HashMap<transparent::OutPoint, transparent::utxo::Utxo>> {
     let mut new_outputs = HashMap::default();
     let height = block.coinbase_height().expect("block has coinbase height");
     for (transaction, hash) in block
@@ -249,7 +249,7 @@ fn new_outputs(
             let index = index as u32;
             new_outputs.insert(
                 transparent::OutPoint { hash, index },
-                zs::Utxo {
+                transparent::utxo::Utxo {
                     output,
                     height,
                     from_coinbase,

@@ -3,7 +3,7 @@ use std::io;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, NegativeAllowed},
     block::MAX_BLOCK_BYTES,
     primitives::{x25519, Bctv14Proof, Groth16Proof, ZkSnarkProof},
     serialization::{

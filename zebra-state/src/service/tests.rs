@@ -88,7 +88,7 @@ async fn test_populated_state_responds_correctly(
                         hash: transaction_hash,
                         index: index as _,
                     };
-                    let utxo = Utxo {
+                    let utxo = transparent::utxo::Utxo {
                         output,
                         height,
                         from_coinbase,

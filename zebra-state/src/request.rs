@@ -73,7 +73,7 @@ pub struct PreparedBlock {
     /// Note: although these transparent outputs are newly created, they may not
     /// be unspent, since a later transaction in a block can spend outputs of an
     /// earlier transaction.
-    pub new_outputs: HashMap<transparent::OutPoint, Utxo>,
+    pub new_outputs: HashMap<transparent::OutPoint, transparent::utxo::Utxo>,
     /// A precomputed list of the hashes of the transactions in this block.
     pub transaction_hashes: Vec<transaction::Hash>,
     // TODO: add these parameters when we can compute anchors.
@@ -98,7 +98,7 @@ pub struct FinalizedBlock {
     /// Note: although these transparent outputs are newly created, they may not
     /// be unspent, since a later transaction in a block can spend outputs of an
     /// earlier transaction.
-    pub(crate) new_outputs: HashMap<transparent::OutPoint, Utxo>,
+    pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::utxo::Utxo>,
     /// A precomputed list of the hashes of the transactions in this block.
     pub(crate) transaction_hashes: Vec<transaction::Hash>,
 }
@@ -130,7 +130,7 @@ impl From<Arc<Block>> for FinalizedBlock {
                 let index = index as u32;
                 new_outputs.insert(
                     transparent::OutPoint { hash, index },
-                    Utxo {
+                    transparent::utxo::Utxo {
                         output,
                         height,
                         from_coinbase,

@@ -24,11 +24,16 @@ pub use sighash::HashType;
 pub use sighash::SigHash;
 
 use crate::{
-    amount, block, orchard,
+    amount::{Amount, NegativeAllowed, NonNegative},
+    block, orchard,
     parameters::NetworkUpgrade,
     primitives::{Bctv14Proof, Groth16Proof},
     sapling, sprout, transparent,
+    value_balance::ValueBalance,
 };
+
+use std::collections::HashMap;
+use std::convert::TryFrom;
 
 /// A Zcash transaction.
 ///
@@ -302,7 +307,7 @@ impl Transaction {
     /// sprout value pool.
     pub fn sprout_pool_added_values(
         &self,
-    ) -> Box<dyn Iterator<Item = &amount::Amount<amount::NonNegative>> + '_> {
+    ) -> Box<dyn Iterator<Item = &Amount<NonNegative>> + '_> {
         match self {
             // JoinSplits with Bctv14 Proofs
             Transaction::V2 {
@@ -539,5 +544,98 @@ impl Transaction {
     pub fn orchard_flags(&self) -> Option<orchard::shielded_data::Flags> {
         self.orchard_shielded_data()
             .map(|orchard_shielded_data| orchard_shielded_data.flags)
+    }
+
+    // value pool
+
+    /// Yes sir, add something
+    pub fn value_balance(&self, utxos: &HashMap<transparent::OutPoint, transparent::utxo::Utxo>) -> ValueBalance<NegativeAllowed> {
+
+        //dbg!(utxos);
+
+        //let mut final_value_balance = ValueBalance::default();
+
+        match self {
+            Transaction::V1 { inputs, outputs, .. } => {
+                dbg!("in the v1");    
+                
+                let input_value_balance: i64 = inputs.iter().map(|i| i64::from(i.value_balance(utxos))).sum();
+                let output_value_balance: i64 = outputs.iter().map(|o| i64::from(o.value_balance())).sum();
+                let transparent_value_balance: Amount<NegativeAllowed> = Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                let transaction_value_balance = ValueBalance::new(Some(transparent_value_balance), None, None, None);
+
+                dbg!(transaction_value_balance);
+                transaction_value_balance
+            },
+            Transaction::V2 { inputs, outputs, joinsplit_data, .. } => {
+                dbg!("in the v2");
+                
+                let input_value_balance: i64 = inputs.iter().map(|i| i64::from(i.value_balance(utxos))).sum();
+                let output_value_balance: i64 = outputs.iter().map(|o| i64::from(o.value_balance())).sum();
+                let transparent = Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                let joinsplit_value_balance: i64 = joinsplit_data.iter().map(|j| i64::from(j.value_balance())).sum();
+                let sprout = Amount::try_from(joinsplit_value_balance).unwrap();
+
+                let final_value_balance = ValueBalance::new(Some(transparent), Some(sprout), None, None);
+
+                dbg!(final_value_balance);
+                final_value_balance
+            },
+            Transaction::V3 { inputs, outputs, joinsplit_data, .. } => {
+                dbg!("in the v3");
+                
+                let input_value_balance: i64 = inputs.iter().map(|i| i64::from(i.value_balance(utxos))).sum();
+                let output_value_balance: i64 = outputs.iter().map(|o| i64::from(o.value_balance())).sum();
+                let transparent = Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                //final_value_balance.transparent = amount::Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                let joinsplit_value_balance: i64 = joinsplit_data.iter().map(|j| i64::from(j.value_balance())).sum();
+                let sprout = Amount::try_from(joinsplit_value_balance).unwrap();
+
+                let final_value_balance = ValueBalance::new(Some(transparent), Some(sprout), None, None);
+
+                dbg!(final_value_balance);
+                final_value_balance
+            },
+            Transaction::V4 { inputs, outputs, joinsplit_data, sapling_shielded_data, .. } => {
+                dbg!("in the v4");
+                
+                let input_value_balance: i64 = inputs.iter().map(|i| i64::from(i.value_balance(utxos))).sum();
+                let output_value_balance: i64 = outputs.iter().map(|o| i64::from(o.value_balance())).sum();
+                let transparent = Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                let joinsplit_value_balance: i64 = joinsplit_data.iter().map(|j| i64::from(j.value_balance())).sum();
+                let sprout = Amount::try_from(joinsplit_value_balance).unwrap();
+
+                let sapling_value_balance: i64 = sapling_shielded_data.iter().map(|s| i64::from(s.value_balance())).sum();
+                let sapling = Amount::try_from(sapling_value_balance).unwrap();
+
+                let final_value_balance = ValueBalance::new(Some(transparent), Some(sprout), Some(sapling), None);
+
+                dbg!(final_value_balance);
+                final_value_balance
+            },
+            Transaction::V5 { inputs, outputs, sapling_shielded_data, orchard_shielded_data, .. } => {
+                dbg!("in the v5");
+                
+                let input_value_balance: i64 = inputs.iter().map(|i| i64::from(i.value_balance(utxos))).sum();
+                let output_value_balance: i64 = outputs.iter().map(|o| i64::from(o.value_balance())).sum();
+                let transparent = Amount::try_from(input_value_balance - output_value_balance).unwrap();
+
+                let sapling_value_balance: i64 = sapling_shielded_data.iter().map(|s| i64::from(s.value_balance())).sum();
+                let sapling = Amount::try_from(sapling_value_balance).unwrap();
+
+                let orchard_value_balance: i64 = orchard_shielded_data.iter().map(|s| i64::from(s.value_balance())).sum();
+                let orchard = Amount::try_from(orchard_value_balance).unwrap();
+
+                let final_value_balance = ValueBalance::new(Some(transparent), None, Some(sapling), Some(orchard));
+
+                dbg!(final_value_balance);
+                final_value_balance
+            },
+        }
     }
 }

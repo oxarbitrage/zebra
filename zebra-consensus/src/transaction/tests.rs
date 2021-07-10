@@ -841,7 +841,7 @@ fn mock_transparent_transfer(
 ) -> (
     transparent::Input,
     transparent::Output,
-    HashMap<transparent::OutPoint, Utxo>,
+    HashMap<transparent::OutPoint, transparent::utxo::Utxo>,
 ) {
     // A script with a single opcode that accepts the transaction (pushes true on the stack)
     let accepting_script = transparent::Script::new(&[1, 1]);
@@ -865,7 +865,7 @@ fn mock_transparent_transfer(
         lock_script,
     };
 
-    let previous_utxo = Utxo {
+    let previous_utxo = transparent::utxo::Utxo {
         output: previous_output,
         height: previous_utxo_height,
         from_coinbase: false,
@@ -1029,4 +1029,38 @@ fn add_to_sprout_pool_after_nu() {
         check::disabled_add_to_sprout_pool(&block.transactions[7], block_height, network),
         Ok(())
     );
+}
+
+#[test]
+fn whatever() -> Result<(), Report> {
+    zebra_test::init();
+
+    const LAST_BLOCK_HEIGHT: u32 = 1180900;
+
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    let blocks = zebra_test::vectors::MAINNET_BLOCKS
+        .range(0..=LAST_BLOCK_HEIGHT)
+        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into::<Arc<zebra_chain::block::Block>>().unwrap())
+        .collect::<Vec<_>>();
+
+    for b in blocks {
+        for transaction in &b.transactions {
+            transaction.value_balance(&HashMap::<transparent::OutPoint, transparent::utxo::Utxo>::new());
+        }
+    }
+
+    /*
+    let networks = vec![
+        (Network::Mainnet, zebra_test::vectors::MAINNET_BLOCKS.iter()),
+        (Network::Testnet, zebra_test::vectors::TESTNET_BLOCKS.iter()),
+    ];
+    
+
+    for (network, blocks) in networks {
+        for transaction in fake_v5_transactions_for_network(network, blocks) {
+            transaction.value_balance(&HashMap::<transparent::OutPoint, transparent::utxo::Utxo>::new());    
+        }
+    }
+    */
+    Ok(())
 }

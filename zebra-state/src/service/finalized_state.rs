@@ -353,7 +353,7 @@ impl FinalizedState {
 
     /// Returns the `transparent::Output` pointed to by the given
     /// `transparent::OutPoint` if it is present.
-    pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<Utxo> {
+    pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::utxo::Utxo> {
         let utxo_by_outpoint = self.db.cf_handle("utxo_by_outpoint").unwrap();
         self.db.zs_get(utxo_by_outpoint, outpoint)
     }
