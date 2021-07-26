@@ -195,7 +195,7 @@ where
                 transparent: (acc.clone()?.transparent + value_balance.transparent)?,
                 sprout: (acc.clone()?.sprout + value_balance.sprout)?,
                 sapling: (acc.clone()?.sapling + value_balance.sapling)?,
-                orchard: (acc.clone()?.orchard + value_balance.orchard)?,
+                orchard: (acc?.orchard + value_balance.orchard)?,
             })
         })
     }
