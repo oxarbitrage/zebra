@@ -184,3 +184,28 @@ where
         self? - rhs
     }
 }
+
+impl<C> std::iter::Sum<ValueBalance<C>> for Result<ValueBalance<C>, ValueBalanceError>
+where
+    C: Constraint + Copy,
+{
+    fn sum<I: Iterator<Item = ValueBalance<C>>>(iter: I) -> Self {
+        iter.fold(Ok(ValueBalance::zero()), |acc, value_balance| {
+            Ok(ValueBalance {
+                transparent: (acc.clone()?.transparent + value_balance.transparent)?,
+                sprout: (acc.clone()?.sprout + value_balance.sprout)?,
+                sapling: (acc.clone()?.sapling + value_balance.sapling)?,
+                orchard: (acc.clone()?.orchard + value_balance.orchard)?,
+            })
+        })
+    }
+}
+
+impl<'amt, C> std::iter::Sum<&'amt ValueBalance<C>> for Result<ValueBalance<C>, ValueBalanceError>
+where
+    C: Constraint + std::marker::Copy + 'amt,
+{
+    fn sum<I: Iterator<Item = &'amt ValueBalance<C>>>(iter: I) -> Self {
+        iter.copied().sum()
+    }
+}

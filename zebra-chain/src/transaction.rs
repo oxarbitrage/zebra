@@ -676,7 +676,7 @@ impl Transaction {
     pub fn value_balance(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    ) -> Result<ValueBalance<NegativeAllowed>, AmountError> {
+    ) -> Result<ValueBalance<NegativeAllowed>, crate::value_balance::ValueBalanceError> {
         let mut value_balance = ValueBalance::zero();
 
         value_balance.set_transparent_value_balance(self.transparent_value_pool(utxos)?);
