@@ -148,6 +148,10 @@ impl Block {
 
     /// Get all the value balances from this block by summing all the value balances
     /// in each transaction the block has.
+    ///
+    /// `utxos` must contain the utxos of every input in the transaction,
+    /// including UTXOs created by a transaction in this block,
+    /// then spent by a later transaction that's also in this block.
     pub fn value_balance(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
