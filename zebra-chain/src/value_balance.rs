@@ -189,13 +189,13 @@ impl<C> std::iter::Sum<ValueBalance<C>> for Result<ValueBalance<C>, ValueBalance
 where
     C: Constraint + Copy,
 {
-    fn sum<I: Iterator<Item = ValueBalance<C>>>(iter: I) -> Self {
-        iter.fold(Ok(ValueBalance::zero()), |acc, value_balance| {
+    fn sum<I: Iterator<Item = ValueBalance<C>>>(mut iter: I) -> Self {
+        iter.try_fold(ValueBalance::zero(), |acc, value_balance| {
             Ok(ValueBalance {
-                transparent: (acc.clone()?.transparent + value_balance.transparent)?,
-                sprout: (acc.clone()?.sprout + value_balance.sprout)?,
-                sapling: (acc.clone()?.sapling + value_balance.sapling)?,
-                orchard: (acc?.orchard + value_balance.orchard)?,
+                transparent: (acc.transparent + value_balance.transparent)?,
+                sprout: (acc.sprout + value_balance.sprout)?,
+                sapling: (acc.sapling + value_balance.sapling)?,
+                orchard: (acc.orchard + value_balance.orchard)?,
             })
         })
     }
