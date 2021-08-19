@@ -1,107 +1,52 @@
-#![allow(clippy::try_err)]
+use vergen::{vergen, Config, SemverKind, ShaKind};
 
-use std::{env, fs, fs::File, io::Read, path::PathBuf};
+/// Disable vergen env vars that could cause spurious reproducible build
+/// failures
+fn disable_non_reproducible(_config: &mut Config) {
+    /*
+    Currently, these features are disabled in `Cargo.toml`
 
-use vergen::{generate_cargo_keys, ConstantsFlags};
+    // We don't use build or host-specific env vars, because they can break
+    // reproducible builds.
+    *config.build_mut().enabled_mut() = false;
+    *config.rustc mut().host_triple_mut() = false;
 
-fn main() {
-    let mut flags = ConstantsFlags::empty();
-    flags.toggle(ConstantsFlags::SHA_SHORT);
-
-    // We want to use REBUILD_ON_HEAD_CHANGE here, but vergen assumes that the
-    // git directory is in the crate directory, and Zebra uses a workspace.
-    // See rustyhorde/vergen#15 and rustyhorde/vergen#21 for details.
-    let result = generate_rebuild_key();
-    if let Err(err) = result {
-        eprintln!("Error generating 'cargo:rerun-if-changed': {:?}", err);
-    }
-
-    // Generate the 'cargo:' key output
-    generate_cargo_keys(flags).expect("Unable to generate the cargo keys!");
+    // It's ok for reproducible builds to depend on the build OS. But most other
+    // sysinfo should not change reproducible builds, so we disable it.
+    *config.sysinfo mut().user_mut() = false;
+    *config.sysinfo mut().memory_mut() = false;
+    *config.sysinfo mut().cpu_vendor_mut() = false;
+    *config.sysinfo mut().cpu_core_count_mut() = false;
+    *config.sysinfo mut().cpu_name_mut() = false;
+    *config.sysinfo mut().cpu_brand_mut() = false;
+    *config.sysinfo mut().cpu_frequency_mut() = false;
+     */
 }
 
-/// Generate the `cargo:` rebuild keys output
-///
-/// The keys that can be generated include:
-/// * `cargo:rustc-rerun-if-changed=<git dir>/HEAD`
-/// * `cargo:rustc-rerun-if-changed=<file git HEAD points to>`
-fn generate_rebuild_key() -> Result<(), Box<dyn std::error::Error>> {
-    // Look for .git and ../.git
-    // We should really use the `git2` crate here, see rustyhorde/vergen#15
-    let mut git_dir_or_file = env::current_dir()?.join(".git");
-    let mut metadata = fs::metadata(&git_dir_or_file);
-    // git searches all the ancestors of the current directory, but Zebra's
-    // crates are direct children of the workspace directory, so we only
-    // need to look at the parent directory
-    if metadata.is_err() {
-        git_dir_or_file = env::current_dir()?
-            .parent()
-            .ok_or("finding crate's parent directory")?
-            .to_path_buf()
-            .join(".git");
-        metadata = fs::metadata(&git_dir_or_file);
+fn main() {
+    let mut config = Config::default();
+    disable_non_reproducible(&mut config);
+
+    *config.git_mut().sha_kind_mut() = ShaKind::Short;
+    *config.git_mut().semver_kind_mut() = SemverKind::Lightweight;
+    // git typically uses "-dirty", but we change that so:
+    // - we're explicit and direct about source code state
+    // - it matches the SemVer 2.0 format, using dot separators
+    *config.git_mut().semver_dirty_mut() = Some(".modified");
+
+    // Disable env vars we aren't using right now
+    *config.cargo_mut().features_mut() = false;
+
+    // Disable git if we're building with an invalid `zebra/.git`
+    match vergen(config) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "git error in vergen build script: skipping git env vars: {:?}",
+                e
+            );
+            *config.git_mut().enabled_mut() = false;
+            vergen(config).expect("non-git vergen should succeed");
+        }
     }
-
-    // Modified from vergen's REBUILD_ON_HEAD_CHANGE implementation:
-    // https://github.com/rustyhorde/vergen/blob/master/src/output/envvar.rs#L46
-    if let Ok(metadata) = metadata {
-        if metadata.is_dir() {
-            // Echo the HEAD path
-            let git_head_path = git_dir_or_file.join("HEAD");
-            println!("cargo:rerun-if-changed={}", git_head_path.display());
-
-            // Determine where HEAD points and echo that path also.
-            let mut f = File::open(&git_head_path)?;
-            let mut git_head_contents = String::new();
-            let _ = f.read_to_string(&mut git_head_contents)?;
-            eprintln!("HEAD contents: {}", git_head_contents);
-            let ref_vec: Vec<&str> = git_head_contents.split(": ").collect();
-
-            if ref_vec.len() == 2 {
-                let current_head_file = ref_vec[1].trim();
-                let git_refs_path = git_dir_or_file.join(current_head_file);
-                println!("cargo:rerun-if-changed={}", git_refs_path.display());
-            } else {
-                eprintln!("You are most likely in a detached HEAD state");
-            }
-        } else if metadata.is_file() {
-            // We are in a worktree, so find out where the actual worktrees/<name>/HEAD file is.
-            let mut git_file = File::open(&git_dir_or_file)?;
-            let mut git_contents = String::new();
-            let _ = git_file.read_to_string(&mut git_contents)?;
-            let dir_vec: Vec<&str> = git_contents.split(": ").collect();
-            eprintln!(".git contents: {}", git_contents);
-            let git_path = dir_vec[1].trim();
-
-            // Echo the HEAD path
-            let git_head_path = PathBuf::from(git_path).join("HEAD");
-            println!("cargo:rerun-if-changed={}", git_head_path.display());
-
-            // Find out what the full path to the .git dir is.
-            let mut actual_git_dir = PathBuf::from(git_path);
-            actual_git_dir.pop();
-            actual_git_dir.pop();
-
-            // Determine where HEAD points and echo that path also.
-            let mut f = File::open(&git_head_path)?;
-            let mut git_head_contents = String::new();
-            let _ = f.read_to_string(&mut git_head_contents)?;
-            eprintln!("HEAD contents: {}", git_head_contents);
-            let ref_vec: Vec<&str> = git_head_contents.split(": ").collect();
-
-            if ref_vec.len() == 2 {
-                let current_head_file = ref_vec[1].trim();
-                let git_refs_path = actual_git_dir.join(current_head_file);
-                println!("cargo:rerun-if-changed={}", git_refs_path.display());
-            } else {
-                eprintln!("You are most likely in a detached HEAD state");
-            }
-        } else {
-            Err("Invalid .git format (Not a directory or a file)")?;
-        };
-    } else {
-        Err(".git directory or file not found in crate dir or parent dir")?;
-    };
-
-    Ok(())
 }

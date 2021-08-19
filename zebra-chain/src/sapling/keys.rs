@@ -8,6 +8,7 @@
 //! [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
 //! [3.1]: https://zips.z.cash/protocol/protocol.pdf#addressesandkeys
 #![allow(clippy::unit_arg)]
+#![allow(dead_code)]
 
 #[cfg(test)]
 mod test_vectors;
@@ -23,6 +24,7 @@ use std::{
 
 use bech32::{self, FromBase32, ToBase32, Variant};
 use rand_core::{CryptoRng, RngCore};
+use subtle::{Choice, ConstantTimeEq};
 
 use crate::{
     parameters::Network,
@@ -61,6 +63,25 @@ fn prf_expand(sk: [u8; 32], t: &[u8]) -> [u8; 64] {
         .finalize();
 
     *hash.as_array()
+}
+
+/// Used to derive the outgoing cipher key _ock_ used to encrypt an Output ciphertext.
+///
+/// PRF^ock(ovk, cv, cm_u, ephemeralKey) := BLAKE2b-256(“Zcash_Derive_ock”, ovk || cv || cm_u || ephemeralKey)
+///
+/// https://zips.z.cash/protocol/nu5.pdf#concreteprfs
+fn prf_ock(ovk: [u8; 32], cv: [u8; 32], cm_u: [u8; 32], ephemeral_key: [u8; 32]) -> [u8; 32] {
+    let hash = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"Zcash_Derive_ock")
+        .to_state()
+        .update(&ovk)
+        .update(&cv)
+        .update(&cm_u)
+        .update(&ephemeral_key)
+        .finalize();
+
+    <[u8; 32]>::try_from(hash.as_bytes()).expect("32 byte array")
 }
 
 /// Invokes Blake2s-256 as _CRH^ivk_, to derive the IncomingViewingKey
@@ -174,10 +195,10 @@ mod sk_hrp {
 /// §4.2.2][ps].
 ///
 /// Our root secret key of the Sapling key derivation tree. All other
-/// Sapling key types derive from the SpendingKey value.
+/// Sapling key types derive from the `SpendingKey` value.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug)]
 #[cfg_attr(
     any(test, feature = "proptest-impl"),
     derive(proptest_derive::Arbitrary)
@@ -187,10 +208,42 @@ pub struct SpendingKey {
     bytes: [u8; 32],
 }
 
+impl SpendingKey {
+    /// Generate a new _SpendingKey_.
+    pub fn new<T>(csprng: &mut T) -> Self
+    where
+        T: RngCore + CryptoRng,
+    {
+        let mut bytes = [0u8; 32];
+        csprng.fill_bytes(&mut bytes);
+
+        Self::from(bytes)
+    }
+}
+
+impl ConstantTimeEq for SpendingKey {
+    /// Check whether two `SpendingKey`s are equal, runtime independent of the
+    /// value of the secret.
+    ///
+    /// # Note
+    ///
+    /// This function short-circuits if the networks of the keys are different.
+    /// Otherwise, it should execute in time independent of the `bytes` value.
+    fn ct_eq(&self, other: &Self) -> Choice {
+        if self.network != other.network {
+            return Choice::from(0);
+        }
+
+        self.bytes.ct_eq(&other.bytes)
+    }
+}
+
+impl Eq for SpendingKey {}
+
 // TODO: impl a From that accepts a Network?
 
 impl From<[u8; 32]> for SpendingKey {
-    /// Generate a _SpendingKey_ from existing bytes.
+    /// Generate a `SpendingKey` from existing bytes.
     fn from(bytes: [u8; 32]) -> Self {
         Self {
             network: Network::default(),
@@ -234,16 +287,9 @@ impl FromStr for SpendingKey {
     }
 }
 
-impl SpendingKey {
-    /// Generate a new _SpendingKey_.
-    pub fn new<T>(csprng: &mut T) -> Self
-    where
-        T: RngCore + CryptoRng,
-    {
-        let mut bytes = [0u8; 32];
-        csprng.fill_bytes(&mut bytes);
-
-        Self::from(bytes)
+impl PartialEq for SpendingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).unwrap_u8() == 1u8
     }
 }
 
@@ -254,8 +300,16 @@ impl SpendingKey {
 /// _Spend Description_, proving ownership of notes.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct SpendAuthorizingKey(pub Scalar);
+#[derive(Copy, Clone)]
+pub struct SpendAuthorizingKey(pub(crate) Scalar);
+
+impl ConstantTimeEq for SpendAuthorizingKey {
+    /// Check whether two `SpendAuthorizingKey`s are equal, runtime independent
+    /// of the value of the secret.
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.to_bytes().ct_eq(&other.0.to_bytes())
+    }
+}
 
 impl fmt::Debug for SpendAuthorizingKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -264,6 +318,8 @@ impl fmt::Debug for SpendAuthorizingKey {
             .finish()
     }
 }
+
+impl Eq for SpendAuthorizingKey {}
 
 impl From<SpendAuthorizingKey> for [u8; 32] {
     fn from(sk: SpendAuthorizingKey) -> Self {
@@ -284,9 +340,15 @@ impl From<SpendingKey> for SpendAuthorizingKey {
     }
 }
 
+impl PartialEq for SpendAuthorizingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).unwrap_u8() == 1u8
+    }
+}
+
 impl PartialEq<[u8; 32]> for SpendAuthorizingKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(*self) == *other
+        self.0.to_bytes().ct_eq(other).unwrap_u8() == 1u8
     }
 }
 
@@ -296,8 +358,16 @@ impl PartialEq<[u8; 32]> for SpendAuthorizingKey {
 /// Used in the _Spend Statement_ to prove nullifier integrity.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct ProofAuthorizingKey(pub Scalar);
+#[derive(Copy, Clone)]
+pub struct ProofAuthorizingKey(pub(crate) Scalar);
+
+impl ConstantTimeEq for ProofAuthorizingKey {
+    /// Check whether two `ProofAuthorizingKey`s are equal, runtime independent
+    /// of the value of the secret.
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.to_bytes().ct_eq(&other.0.to_bytes())
+    }
+}
 
 impl fmt::Debug for ProofAuthorizingKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -306,6 +376,8 @@ impl fmt::Debug for ProofAuthorizingKey {
             .finish()
     }
 }
+
+impl Eq for ProofAuthorizingKey {}
 
 impl From<ProofAuthorizingKey> for [u8; 32] {
     fn from(nsk: ProofAuthorizingKey) -> Self {
@@ -325,9 +397,15 @@ impl From<SpendingKey> for ProofAuthorizingKey {
     }
 }
 
+impl PartialEq for ProofAuthorizingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).unwrap_u8() == 1u8
+    }
+}
+
 impl PartialEq<[u8; 32]> for ProofAuthorizingKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(*self) == *other
+        self.0.to_bytes().ct_eq(other).unwrap_u8() == 1u8
     }
 }
 
@@ -338,7 +416,7 @@ impl PartialEq<[u8; 32]> for ProofAuthorizingKey {
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub struct OutgoingViewingKey(pub [u8; 32]);
+pub struct OutgoingViewingKey(pub(crate) [u8; 32]);
 
 impl fmt::Debug for OutgoingViewingKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -390,7 +468,7 @@ impl PartialEq<[u8; 32]> for OutgoingViewingKey {
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
 #[derive(Copy, Clone, Debug)]
-pub struct AuthorizingKey(pub redjubjub::VerificationKey<SpendAuth>);
+pub struct AuthorizingKey(pub(crate) redjubjub::VerificationKey<SpendAuth>);
 
 impl Eq for AuthorizingKey {}
 
@@ -415,24 +493,32 @@ impl From<SpendAuthorizingKey> for AuthorizingKey {
 
 impl PartialEq for AuthorizingKey {
     fn eq(&self, other: &Self) -> bool {
-        <[u8; 32]>::from(self.0) == <[u8; 32]>::from(other.0)
+        self == &<[u8; 32]>::from(*other)
     }
 }
 
 impl PartialEq<[u8; 32]> for AuthorizingKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(self.0) == *other
+        &<[u8; 32]>::from(self.0) == other
     }
 }
 
 /// A _Nullifier Deriving Key_, as described in [protocol
 /// specification §4.2.2][ps].
 ///
-/// Used to create a _Nullifier_ per note.
+/// Used to create a `Nullifier` per note.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-#[derive(Copy, Clone, PartialEq)]
-pub struct NullifierDerivingKey(pub jubjub::AffinePoint);
+#[derive(Copy, Clone)]
+pub struct NullifierDerivingKey(pub(crate) jubjub::AffinePoint);
+
+impl ConstantTimeEq for NullifierDerivingKey {
+    /// Check whether two `NullifierDerivingKey`s are equal, runtime independent
+    /// of the value of the secret.
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.to_bytes().ct_eq(&other.0.to_bytes())
+    }
+}
 
 impl fmt::Debug for NullifierDerivingKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -484,9 +570,15 @@ impl From<ProofAuthorizingKey> for NullifierDerivingKey {
     }
 }
 
+impl PartialEq for NullifierDerivingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).unwrap_u8() == 1u8
+    }
+}
+
 impl PartialEq<[u8; 32]> for NullifierDerivingKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(*self) == *other
+        self.0.to_bytes().ct_eq(other).unwrap_u8() == 1u8
     }
 }
 
@@ -612,7 +704,7 @@ impl PartialEq<[u8; 32]> for IncomingViewingKey {
     any(test, feature = "proptest-impl"),
     derive(proptest_derive::Arbitrary)
 )]
-pub struct Diversifier(pub [u8; 11]);
+pub struct Diversifier(pub(crate) [u8; 11]);
 
 impl fmt::Debug for Diversifier {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -732,7 +824,7 @@ impl Diversifier {
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#concretediversifyhash
 #[derive(Copy, Clone, PartialEq)]
-pub struct TransmissionKey(pub jubjub::AffinePoint);
+pub struct TransmissionKey(pub(crate) jubjub::AffinePoint);
 
 impl fmt::Debug for TransmissionKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -777,7 +869,7 @@ impl From<(IncomingViewingKey, Diversifier)> for TransmissionKey {
 
 impl PartialEq<[u8; 32]> for TransmissionKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(*self) == *other
+        &self.0.to_bytes() == other
     }
 }
 
@@ -871,7 +963,7 @@ impl FromStr for FullViewingKey {
 /// https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
 #[derive(Copy, Clone, Deserialize, PartialEq, Serialize)]
 pub struct EphemeralPublicKey(
-    #[serde(with = "serde_helpers::AffinePoint")] pub jubjub::AffinePoint,
+    #[serde(with = "serde_helpers::AffinePoint")] pub(crate) jubjub::AffinePoint,
 );
 
 impl fmt::Debug for EphemeralPublicKey {
@@ -899,7 +991,7 @@ impl From<&EphemeralPublicKey> for [u8; 32] {
 
 impl PartialEq<[u8; 32]> for EphemeralPublicKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        <[u8; 32]>::from(self) == *other
+        &self.0.to_bytes() == other
     }
 }
 

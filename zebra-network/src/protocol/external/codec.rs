@@ -15,8 +15,8 @@ use zebra_chain::{
     block::{self, Block},
     parameters::Network,
     serialization::{
-        sha256d, ReadZcashExt, SerializationError as Error, WriteZcashExt, ZcashDeserialize,
-        ZcashSerialize,
+        sha256d, zcash_deserialize_bytes_external_count, ReadZcashExt, SerializationError as Error,
+        WriteZcashExt, ZcashDeserialize, ZcashSerialize, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -30,9 +30,6 @@ use super::{
 
 /// The length of a Bitcoin message header.
 const HEADER_LEN: usize = 24usize;
-
-/// Maximum size of a protocol message body.
-pub use zebra_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
@@ -48,8 +45,8 @@ pub struct Builder {
     version: Version,
     /// The maximum allowable message length.
     max_len: usize,
-    /// An optional label to use for reporting metrics.
-    metrics_label: Option<String>,
+    /// An optional address label, to use for reporting metrics.
+    metrics_addr_label: Option<String>,
 }
 
 impl Codec {
@@ -57,9 +54,9 @@ impl Codec {
     pub fn builder() -> Builder {
         Builder {
             network: Network::Mainnet,
-            version: constants::CURRENT_VERSION,
+            version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_PROTOCOL_MESSAGE_LEN,
-            metrics_label: None,
+            metrics_addr_label: None,
         }
     }
 
@@ -98,9 +95,9 @@ impl Builder {
         self
     }
 
-    /// Configure the codec for the given peer address.
-    pub fn with_metrics_label(mut self, metrics_label: String) -> Self {
-        self.metrics_label = Some(metrics_label);
+    /// Configure the codec with a label corresponding to the peer address.
+    pub fn with_metrics_addr_label(mut self, metrics_addr_label: String) -> Self {
+        self.metrics_addr_label = Some(metrics_addr_label);
         self
     }
 }
@@ -119,8 +116,10 @@ impl Encoder<Message> for Codec {
             return Err(Parse("body length exceeded maximum size"));
         }
 
-        if let Some(label) = self.builder.metrics_label.clone() {
-            metrics::counter!("zcash.net.out.bytes.total", (body_length + HEADER_LEN) as u64, "addr" => label);
+        if let Some(addr_label) = self.builder.metrics_addr_label.clone() {
+            metrics::counter!("zcash.net.out.bytes.total",
+                              (body_length + HEADER_LEN) as u64,
+                              "addr" => addr_label);
         }
 
         use Message::*;
@@ -220,6 +219,9 @@ impl Codec {
             } => {
                 writer.write_u32::<LittleEndian>(version.0)?;
                 writer.write_u64::<LittleEndian>(services.bits())?;
+                // # Security
+                // DateTime<Utc>::timestamp has a smaller range than i64, so
+                // serialization can not error.
                 writer.write_i64::<LittleEndian>(timestamp.timestamp())?;
 
                 let (recv_services, recv_addr) = address_recv;
@@ -231,7 +233,7 @@ impl Codec {
                 writer.write_socket_addr(*from_addr)?;
 
                 writer.write_u64::<LittleEndian>(nonce.0)?;
-                writer.write_string(&user_agent)?;
+                user_agent.zcash_serialize(&mut writer)?;
                 writer.write_u32::<LittleEndian>(start_height.0)?;
                 writer.write_u8(*relay as u8)?;
             }
@@ -248,10 +250,12 @@ impl Codec {
                 reason,
                 data,
             } => {
-                writer.write_string(&message)?;
+                message.zcash_serialize(&mut writer)?;
                 writer.write_u8(*ccode as u8)?;
-                writer.write_string(&reason)?;
-                writer.write_all(&data.unwrap())?;
+                reason.zcash_serialize(&mut writer)?;
+                if let Some(data) = data {
+                    writer.write_all(data)?;
+                }
             }
             Message::Addr(addrs) => addrs.zcash_serialize(&mut writer)?,
             Message::GetAddr => { /* Empty payload -- no-op */ }
@@ -272,7 +276,7 @@ impl Codec {
             Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::Tx(transaction) => transaction.zcash_serialize(&mut writer)?,
+            Message::Tx(transaction) => transaction.transaction.zcash_serialize(&mut writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
             Message::FilterLoad {
                 filter,
@@ -368,7 +372,7 @@ impl Decoder for Codec {
                     return Err(Parse("body length exceeded maximum size"));
                 }
 
-                if let Some(label) = self.builder.metrics_label.clone() {
+                if let Some(label) = self.builder.metrics_addr_label.clone() {
                     metrics::counter!("zcash.net.in.bytes.total", (body_len + HEADER_LEN) as u64, "addr" =>  label);
                 }
 
@@ -457,7 +461,12 @@ impl Codec {
             version: Version(reader.read_u32::<LittleEndian>()?),
             // Use from_bits_truncate to discard unknown service bits.
             services: PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?),
-            timestamp: Utc.timestamp(reader.read_i64::<LittleEndian>()?, 0),
+            timestamp: Utc
+                .timestamp_opt(reader.read_i64::<LittleEndian>()?, 0)
+                .single()
+                .ok_or(Error::Parse(
+                    "version timestamp is out of range for DateTime",
+                ))?,
             address_recv: (
                 PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?),
                 reader.read_socket_addr()?,
@@ -511,7 +520,8 @@ impl Codec {
             // data (hash identifying the rejected object) or none (and we model
             // the Reject message that way), so instead of passing in the
             // body_len separately and calculating remaining bytes, just try to
-            // read 32 bytes and ignore any failures.
+            // read 32 bytes and ignore any failures. (The caller will log and
+            // ignore any trailing bytes.)
             data: reader.read_32_bytes().ok(),
         })
     }
@@ -597,10 +607,9 @@ impl Codec {
             return Err(Error::Parse("Invalid filterload message body length."));
         }
 
+        // Memory Denial of Service: we just limited the untrusted parsed length
         let filter_length: usize = body_len - FILTERLOAD_REMAINDER_LENGTH;
-
-        let mut filter_bytes = vec![0; filter_length];
-        reader.read_exact(&mut filter_bytes)?;
+        let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
 
         Ok(Message::FilterLoad {
             filter: Filter(filter_bytes),
@@ -613,11 +622,9 @@ impl Codec {
     fn read_filteradd<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
         const MAX_FILTERADD_LENGTH: usize = 520;
 
+        // Memory Denial of Service: limit the untrusted parsed length
         let filter_length: usize = min(body_len, MAX_FILTERADD_LENGTH);
-
-        // Memory Denial of Service: this length has just been bounded
-        let mut filter_bytes = vec![0; filter_length];
-        reader.read_exact(&mut filter_bytes)?;
+        let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
 
         Ok(Message::FilterAdd { data: filter_bytes })
     }
@@ -631,34 +638,145 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use chrono::{MAX_DATETIME, MIN_DATETIME};
     use futures::prelude::*;
+    use lazy_static::lazy_static;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::runtime::Runtime;
 
+    lazy_static! {
+        static ref VERSION_TEST_VECTOR: Message = {
+            let services = PeerServices::NODE_NETWORK;
+            let timestamp = Utc.timestamp(1_568_000_000, 0);
+            Message::Version {
+                version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+                services,
+                timestamp,
+                address_recv: (
+                    services,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+                ),
+                address_from: (
+                    services,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+                ),
+                nonce: Nonce(0x9082_4908_8927_9238),
+                user_agent: "Zebra".to_owned(),
+                start_height: block::Height(540_000),
+                relay: true,
+            }
+        };
+    }
+
+    /// Check that the version test vector serializes and deserializes correctly
     #[test]
     fn version_message_round_trip() {
         zebra_test::init();
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let services = PeerServices::NODE_NETWORK;
-        let timestamp = Utc.timestamp(1_568_000_000, 0);
+        let rt = Runtime::new().unwrap();
+
+        let v = &*VERSION_TEST_VECTOR;
+
+        use tokio_util::codec::{FramedRead, FramedWrite};
+        let v_bytes = rt.block_on(async {
+            let mut bytes = Vec::new();
+            {
+                let mut fw = FramedWrite::new(&mut bytes, Codec::builder().finish());
+                fw.send(v.clone())
+                    .await
+                    .expect("message should be serialized");
+            }
+            bytes
+        });
+
+        let v_parsed = rt.block_on(async {
+            let mut fr = FramedRead::new(Cursor::new(&v_bytes), Codec::builder().finish());
+            fr.next()
+                .await
+                .expect("a next message should be available")
+                .expect("that message should deserialize")
+        });
+
+        assert_eq!(*v, v_parsed);
+    }
+
+    /// Check that version deserialization rejects out-of-range timestamps with
+    /// an error.
+    #[test]
+    fn version_timestamp_out_of_range() {
+        let v_err = deserialize_version_with_time(i64::MAX);
+        assert!(
+            matches!(v_err, Err(Error::Parse(_))),
+            "expected error with version timestamp: {}",
+            i64::MAX
+        );
+
+        let v_err = deserialize_version_with_time(i64::MIN);
+        assert!(
+            matches!(v_err, Err(Error::Parse(_))),
+            "expected error with version timestamp: {}",
+            i64::MIN
+        );
+
+        deserialize_version_with_time(1620777600).expect("recent time is valid");
+        deserialize_version_with_time(0).expect("zero time is valid");
+        deserialize_version_with_time(MIN_DATETIME.timestamp()).expect("min time is valid");
+        deserialize_version_with_time(MAX_DATETIME.timestamp()).expect("max time is valid");
+    }
+
+    /// Deserialize a `Version` message containing `time`, and return the result.
+    fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
+        zebra_test::init();
+        let rt = Runtime::new().unwrap();
+
+        let v = &*VERSION_TEST_VECTOR;
+
+        use tokio_util::codec::{FramedRead, FramedWrite};
+        let v_bytes = rt.block_on(async {
+            let mut bytes = Vec::new();
+            {
+                let mut fw = FramedWrite::new(&mut bytes, Codec::builder().finish());
+                fw.send(v.clone())
+                    .await
+                    .expect("message should be serialized");
+            }
+
+            let old_bytes = bytes.clone();
+
+            // tweak the version bytes so the timestamp is set to `time`
+            // Version serialization is specified at:
+            // https://developer.bitcoin.org/reference/p2p_networking.html#version
+            bytes[36..44].copy_from_slice(&time.to_le_bytes());
+
+            // Checksum is specified at:
+            // https://developer.bitcoin.org/reference/p2p_networking.html#message-headers
+            let checksum = sha256d::Checksum::from(&bytes[HEADER_LEN..]);
+            bytes[20..24].copy_from_slice(&checksum.0);
+
+            debug!(?time,
+                   old_len = ?old_bytes.len(), new_len = ?bytes.len(),
+                   old_bytes = ?&old_bytes[36..44], new_bytes = ?&bytes[36..44]);
+
+            bytes
+        });
+
+        rt.block_on(async {
+            let mut fr = FramedRead::new(Cursor::new(&v_bytes), Codec::builder().finish());
+            fr.next().await.expect("a next message should be available")
+        })
+    }
+
+    #[test]
+    fn filterload_message_round_trip() {
+        zebra_test::init();
 
         let rt = Runtime::new().unwrap();
 
-        let v = Message::Version {
-            version: crate::constants::CURRENT_VERSION,
-            services,
-            timestamp,
-            address_recv: (
-                services,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-            ),
-            address_from: (
-                services,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-            ),
-            nonce: Nonce(0x9082_4908_8927_9238),
-            user_agent: "Zebra".to_owned(),
-            start_height: block::Height(540_000),
-            relay: true,
+        let v = Message::FilterLoad {
+            filter: Filter(vec![0; 35999]),
+            hash_functions_count: 0,
+            tweak: Tweak(0),
+            flags: 0,
         };
 
         use tokio_util::codec::{FramedRead, FramedWrite};
@@ -685,16 +803,52 @@ mod tests {
     }
 
     #[test]
-    fn filterload_message_round_trip() {
+    fn reject_message_no_extra_data_round_trip() {
         zebra_test::init();
 
         let rt = Runtime::new().unwrap();
 
-        let v = Message::FilterLoad {
-            filter: Filter(vec![0; 35999]),
-            hash_functions_count: 0,
-            tweak: Tweak(0),
-            flags: 0,
+        let v = Message::Reject {
+            message: "experimental".to_string(),
+            ccode: RejectReason::Malformed,
+            reason: "message could not be decoded".to_string(),
+            data: None,
+        };
+
+        use tokio_util::codec::{FramedRead, FramedWrite};
+        let v_bytes = rt.block_on(async {
+            let mut bytes = Vec::new();
+            {
+                let mut fw = FramedWrite::new(&mut bytes, Codec::builder().finish());
+                fw.send(v.clone())
+                    .await
+                    .expect("message should be serialized");
+            }
+            bytes
+        });
+
+        let v_parsed = rt.block_on(async {
+            let mut fr = FramedRead::new(Cursor::new(&v_bytes), Codec::builder().finish());
+            fr.next()
+                .await
+                .expect("a next message should be available")
+                .expect("that message should deserialize")
+        });
+
+        assert_eq!(v, v_parsed);
+    }
+
+    #[test]
+    fn reject_message_extra_data_round_trip() {
+        zebra_test::init();
+
+        let rt = Runtime::new().unwrap();
+
+        let v = Message::Reject {
+            message: "block".to_string(),
+            ccode: RejectReason::Invalid,
+            reason: "invalid block difficulty".to_string(),
+            data: Some([0xff; 32]),
         };
 
         use tokio_util::codec::{FramedRead, FramedWrite};
@@ -756,17 +910,17 @@ mod tests {
 
     #[test]
     fn max_msg_size_round_trip() {
-        use std::sync::Arc;
         use zebra_chain::serialization::ZcashDeserializeInto;
+
         zebra_test::init();
 
         let rt = Runtime::new().unwrap();
 
         // make tests with a Tx message
-        let tx = zebra_test::vectors::DUMMY_TX1
+        let tx: Transaction = zebra_test::vectors::DUMMY_TX1
             .zcash_deserialize_into()
             .unwrap();
-        let msg = Message::Tx(Arc::new(tx));
+        let msg = Message::Tx(tx.into());
 
         use tokio_util::codec::{FramedRead, FramedWrite};
 

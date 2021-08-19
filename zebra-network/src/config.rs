@@ -1,22 +1,42 @@
-use std::{collections::HashSet, net::SocketAddr, string::String, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    string::String,
+    time::Duration,
+};
 
-use zebra_chain::parameters::Network;
+use serde::{de, Deserialize, Deserializer};
+
+use zebra_chain::{parameters::Network, serialization::canonical_socket_addr};
 
 use crate::BoxError;
 
-/// The number of times Zebra will retry each initial peer, before checking if
-/// any other initial peers have returned addresses.
+/// The number of times Zebra will retry each initial peer's DNS resolution,
+/// before checking if any other initial peers have returned addresses.
 const MAX_SINGLE_PEER_RETRIES: usize = 2;
 
 /// Configuration for networking code.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Config {
     /// The address on which this node should listen for connections.
     ///
-    /// Zebra will also advertise this address to other nodes. Advertising a
-    /// different external IP address is currently not supported, see #1890
-    /// for details.
+    /// Can be `address:port` or just `address`. If there is no configured
+    /// port, Zebra will use the default port for the configured `network`.
+    ///
+    /// `address` can be an IP address or a DNS name. DNS names are
+    /// only resolved once, when Zebra starts up.
+    ///
+    /// If a specific listener address is configured, Zebra will advertise
+    /// it to other nodes. But by default, Zebra uses an unspecified address
+    /// ("0.0.0.0" or "[::]"), which is not advertised to other nodes.
+    ///
+    /// Zebra does not currently support:
+    /// - [Advertising a different external IP address #1890](https://github.com/ZcashFoundation/zebra/issues/1890), or
+    /// - [Auto-discovering its own external IP address #1893](https://github.com/ZcashFoundation/zebra/issues/1893).
+    ///
+    /// However, other Zebra instances compensate for unspecified or incorrect
+    /// listener addresses by adding the external IP addresses of peers to
+    /// their address books.
     pub listen_addr: SocketAddr,
 
     /// The network to connect to.
@@ -38,12 +58,12 @@ pub struct Config {
     pub peerset_initial_target_size: usize,
 
     /// How frequently we attempt to crawl the network to discover new peer
-    /// connections.
+    /// addresses.
     ///
-    /// This duration only pertains to the rate at which zebra crawls for new
-    /// peers, not the rate zebra connects to new peers, which is restricted to
-    /// CandidateSet::PEER_CONNECTION_INTERVAL
-    #[serde(alias = "new_peer_interval")]
+    /// Zebra asks its connected peers for more peer addresses:
+    /// - regularly, every time `crawl_new_peer_interval` elapses, and
+    /// - if the peer set is busy, and there aren't any peer addresses for the
+    ///   next connection attempt.
     pub crawl_new_peer_interval: Duration,
 }
 
@@ -55,6 +75,15 @@ impl Config {
     /// until at least one peer is found.
     async fn resolve_peers(peers: &HashSet<String>) -> HashSet<SocketAddr> {
         use futures::stream::StreamExt;
+
+        if peers.is_empty() {
+            warn!(
+                "no initial peers in the network config. \
+                 Hint: you must configure at least one peer IP or DNS seeder to run Zebra, \
+                 or make sure Zebra's listener port gets inbound connections."
+            );
+            return HashSet::new();
+        }
 
         loop {
             // We retry each peer individually, as well as retrying if there are
@@ -115,7 +144,7 @@ impl Config {
         let fut = tokio::time::timeout(crate::constants::DNS_LOOKUP_TIMEOUT, fut);
 
         match fut.await {
-            Ok(Ok(ips)) => Ok(ips.collect()),
+            Ok(Ok(ips)) => Ok(ips.map(canonical_socket_addr).collect()),
             Ok(Err(e)) => {
                 tracing::info!(?host, ?e, "DNS error resolving peer IP address");
                 Err(e.into())
@@ -175,3 +204,61 @@ impl Default for Config {
         }
     }
 }
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, default)]
+        struct DConfig {
+            listen_addr: String,
+            network: Network,
+            initial_mainnet_peers: HashSet<String>,
+            initial_testnet_peers: HashSet<String>,
+            peerset_initial_target_size: usize,
+            #[serde(alias = "new_peer_interval")]
+            crawl_new_peer_interval: Duration,
+        }
+
+        impl Default for DConfig {
+            fn default() -> Self {
+                let config = Config::default();
+                Self {
+                    listen_addr: config.listen_addr.to_string(),
+                    network: config.network,
+                    initial_mainnet_peers: config.initial_mainnet_peers,
+                    initial_testnet_peers: config.initial_testnet_peers,
+                    peerset_initial_target_size: config.peerset_initial_target_size,
+                    crawl_new_peer_interval: config.crawl_new_peer_interval,
+                }
+            }
+        }
+
+        let config = DConfig::deserialize(deserializer)?;
+        // TODO: perform listener DNS lookups asynchronously with a timeout (#1631)
+        let listen_addr = match config.listen_addr.parse::<SocketAddr>() {
+            Ok(socket) => Ok(socket),
+            Err(_) => match config.listen_addr.parse::<IpAddr>() {
+                Ok(ip) => Ok(SocketAddr::new(ip, config.network.default_port())),
+                Err(err) => Err(de::Error::custom(format!(
+                    "{}; Hint: addresses can be a IPv4, IPv6 (with brackets), or a DNS name, the port is optional",
+                    err
+                ))),
+            },
+        }?;
+
+        Ok(Config {
+            listen_addr: canonical_socket_addr(listen_addr),
+            network: config.network,
+            initial_mainnet_peers: config.initial_mainnet_peers,
+            initial_testnet_peers: config.initial_testnet_peers,
+            peerset_initial_target_size: config.peerset_initial_target_size,
+            crawl_new_peer_interval: config.crawl_new_peer_interval,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,7 +1,7 @@
 //! Blocks and block-related structures (heights, headers, etc.)
-#![allow(clippy::unit_arg)]
 
 mod commitment;
+mod error;
 mod hash;
 mod header;
 mod height;
@@ -10,26 +10,35 @@ mod serialize;
 pub mod merkle;
 
 #[cfg(any(test, feature = "proptest-impl"))]
-mod arbitrary;
-#[cfg(test)]
-mod tests;
+pub mod arbitrary;
+#[cfg(any(test, feature = "bench"))]
+pub mod tests;
 
-use std::fmt;
+use std::{collections::HashMap, convert::TryInto, fmt, ops::Neg};
 
-pub use commitment::{Commitment, CommitmentError};
+pub use commitment::{ChainHistoryMmrRootHash, Commitment, CommitmentError};
 pub use hash::Hash;
 pub use header::{BlockTimeError, CountedHeader, Header};
 pub use height::Height;
 pub use serialize::MAX_BLOCK_BYTES;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use arbitrary::LedgerState;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    amount::NegativeAllowed,
+    block::merkle::AuthDataRoot,
     fmt::DisplayToDebug,
-    parameters::Network,
+    orchard,
+    parameters::{Network, NetworkUpgrade},
+    sapling,
     serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    sprout,
     transaction::Transaction,
     transparent,
+    value_balance::{ValueBalance, ValueBalanceError},
 };
 
 /// A Zcash block, containing a header and a list of transactions.
@@ -83,6 +92,120 @@ impl Block {
             }),
             Some(height) => Commitment::from_bytes(self.header.commitment_bytes, network, height),
         }
+    }
+
+    /// Check if the `network_upgrade` fields from each transaction in the block matches
+    /// the network upgrade calculated from the `network` and block height.
+    ///
+    /// # Consensus rule:
+    ///
+    ///  The nConsensusBranchId field MUST match the consensus branch ID used for
+    ///  SIGHASH transaction hashes, as specifed in [ZIP-244] ([7.1]).
+    ///
+    /// [ZIP-244]: https://zips.z.cash/zip-0244
+    /// [7.1]: https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus
+    pub fn check_transaction_network_upgrade_consistency(
+        &self,
+        network: Network,
+    ) -> Result<(), error::BlockError> {
+        let block_nu =
+            NetworkUpgrade::current(network, self.coinbase_height().expect("a valid height"));
+
+        if self
+            .transactions
+            .iter()
+            .filter_map(|trans| trans.as_ref().network_upgrade())
+            .any(|trans_nu| trans_nu != block_nu)
+        {
+            return Err(error::BlockError::WrongTransactionConsensusBranchId);
+        }
+
+        Ok(())
+    }
+
+    /// Access the [`sprout::Nullifier`]s from all transactions in this block.
+    pub fn sprout_nullifiers(&self) -> impl Iterator<Item = &sprout::Nullifier> {
+        self.transactions
+            .iter()
+            .map(|transaction| transaction.sprout_nullifiers())
+            .flatten()
+    }
+
+    /// Access the [`sapling::Nullifier`]s from all transactions in this block.
+    pub fn sapling_nullifiers(&self) -> impl Iterator<Item = &sapling::Nullifier> {
+        self.transactions
+            .iter()
+            .map(|transaction| transaction.sapling_nullifiers())
+            .flatten()
+    }
+
+    /// Access the [`orchard::Nullifier`]s from all transactions in this block.
+    pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
+        self.transactions
+            .iter()
+            .map(|transaction| transaction.orchard_nullifiers())
+            .flatten()
+    }
+
+    /// Count how many Sapling transactions exist in a block,
+    /// i.e. transactions "where either of vSpendsSapling or vOutputsSapling is non-empty"
+    /// (https://zips.z.cash/zip-0221#tree-node-specification).
+    pub fn sapling_transactions_count(&self) -> u64 {
+        self.transactions
+            .iter()
+            .filter(|tx| tx.has_sapling_shielded_data())
+            .count()
+            .try_into()
+            .expect("number of transactions must fit u64")
+    }
+
+    /// Count how many Orchard transactions exist in a block,
+    /// i.e. transactions "where vActionsOrchard is non-empty."
+    /// (https://zips.z.cash/zip-0221#tree-node-specification).
+    pub fn orchard_transactions_count(&self) -> u64 {
+        self.transactions
+            .iter()
+            .filter(|tx| tx.has_orchard_shielded_data())
+            .count()
+            .try_into()
+            .expect("number of transactions must fit u64")
+    }
+
+    /// Get the overall chain value pool change in this block,
+    /// the negative sum of the transaction value balances in this block.
+    ///
+    /// These are the changes in the transparent, sprout, sapling, and orchard
+    /// chain value pools, as a result of this block.
+    ///
+    /// Positive values are added to the corresponding chain value pool.
+    /// Negative values are removed from the corresponding pool.
+    ///
+    /// https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
+    ///
+    /// `utxos` must contain the [`Utxo`]s of every input in this block,
+    /// including UTXOs created by earlier transactions in this block.
+    ///
+    /// Note: the chain value pool has the opposite sign to the transaction
+    /// value pool.
+    pub fn chain_value_pool_change(
+        &self,
+        utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        let transaction_value_balance_total = self
+            .transactions
+            .iter()
+            .flat_map(|t| t.value_balance(utxos))
+            .sum::<Result<ValueBalance<NegativeAllowed>, _>>()?;
+
+        Ok(transaction_value_balance_total.neg())
+    }
+
+    /// Compute the root of the authorizing data Merkle tree,
+    /// as defined in [ZIP-244].
+    ///
+    /// [ZIP-244]: https://zips.z.cash/zip-0244
+    pub fn auth_data_root(&self) -> AuthDataRoot {
+        self.transactions.iter().collect::<AuthDataRoot>()
     }
 }
 

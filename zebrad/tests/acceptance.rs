@@ -1,7 +1,7 @@
 //! Acceptance test: runs zebrad as a subprocess and asserts its
 //! output for given argument combinations matches what is expected.
 //!
-//! ### Note on port conflict
+//! ## Note on port conflict
 //!
 //! If the test child has a cache or port conflict with another test, or a
 //! running zebrad or zcashd, then it will panic. But the acceptance tests
@@ -11,29 +11,39 @@
 //!   - run the tests in an isolated environment,
 //!   - run zebrad on a custom cache path and port,
 //!   - run zcashd on a custom port.
+//!
+//! ## Failures due to Configured Network Interfaces or Network Connectivity
+//!
+//! If your test environment does not have any IPv6 interfaces configured, skip IPv6 tests
+//! by setting the `ZEBRA_SKIP_IPV6_TESTS` environmental variable.
+//!
+//! If it does not have any IPv4 interfaces, IPv4 localhost is not on `127.0.0.1`,
+//! or you have poor network connectivity,
+//! skip all the network tests by setting the `ZEBRA_SKIP_NETWORK_TESTS` environmental variable.
 
-#![warn(warnings, missing_docs, trivial_casts, unused_qualifications)]
-#![forbid(unsafe_code)]
-#![allow(dead_code)]
+// Standard lints
+#![warn(missing_docs)]
 #![allow(clippy::try_err)]
+#![deny(clippy::await_holding_lock)]
+#![forbid(unsafe_code)]
 
-use color_eyre::eyre::Result;
-use eyre::WrapErr;
+use color_eyre::{
+    eyre::{Result, WrapErr},
+    Help,
+};
 use tempdir::TempDir;
 
-use std::{collections::HashSet, convert::TryInto, env, path::Path, path::PathBuf, time::Duration};
+use std::{collections::HashSet, convert::TryInto, path::Path, path::PathBuf, time::Duration};
 
 use zebra_chain::{
     block::Height,
-    parameters::{
-        Network::{self, *},
-        NetworkUpgrade,
-    },
+    parameters::Network::{self, *},
 };
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::constants::LOCK_FILE_ERROR;
 use zebra_test::{
     command::{ContextFrom, TestDirExt},
+    net::random_known_port,
     prelude::*,
 };
 use zebrad::config::ZebradConfig;
@@ -212,7 +222,7 @@ fn generate_no_args() -> Result<()> {
     let output = output.assert_success()?;
 
     // First line
-    output.stdout_contains(r"# Default configuration for zebrad.")?;
+    output.stdout_line_contains("# Default configuration for zebrad")?;
 
     Ok(())
 }
@@ -295,6 +305,17 @@ fn generate_args() -> Result<()> {
     Ok(())
 }
 
+/// Is `s` a valid `zebrad` version string?
+///
+/// Trims whitespace before parsing the version.
+///
+/// Returns false if the version is invalid, or if there is anything else on the
+/// line that contains the version. In particular, this check will fail if `s`
+/// includes any terminal formatting.
+fn is_zebrad_version(s: &str) -> bool {
+    semver::Version::parse(s.replace("zebrad", "").trim()).is_ok()
+}
+
 #[test]
 fn help_no_args() -> Result<()> {
     zebra_test::init();
@@ -305,11 +326,16 @@ fn help_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_success()?;
 
-    // First line haves the version
-    output.stdout_contains(r"zebrad [0-9].[0-9].[0-9]")?;
+    // The first line should have the version
+    output.any_output_line(
+        is_zebrad_version,
+        &output.output.stdout,
+        "stdout",
+        "a valid zebrad semantic version",
+    )?;
 
     // Make sure we are in help by looking usage string
-    output.stdout_contains(r"USAGE:")?;
+    output.stdout_line_contains("USAGE:")?;
 
     Ok(())
 }
@@ -350,7 +376,11 @@ fn start_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_contains(r"Starting zebrad$")?;
+    output.stdout_line_contains("Starting zebrad")?;
+
+    // Make sure the command passed the legacy chain check
+    output.stdout_line_contains("starting legacy chain check")?;
+    output.stdout_line_contains("no legacy chain found")?;
 
     // Make sure the command was killed
     output.assert_was_killed()?;
@@ -557,7 +587,7 @@ fn app_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_success()?;
 
-    output.stdout_contains(r"USAGE:")?;
+    output.stdout_line_contains("USAGE:")?;
 
     Ok(())
 }
@@ -572,7 +602,13 @@ fn version_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_success()?;
 
-    output.stdout_matches(r"^zebrad [0-9].[0-9].[0-9]-[A-Za-z]*.[0-9]\n$")?;
+    // The output should only contain the version
+    output.output_check(
+        is_zebrad_version,
+        &output.output.stdout,
+        "stdout",
+        "a valid zebrad semantic version",
+    )?;
 
     Ok(())
 }
@@ -602,12 +638,12 @@ fn valid_generated_config_test() -> Result<()> {
     // Unlike the other tests, these tests can not be run in parallel, because
     // they use the generated config. So parallel execution can cause port and
     // cache conflicts.
-    valid_generated_config("start", r"Starting zebrad$")?;
+    valid_generated_config("start", "Starting zebrad")?;
 
     Ok(())
 }
 
-fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
+fn valid_generated_config(command: &str, expect_stdout_line_contains: &str) -> Result<()> {
     zebra_test::init();
 
     let testdir = testdir()?;
@@ -637,7 +673,7 @@ fn valid_generated_config(command: &str, expected_output: &str) -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_contains(expected_output)?;
+    output.stdout_line_contains(expect_stdout_line_contains)?;
 
     // [Note on port conflict](#Note on port conflict)
     output.assert_was_killed().wrap_err("Possible port or cache conflict. Are there other acceptance test, zebrad, or zcashd processes running?")?;
@@ -677,6 +713,7 @@ fn sync_one_checkpoint_mainnet() -> Result<()> {
         STOP_AT_HEIGHT_REGEX,
         SMALL_CHECKPOINT_TIMEOUT,
         None,
+        true,
     )
     .map(|_tempdir| ())
 }
@@ -692,6 +729,7 @@ fn sync_one_checkpoint_testnet() -> Result<()> {
         STOP_AT_HEIGHT_REGEX,
         SMALL_CHECKPOINT_TIMEOUT,
         None,
+        true,
     )
     .map(|_tempdir| ())
 }
@@ -699,22 +737,33 @@ fn sync_one_checkpoint_testnet() -> Result<()> {
 /// Test if `zebrad` can sync the first checkpoint, restart, and stop on load.
 #[test]
 fn restart_stop_at_height() -> Result<()> {
+    zebra_test::init();
+
+    restart_stop_at_height_for_network(Network::Mainnet, Height(0))?;
+    restart_stop_at_height_for_network(Network::Testnet, Height(0))?;
+
+    Ok(())
+}
+
+fn restart_stop_at_height_for_network(network: Network, height: Height) -> Result<()> {
     let reuse_tempdir = sync_until(
-        Height(0),
-        Mainnet,
+        height,
+        network,
         STOP_AT_HEIGHT_REGEX,
         SMALL_CHECKPOINT_TIMEOUT,
         None,
+        true,
     )?;
     // if stopping corrupts the rocksdb database, zebrad might hang or crash here
     // if stopping does not write the rocksdb database to disk, Zebra will
     // sync, rather than stopping immediately at the configured height
     sync_until(
-        Height(0),
-        Mainnet,
+        height,
+        network,
         "state is already at the configured height",
         STOP_ON_LOAD_TIMEOUT,
         Some(reuse_tempdir),
+        false,
     )?;
 
     Ok(())
@@ -734,6 +783,7 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
         STOP_AT_HEIGHT_REGEX,
         LARGE_CHECKPOINT_TIMEOUT,
         None,
+        true,
     )?;
     // if this sync fails, see the failure notes in `restart_stop_at_height`
     sync_until(
@@ -742,13 +792,14 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
         "previous state height is greater than the stop height",
         STOP_ON_LOAD_TIMEOUT,
         Some(reuse_tempdir),
+        false,
     )?;
 
     Ok(())
 }
 
-// Todo: We had a `sync_large_checkpoints_testnet` here but it was removed because
-// the testnet is unreliable(#1222). Enable after we have more testnet instances(#1791).
+// TODO: We had a `sync_large_checkpoints_testnet` here but it was removed because
+// the testnet is unreliable (#1222). Enable after we have more testnet instances (#1791).
 
 /// Sync `network` until `zebrad` reaches `height`, and ensure that
 /// the output contains `stop_regex`. If `reuse_tempdir` is supplied,
@@ -769,13 +820,11 @@ fn sync_until(
     stop_regex: &str,
     timeout: Duration,
     reuse_tempdir: Option<TempDir>,
+    check_legacy_chain: bool,
 ) -> Result<TempDir> {
     zebra_test::init();
 
-    if env::var_os("ZEBRA_SKIP_NETWORK_TESTS").is_some() {
-        // This message is captured by the test runner, use
-        // `cargo test -- --nocapture` to see it.
-        eprintln!("Skipping network test because '$ZEBRA_SKIP_NETWORK_TESTS' is set.");
+    if zebra_test::net::zebra_skip_network_tests() {
         return testdir();
     }
 
@@ -794,27 +843,47 @@ fn sync_until(
     let mut child = tempdir.spawn_child(&["start"])?.with_timeout(timeout);
 
     let network = format!("network: {},", network);
-    child.expect_stdout(&network)?;
-    child.expect_stdout(stop_regex)?;
+    child.expect_stdout_line_matches(&network)?;
+
+    if check_legacy_chain {
+        child.expect_stdout_line_matches("starting legacy chain check")?;
+        child.expect_stdout_line_matches("no legacy chain found")?;
+    }
+
+    child.expect_stdout_line_matches(stop_regex)?;
     child.kill()?;
 
     Ok(child.dir)
 }
 
-fn cached_canopy_test_config() -> Result<ZebradConfig> {
+fn cached_mandatory_checkpoint_test_config() -> Result<ZebradConfig> {
     let mut config = persistent_test_config()?;
-    config.consensus.checkpoint_sync = true;
     config.state.cache_dir = "/zebrad-cache".into();
     Ok(config)
 }
 
-fn create_cached_database_height(network: Network, height: Height) -> Result<()> {
+/// Create or update a cached state for `network`, stopping at `height`.
+///
+/// Callers can supply an extra `test_child_predicate`, which is called on
+/// the `TestChild` between the startup checks, and the final
+/// `STOP_AT_HEIGHT_REGEX` check.
+///
+/// The `TestChild` is spawned with a timeout, so the predicate should use
+/// `expect_stdout_line_matches` or `expect_stderr_line_matches`.
+fn create_cached_database_height<P>(
+    network: Network,
+    height: Height,
+    test_child_predicate: impl Into<Option<P>>,
+) -> Result<()>
+where
+    P: FnOnce(&mut TestChild<PathBuf>) -> Result<()>,
+{
     println!("Creating cached database");
-    // 8 hours
-    let timeout = Duration::from_secs(60 * 60 * 8);
+    // 16 hours
+    let timeout = Duration::from_secs(60 * 60 * 16);
 
     // Use a persistent state, so we can handle large syncs
-    let mut config = cached_canopy_test_config()?;
+    let mut config = cached_mandatory_checkpoint_test_config()?;
     // TODO: add convenience methods?
     config.network.network = network;
     config.state.debug_stop_at_height = Some(height.0);
@@ -827,21 +896,43 @@ fn create_cached_database_height(network: Network, height: Height) -> Result<()>
         .bypass_test_capture(true);
 
     let network = format!("network: {},", network);
-    child.expect_stdout(&network)?;
-    child.expect_stdout(STOP_AT_HEIGHT_REGEX)?;
+    child.expect_stdout_line_matches(&network)?;
+
+    child.expect_stdout_line_matches("starting legacy chain check")?;
+    child.expect_stdout_line_matches("no legacy chain found")?;
+
+    if let Some(test_child_predicate) = test_child_predicate.into() {
+        test_child_predicate(&mut child)?;
+    }
+
+    child.expect_stdout_line_matches(STOP_AT_HEIGHT_REGEX)?;
+
     child.kill()?;
 
     Ok(())
 }
 
 fn create_cached_database(network: Network) -> Result<()> {
-    let height = NetworkUpgrade::Canopy.activation_height(network).unwrap();
-    create_cached_database_height(network, height)
+    let height = network.mandatory_checkpoint_height();
+    create_cached_database_height(network, height, |test_child: &mut TestChild<PathBuf>| {
+        // make sure pre-cached databases finish before the mandatory checkpoint
+        test_child.expect_stdout_line_matches("CommitFinalized request")?;
+        Ok(())
+    })
 }
 
-fn sync_past_canopy(network: Network) -> Result<()> {
-    let height = NetworkUpgrade::Canopy.activation_height(network).unwrap() + 1200;
-    create_cached_database_height(network, height.unwrap())
+fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
+    let height = network.mandatory_checkpoint_height() + 1200;
+    create_cached_database_height(
+        network,
+        height.unwrap(),
+        |test_child: &mut TestChild<PathBuf>| {
+            // make sure cached database tests finish after the mandatory checkpoint,
+            // using the non-finalized state (the checkpoint_sync config must be false)
+            test_child.expect_stdout_line_matches("best non-finalized chain root")?;
+            Ok(())
+        },
+    )
 }
 
 // These tests are ignored because they're too long running to run during our
@@ -851,78 +942,48 @@ fn sync_past_canopy(network: Network) -> Result<()> {
 // drives populated by the first two tests, snapshot those drives, and then use
 // those to more quickly run the second two tests.
 
-// Sync up to the canopy activation height on mainnet and stop.
-#[cfg_attr(feature = "test_sync_to_canopy_mainnet", test)]
-fn sync_to_canopy_mainnet() {
+/// Sync up to the mandatory checkpoint height on mainnet and stop.
+#[allow(dead_code)]
+#[cfg_attr(feature = "test_sync_to_mandatory_checkpoint_mainnet", test)]
+fn sync_to_mandatory_checkpoint_mainnet() {
     zebra_test::init();
     let network = Mainnet;
     create_cached_database(network).unwrap();
 }
 
-// Sync to the canopy activation height testnet and stop.
-#[cfg_attr(feature = "test_sync_to_canopy_testnet", test)]
-fn sync_to_canopy_testnet() {
+/// Sync to the mandatory checkpoint height testnet and stop.
+#[allow(dead_code)]
+#[cfg_attr(feature = "test_sync_to_mandatory_checkpoint_testnet", test)]
+fn sync_to_mandatory_checkpoint_testnet() {
     zebra_test::init();
     let network = Testnet;
     create_cached_database(network).unwrap();
 }
 
-/// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on mainnet.
+/// Test syncing 1200 blocks (3 checkpoints) past the mandatory checkpoint on mainnet.
 ///
-/// This assumes that the config'd state is already synced at or near Canopy
-/// activation on mainnet. If the state has already synced past Canopy
+/// This assumes that the config'd state is already synced at or near the mandatory checkpoint
+/// activation on mainnet. If the state has already synced past the mandatory checkpoint
 /// activation by 1200 blocks, it will fail.
-#[cfg_attr(feature = "test_sync_past_canopy_mainnet", test)]
-fn sync_past_canopy_mainnet() {
+#[allow(dead_code)]
+#[cfg_attr(feature = "test_sync_past_mandatory_checkpoint_mainnet", test)]
+fn sync_past_mandatory_checkpoint_mainnet() {
     zebra_test::init();
     let network = Mainnet;
-    sync_past_canopy(network).unwrap();
+    sync_past_mandatory_checkpoint(network).unwrap();
 }
 
-/// Test syncing 1200 blocks (3 checkpoints) past the last checkpoint on testnet.
+/// Test syncing 1200 blocks (3 checkpoints) past the mandatory checkpoint on testnet.
 ///
-/// This assumes that the config'd state is already synced at or near Canopy
-/// activation on testnet. If the state has already synced past Canopy
+/// This assumes that the config'd state is already synced at or near the mandatory checkpoint
+/// activation on testnet. If the state has already synced past the mandatory checkpoint
 /// activation by 1200 blocks, it will fail.
-#[cfg_attr(feature = "test_sync_past_canopy_testnet", test)]
-fn sync_past_canopy_testnet() {
+#[allow(dead_code)]
+#[cfg_attr(feature = "test_sync_past_mandatory_checkpoint_testnet", test)]
+fn sync_past_mandatory_checkpoint_testnet() {
     zebra_test::init();
     let network = Testnet;
-    sync_past_canopy(network).unwrap();
-}
-
-/// Returns a random port number from the ephemeral port range.
-///
-/// Does not check if the port is already in use. It's impossible to do this
-/// check in a reliable, cross-platform way.
-///
-/// ## Usage
-///
-/// If you want a once-off random unallocated port, use
-/// `random_unallocated_port`. Don't use this function if you don't need
-/// to - it has a small risk of port conflcits.
-///
-/// Use this function when you need to use the same random port multiple
-/// times. For example: setting up both ends of a connection, or re-using
-/// the same port multiple times.
-fn random_known_port() -> u16 {
-    // Use the intersection of the IANA/Windows/macOS ephemeral port range,
-    // and the Linux ephemeral port range:
-    //   - https://en.wikipedia.org/wiki/Ephemeral_port#Range
-    // excluding ports less than 53500, to avoid:
-    //   - typical Hyper-V reservations up to 52000:
-    //      - https://github.com/googlevr/gvr-unity-sdk/issues/1002
-    //      - https://github.com/docker/for-win/issues/3171
-    //   - the MOM-Clear port 51515
-    //      - https://docs.microsoft.com/en-us/troubleshoot/windows-server/networking/service-overview-and-network-port-requirements
-    //   - the LDAP Kerberos byte-swapped reservation 53249
-    //      - https://docs.microsoft.com/en-us/troubleshoot/windows-server/identity/ldap-kerberos-server-reset-tcp-sessions
-    //   - macOS and Windows sequential ephemeral port allocations,
-    //     starting from 49152:
-    //      - https://dataplane.org/ephemeralports.html
-    use rand::Rng;
-
-    rand::thread_rng().gen_range(53500..60999)
+    sync_past_mandatory_checkpoint(network).unwrap();
 }
 
 /// Returns the "magic" port number that tells the operating system to
@@ -970,20 +1031,21 @@ async fn metrics_endpoint() -> Result<()> {
     assert!(res.status().is_success());
     let body = hyper::body::to_bytes(res).await;
     let (body, mut child) = child.kill_on_error(body)?;
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("metrics response is valid UTF-8")
-            .contains("metrics snapshot"),
-        "metrics exporter returns data in the expected format"
-    );
-
     child.kill()?;
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
+    output.any_output_line_contains(
+        "metrics snapshot",
+        &body,
+        "metrics exporter response",
+        "the metrics response header",
+    )?;
+    std::str::from_utf8(&body).expect("unexpected invalid UTF-8 in metrics exporter response");
+
     // Make sure metrics was started
-    output.stdout_contains(format!(r"Opened metrics endpoint at {}", endpoint).as_str())?;
+    output.stdout_line_contains(format!("Opened metrics endpoint at {}", endpoint).as_str())?;
 
     // [Note on port conflict](#Note on port conflict)
     output
@@ -1027,9 +1089,6 @@ async fn tracing_endpoint() -> Result<()> {
     assert!(res.status().is_success());
     let body = hyper::body::to_bytes(res).await;
     let (body, child) = child.kill_on_error(body)?;
-    assert!(std::str::from_utf8(&body).unwrap().contains(
-        "This HTTP endpoint allows dynamic control of the filter applied to\ntracing events."
-    ));
 
     // Set a filter and make sure it was changed
     let request = Request::post(url_filter.clone())
@@ -1045,9 +1104,6 @@ async fn tracing_endpoint() -> Result<()> {
     assert!(tracing_res.status().is_success());
     let tracing_body = hyper::body::to_bytes(tracing_res).await;
     let (tracing_body, mut child) = child.kill_on_error(tracing_body)?;
-    assert!(std::str::from_utf8(&tracing_body)
-        .unwrap()
-        .contains("zebrad=debug"));
 
     child.kill()?;
 
@@ -1055,8 +1111,35 @@ async fn tracing_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     // Make sure tracing endpoint was started
-    output.stdout_contains(format!(r"Opened tracing endpoint at {}", endpoint).as_str())?;
-    // Todo: Match some trace level messages from output
+    output.stdout_line_contains(format!("Opened tracing endpoint at {}", endpoint).as_str())?;
+    // TODO: Match some trace level messages from output
+
+    // Make sure the endpoint header is correct
+    // The header is split over two lines. But we don't want to require line
+    // breaks at a specific word, so we run two checks for different substrings.
+    output.any_output_line_contains(
+        "HTTP endpoint allows dynamic control of the filter",
+        &body,
+        "tracing filter endpoint response",
+        "the tracing response header",
+    )?;
+    output.any_output_line_contains(
+        "tracing events",
+        &body,
+        "tracing filter endpoint response",
+        "the tracing response header",
+    )?;
+    std::str::from_utf8(&body).expect("unexpected invalid UTF-8 in tracing filter response");
+
+    // Make sure endpoint requests change the filter
+    output.any_output_line_contains(
+        "zebrad=debug",
+        &tracing_body,
+        "tracing filter endpoint response",
+        "the modified tracing filter",
+    )?;
+    std::str::from_utf8(&tracing_body)
+        .expect("unexpected invalid UTF-8 in modified tracing filter response");
 
     // [Note on port conflict](#Note on port conflict)
     output
@@ -1081,7 +1164,10 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
     let mut config = default_test_config()?;
     config.network.listen_addr = listen_addr.parse().unwrap();
     let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
-    let regex1 = format!(r"Opened Zcash protocol endpoint at {}", listen_addr);
+    let regex1 = regex::escape(&format!(
+        "Opened Zcash protocol endpoint at {}",
+        listen_addr
+    ));
 
     // From another folder create a configuration with the same listener.
     // `network.listen_addr` will be the same in the 2 nodes.
@@ -1109,7 +1195,7 @@ fn zebra_metrics_conflict() -> Result<()> {
     let mut config = default_test_config()?;
     config.metrics.endpoint_addr = Some(listen_addr.parse().unwrap());
     let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
-    let regex1 = format!(r"Opened metrics endpoint at {}", listen_addr);
+    let regex1 = regex::escape(&format!(r"Opened metrics endpoint at {}", listen_addr));
 
     // From another folder create a configuration with the same endpoint.
     // `metrics.endpoint_addr` will be the same in the 2 nodes.
@@ -1137,7 +1223,7 @@ fn zebra_tracing_conflict() -> Result<()> {
     let mut config = default_test_config()?;
     config.tracing.endpoint_addr = Some(listen_addr.parse().unwrap());
     let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
-    let regex1 = format!(r"Opened tracing endpoint at {}", listen_addr);
+    let regex1 = regex::escape(&format!(r"Opened tracing endpoint at {}", listen_addr));
 
     // From another folder create a configuration with the same endpoint.
     // `tracing.endpoint_addr` will be the same in the 2 nodes.
@@ -1163,7 +1249,7 @@ fn zebra_state_conflict() -> Result<()> {
 
     // Windows problems with this match will be worked on at #1654
     // We are matching the whole opened path only for unix by now.
-    let regex = if cfg!(unix) {
+    let contains = if cfg!(unix) {
         let mut dir_conflict_full = PathBuf::new();
         dir_conflict_full.push(dir_conflict.path());
         dir_conflict_full.push("state");
@@ -1183,7 +1269,7 @@ fn zebra_state_conflict() -> Result<()> {
 
     check_config_conflict(
         dir_conflict.path(),
-        regex.as_str(),
+        regex::escape(&contains).as_str(),
         dir_conflict.path(),
         LOCK_FILE_ERROR.as_str(),
     )?;
@@ -1249,9 +1335,8 @@ where
 
     // Look for the success regex
     output1
-        .stdout_contains(first_stdout_regex)
+        .stdout_line_matches(first_stdout_regex)
         .context_from(&output2)?;
-    use color_eyre::Help;
     output1
         .assert_was_killed()
         .warning("Possible port conflict. Are there other acceptance tests running?")
@@ -1259,7 +1344,7 @@ where
 
     // In the second node we look for the conflict regex
     output2
-        .stderr_contains(second_stderr_regex)
+        .stderr_line_matches(second_stderr_regex)
         .context_from(&output1)?;
     output2
         .assert_was_not_killed()

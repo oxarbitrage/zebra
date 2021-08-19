@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use color_eyre::eyre::Report;
 use once_cell::sync::Lazy;
-use tower::{layer::Layer, timeout::TimeoutLayer, Service, ServiceBuilder};
+use tower::{layer::Layer, timeout::TimeoutLayer, Service};
 
 use zebra_chain::{
     block::{self, Block},
@@ -12,7 +12,7 @@ use zebra_chain::{
     serialization::ZcashDeserialize,
 };
 use zebra_state as zs;
-use zebra_test::transcript::{TransError, Transcript};
+use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use crate::Config;
 
@@ -63,68 +63,70 @@ async fn verifiers_from_network(
         + Clone
         + 'static,
 ) {
-    let state_service = ServiceBuilder::new()
-        .buffer(1)
-        .service(zs::init(zs::Config::ephemeral(), network));
+    let state_service = zs::init_test(network);
     let chain_verifier =
         crate::chain::init(Config::default(), network, state_service.clone()).await;
 
     (chain_verifier, state_service)
 }
 
-static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<Vec<(Arc<Block>, Result<block::Hash, TransError>)>> =
-    Lazy::new(|| {
-        let block: Arc<_> =
-            Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap()
-                .into();
-        let hash = Ok(block.hash());
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+    let hash = Ok(block.hash());
 
-        vec![(block, hash)]
-    });
+    vec![(block, hash)]
+});
 
 static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: Lazy<
-    Vec<(Arc<Block>, Result<block::Hash, TransError>)>,
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
 > = Lazy::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .into();
 
-    vec![(block, Err(TransError::Any))]
+    vec![(block, Err(ExpectedTranscriptError::Any))]
 });
 
-static NO_COINBASE_TRANSCRIPT: Lazy<Vec<(Arc<Block>, Result<block::Hash, TransError>)>> =
-    Lazy::new(|| {
-        let block = block_no_transactions();
+static NO_COINBASE_TRANSCRIPT: Lazy<
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block = block_no_transactions();
 
-        vec![(Arc::new(block), Err(TransError::Any))]
-    });
+    vec![(Arc::new(block), Err(ExpectedTranscriptError::Any))]
+});
 
-static NO_COINBASE_STATE_TRANSCRIPT: Lazy<Vec<(zs::Request, Result<zs::Response, TransError>)>> =
-    Lazy::new(|| {
-        let block = block_no_transactions();
-        let hash = block.hash();
+static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
+    Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block = block_no_transactions();
+    let hash = block.hash();
 
-        vec![(
-            zs::Request::Block(hash.into()),
-            Ok(zs::Response::Block(None)),
-        )]
-    });
+    vec![(
+        zs::Request::Block(hash.into()),
+        Ok(zs::Response::Block(None)),
+    )]
+});
 
-static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<Vec<(zs::Request, Result<zs::Response, TransError>)>> =
-    Lazy::new(|| {
-        let block: Arc<_> =
-            Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap()
-                .into();
-        let hash = block.hash();
+static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+    Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+    let hash = block.hash();
 
-        vec![(
-            zs::Request::Block(hash.into()),
-            Ok(zs::Response::Block(Some(block))),
-        )]
-    });
+    vec![(
+        zs::Request::Block(hash.into()),
+        Ok(zs::Response::Block(Some(block))),
+    )]
+});
 
 #[tokio::test]
 async fn verify_checkpoint_test() -> Result<(), Report> {
@@ -151,14 +153,7 @@ async fn verify_checkpoint(config: Config) -> Result<(), Report> {
 
     // Test that the chain::init function works. Most of the other tests use
     // init_from_verifiers.
-    let chain_verifier = super::init(
-        config.clone(),
-        network,
-        ServiceBuilder::new()
-            .buffer(1)
-            .service(zs::init(zs::Config::ephemeral(), network)),
-    )
-    .await;
+    let chain_verifier = super::init(config.clone(), network, zs::init_test(network)).await;
 
     // Add a timeout layer
     let chain_verifier =

@@ -14,25 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout the source code
-      uses: actions/checkout@master
+      uses: actions/checkout@v2.3.4
+      with:
+        persist-credentials: false
 
     - name: Install latest beta
       uses: actions-rs/toolchain@v1
       with:
         toolchain: beta
+        components: rust-docs
         override: true
+
+    - uses: Swatinem/rust-cache@v1
 
     - name: Install mdbook
       run: |
-        cd book
-        curl -L https://github.com/rust-lang/mdBook/releases/download/v0.4.5/mdbook-v0.4.5-x86_64-unknown-linux-gnu.tar.gz | tar xz
-        # Add the book directory to the $PATH
-        echo "$GITHUB_WORKSPACE/book" >> $GITHUB_PATH
-    
+        cargo install mdbook
+
     - name: Build Zebra book
       run: |
         mdbook build book/
-    
+
     - name: Deploy Zebra book to firebase
       uses: w9jds/firebase-action@v2.0.0
       with:

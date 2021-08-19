@@ -31,7 +31,7 @@ pub fn coinbase_is_first(block: &Block) -> Result<(), BlockError> {
         return Err(TransactionError::CoinbasePosition)?;
     }
     if rest.any(|tx| tx.contains_coinbase_input()) {
-        return Err(TransactionError::CoinbaseInputFound)?;
+        return Err(TransactionError::CoinbaseAfterFirst)?;
     }
 
     Ok(())
@@ -90,7 +90,7 @@ pub fn difficulty_is_valid(
 
 /// Returns `Ok(())` if the `EquihashSolution` is valid for `header`
 pub fn equihash_solution_is_valid(header: &Header) -> Result<(), equihash::Error> {
-    header.solution.check(&header)
+    header.solution.check(header)
 }
 
 /// Returns `Ok(())` if the block subsidy and miner fees in `block` are valid for `network`
@@ -168,10 +168,34 @@ pub fn time_is_valid_at(
 /// Check Merkle root validity.
 ///
 /// `transaction_hashes` is a precomputed list of transaction hashes.
+///
+/// # Consensus rules:
+///
+/// - The nConsensusBranchId field MUST match the consensus branch ID used for
+///  SIGHASH transaction hashes, as specifed in [ZIP-244] ([7.1]).
+/// - A SHA-256d hash in internal byte order. The merkle root is derived from the
+///  hashes of all transactions included in this block, ensuring that none of
+///  those transactions can be modified without modifying the header. [7.6]
+///
+/// # Panics
+///
+/// - If block does not have a coinbase transaction.
+///
+/// [ZIP-244]: https://zips.z.cash/zip-0244
+/// [7.1]: https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus
+/// [7.6]: https://zips.z.cash/protocol/nu5.pdf#blockheader
 pub fn merkle_root_validity(
+    network: Network,
     block: &Block,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
+    if block
+        .check_transaction_network_upgrade_consistency(network)
+        .is_err()
+    {
+        return Err(BlockError::WrongTransactionConsensusBranchId);
+    }
+
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
     if block.header.merkle_root != merkle_root {

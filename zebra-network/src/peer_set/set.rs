@@ -5,7 +5,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -39,6 +39,17 @@ use super::{
 };
 
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
+///
+/// # Security
+///
+/// The `Discover::Key` must be the transient remote address of each peer. This
+/// address may only be valid for the duration of a single connection. (For
+/// example, inbound connections have an ephemeral remote port, and proxy
+/// connections have an ephemeral local or proxy port.)
+///
+/// Otherwise, malicious peers could interfere with other peers' `PeerSet` state.
+///
+/// # Implementation
 ///
 /// This implementation is adapted from the one in `tower-balance`, and as
 /// described in that crate's documentation, it
@@ -106,7 +117,7 @@ where
     /// A shared list of peer addresses.
     ///
     /// Used for logging diagnostics.
-    address_book: Arc<Mutex<AddressBook>>,
+    address_book: Arc<std::sync::Mutex<AddressBook>>,
 }
 
 impl<D> PeerSet<D>
@@ -124,7 +135,7 @@ where
         demand_signal: mpsc::Sender<()>,
         handle_rx: tokio::sync::oneshot::Receiver<Vec<JoinHandle<Result<(), BoxError>>>>,
         inv_stream: broadcast::Receiver<(InventoryHash, SocketAddr)>,
-        address_book: Arc<Mutex<AddressBook>>,
+        address_book: Arc<std::sync::Mutex<AddressBook>>,
     ) -> Self {
         Self {
             discover,
@@ -379,8 +390,13 @@ where
         }
 
         self.last_peer_log = Some(Instant::now());
+
+        // # Correctness
+        //
         // Only log address metrics in exceptional circumstances, to avoid lock contention.
-        // TODO: replace with a watch channel that is updated in `AddressBook::update_metrics()`.
+        //
+        // TODO: replace with a watch channel that is updated in `AddressBook::update_metrics()`,
+        //       or turn the address book into a service (#1976)
         let address_metrics = self.address_book.lock().unwrap().address_metrics();
         if unready_services_len == 0 {
             warn!(
@@ -501,12 +517,16 @@ where
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
-            Request::TransactionsByHash(ref hashes) if hashes.len() == 1 => {
+            Request::TransactionsById(ref hashes) if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
-            Request::AdvertiseTransactions(_) => self.route_all(req),
+
+            // Broadcast advertisements to all peers
+            Request::AdvertiseTransactionIds(_) => self.route_all(req),
             Request::AdvertiseBlock(_) => self.route_all(req),
+
+            // Choose a random less-loaded peer for all other requests
             _ => self.route_p2c(req),
         };
         self.update_metrics();

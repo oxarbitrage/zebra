@@ -1,44 +1,24 @@
 use std::{convert::TryFrom, mem, sync::Arc};
 
-use primitive_types::U256;
 use zebra_chain::{
     block::{self, Block},
     transaction::Transaction,
     transparent,
     work::difficulty::ExpandedDifficulty,
-    work::difficulty::Work,
+    work::difficulty::{Work, U256},
 };
 
 use super::*;
 
-/// Mocks computation done during semantic validation
-pub trait Prepare {
-    fn prepare(self) -> PreparedBlock;
-}
-
-impl Prepare for Arc<Block> {
-    fn prepare(self) -> PreparedBlock {
-        let block = self;
-        let hash = block.hash();
-        let height = block.coinbase_height().unwrap();
-        let transaction_hashes = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let new_outputs = crate::utxo::new_outputs(&block);
-
-        PreparedBlock {
-            block,
-            hash,
-            height,
-            new_outputs,
-            transaction_hashes,
-        }
-    }
-}
+pub mod setup;
 
 /// Helper trait for constructing "valid" looking chains of blocks
 pub trait FakeChainHelper {
     fn make_fake_child(&self) -> Arc<Block>;
 
     fn set_work(self, work: u128) -> Arc<Block>;
+
+    fn set_block_commitment(self, commitment: [u8; 32]) -> Arc<Block>;
 }
 
 impl FakeChainHelper for Arc<Block> {
@@ -73,6 +53,12 @@ impl FakeChainHelper for Arc<Block> {
 
         let block = Arc::make_mut(&mut self);
         block.header.difficulty_threshold = expanded.into();
+        self
+    }
+
+    fn set_block_commitment(mut self, block_commitment: [u8; 32]) -> Arc<Block> {
+        let block = Arc::make_mut(&mut self);
+        block.header.commitment_bytes = block_commitment;
         self
     }
 }

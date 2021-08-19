@@ -8,10 +8,11 @@ use std::{
 use futures::prelude::*;
 use tokio::net::TcpStream;
 use tower::{discover::Change, Service, ServiceExt};
+use tracing_futures::Instrument;
 
 use crate::{BoxError, Request, Response};
 
-use super::{Client, Handshake};
+use super::{Client, ConnectedAddr, Handshake};
 
 /// A wrapper around [`peer::Handshake`] that opens a TCP connection before
 /// forwarding to the inner handshake service. Writing this as its own
@@ -50,12 +51,15 @@ where
 
     fn call(&mut self, addr: SocketAddr) -> Self::Future {
         let mut hs = self.handshaker.clone();
+        let connected_addr = ConnectedAddr::new_outbound_direct(addr);
+        let connector_span = info_span!("connector", peer = ?connected_addr);
         async move {
             let stream = TcpStream::connect(addr).await?;
             hs.ready_and().await?;
-            let client = hs.call((stream, addr)).await?;
+            let client = hs.call((stream, connected_addr)).await?;
             Ok(Change::Insert(addr, client))
         }
+        .instrument(connector_span)
         .boxed()
     }
 }

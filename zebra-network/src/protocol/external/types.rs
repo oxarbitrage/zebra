@@ -1,8 +1,8 @@
 #![allow(clippy::unit_arg)]
 
-use crate::constants::magics;
+use crate::constants::{self, magics};
 
-use std::fmt;
+use std::{cmp::max, fmt};
 
 use zebra_chain::{
     block,
@@ -17,7 +17,7 @@ use proptest_derive::Arbitrary;
 
 /// A magic number identifying the network.
 #[derive(Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Magic(pub [u8; 4]);
 
 impl fmt::Debug for Magic {
@@ -38,12 +38,57 @@ impl From<Network> for Magic {
 
 /// A protocol version number.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Version(pub u32);
 
 impl Version {
-    /// Returns the minimum network protocol version for `network` and
+    /// Returns the minimum remote node network protocol version for `network` and
+    /// `height`. Zebra disconnects from peers with lower versions.
+    ///
+    /// # Panics
+    ///
+    /// If we are incompatible with our own minimum remote protocol version.
+    pub fn min_remote_for_height(
+        network: Network,
+        height: impl Into<Option<block::Height>>,
+    ) -> Version {
+        let height = height.into().unwrap_or(block::Height(0));
+        let min_spec = Version::min_specified_for_height(network, height);
+
+        // shut down if our own version is too old
+        assert!(
+            constants::CURRENT_NETWORK_PROTOCOL_VERSION >= min_spec,
+            "Zebra does not implement the minimum specified {:?} protocol version for {:?} at {:?}",
+            NetworkUpgrade::current(network, height),
+            network,
+            height,
+        );
+
+        max(min_spec, Version::initial_min_for_network(network))
+    }
+
+    /// Returns the minimum supported network protocol version for `network`.
+    ///
+    /// This is the minimum peer version when Zebra is significantly behind current tip:
+    /// - during the initial block download,
+    /// - after Zebra restarts, and
+    /// - after Zebra's local network is slow or shut down.
+    fn initial_min_for_network(network: Network) -> Version {
+        Version::min_specified_for_upgrade(network, constants::INITIAL_MIN_NETWORK_PROTOCOL_VERSION)
+    }
+
+    /// Returns the minimum specified network protocol version for `network` and
+    /// `height`.
+    ///
+    /// This is the minimum peer version when Zebra is close to the current tip.
+    fn min_specified_for_height(network: Network, height: block::Height) -> Version {
+        let network_upgrade = NetworkUpgrade::current(network, height);
+        Version::min_specified_for_upgrade(network, network_upgrade)
+    }
+
+    /// Returns the minimum specified network protocol version for `network` and
     /// `network_upgrade`.
-    pub fn min_for_upgrade(network: Network, network_upgrade: NetworkUpgrade) -> Self {
+    fn min_specified_for_upgrade(network: Network, network_upgrade: NetworkUpgrade) -> Version {
         // TODO: Should we reject earlier protocol versions during our initial
         //       sync? zcashd accepts 170_002 or later during its initial sync.
         Version(match (network, network_upgrade) {
@@ -61,15 +106,6 @@ impl Version {
             (Mainnet, Nu5) => 170_015,
         })
     }
-
-    /// Returns the current minimum protocol version for `network` and `height`.
-    ///
-    /// Returns None if the network has no branch id at this height.
-    #[allow(dead_code)]
-    pub fn current_min(network: Network, height: block::Height) -> Version {
-        let network_upgrade = NetworkUpgrade::current(network, height);
-        Version::min_for_upgrade(network, network_upgrade)
-    }
 }
 
 bitflags! {
@@ -78,7 +114,6 @@ bitflags! {
     /// Note that bits 24-31 are reserved for temporary experiments; other
     /// service bits should be allocated via the ZIP process.
     #[derive(Default)]
-    #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
     pub struct PeerServices: u64 {
         /// NODE_NETWORK means that the node is a full node capable of serving
         /// blocks, as opposed to a light client that makes network requests but
@@ -89,6 +124,7 @@ bitflags! {
 
 /// A nonce used in the networking layer to identify messages.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Nonce(pub u64);
 
 impl Default for Nonce {
@@ -100,6 +136,7 @@ impl Default for Nonce {
 
 /// A random value to add to the seed value in a hash function.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Tweak(pub u32);
 
 impl Default for Tweak {
@@ -112,6 +149,7 @@ impl Default for Tweak {
 /// A Bloom filter consisting of a bit field of arbitrary byte-aligned
 /// size, maximum size is 36,000 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Filter(pub Vec<u8>);
 
 #[cfg(test)]
@@ -156,21 +194,21 @@ mod test {
         version_extremes(Testnet)
     }
 
-    /// Test the min_for_upgrade and current_min functions for `network` with
+    /// Test the min_specified_for_upgrade and min_specified_for_height functions for `network` with
     /// extreme values.
     fn version_extremes(network: Network) {
         zebra_test::init();
 
         assert_eq!(
-            Version::current_min(network, block::Height(0)),
-            Version::min_for_upgrade(network, BeforeOverwinter),
+            Version::min_specified_for_height(network, block::Height(0)),
+            Version::min_specified_for_upgrade(network, BeforeOverwinter),
         );
 
         // We assume that the last version we know about continues forever
         // (even if we suspect that won't be true)
         assert_ne!(
-            Version::current_min(network, block::Height::MAX),
-            Version::min_for_upgrade(network, BeforeOverwinter),
+            Version::min_specified_for_height(network, block::Height::MAX),
+            Version::min_specified_for_upgrade(network, BeforeOverwinter),
         );
     }
 
@@ -184,7 +222,7 @@ mod test {
         version_consistent(Testnet)
     }
 
-    /// Check that the min_for_upgrade and current_min functions
+    /// Check that the min_specified_for_upgrade and min_specified_for_height functions
     /// are consistent for `network`.
     fn version_consistent(network: Network) {
         zebra_test::init();
@@ -205,8 +243,8 @@ mod test {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {
                 assert_eq!(
-                    Version::min_for_upgrade(network, network_upgrade),
-                    Version::current_min(network, height)
+                    Version::min_specified_for_upgrade(network, network_upgrade),
+                    Version::min_specified_for_height(network, height)
                 );
             }
         }

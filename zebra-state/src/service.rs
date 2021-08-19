@@ -6,30 +6,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-use check::difficulty::POW_MEDIAN_BLOCK_SPAN;
 use futures::future::FutureExt;
 use non_finalized_state::{NonFinalizedState, QueuedBlocks};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+#[cfg(any(test, feature = "proptest-impl"))]
+use tower::buffer::Buffer;
 use tower::{util::BoxService, Service};
 use tracing::instrument;
 use zebra_chain::{
     block::{self, Block},
-    parameters::Network,
-    parameters::POW_AVERAGING_WINDOW,
+    parameters::{Network, NetworkUpgrade},
     transaction,
     transaction::Transaction,
     transparent,
 };
 
+use self::best_tip_height::BestTipHeight;
 use crate::{
-    request::HashOrHeight, BoxError, CommitBlockError, Config, FinalizedBlock, PreparedBlock,
-    Request, Response, Utxo, ValidateContextError,
+    constants, request::HashOrHeight, BoxError, CloneError, CommitBlockError, Config,
+    FinalizedBlock, PreparedBlock, Request, Response, ValidateContextError,
 };
 
-mod check;
+mod best_tip_height;
+pub(crate) mod check;
 mod finalized_state;
 mod non_finalized_state;
 mod pending_utxos;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+pub mod arbitrary;
+
 #[cfg(test)]
 mod tests;
 
@@ -44,9 +50,9 @@ pub type QueuedFinalized = (
     oneshot::Sender<Result<block::Hash, BoxError>>,
 );
 
-struct StateService {
+pub(crate) struct StateService {
     /// Holds data relating to finalized chain state.
-    disk: FinalizedState,
+    pub(crate) disk: FinalizedState,
     /// Holds data relating to non-finalized chain state.
     mem: NonFinalizedState,
     /// Blocks awaiting their parent blocks for contextual verification.
@@ -57,28 +63,76 @@ struct StateService {
     network: Network,
     /// Instant tracking the last time `pending_utxos` was pruned
     last_prune: Instant,
+    /// The current best chain tip height.
+    best_tip_height: BestTipHeight,
 }
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 
-    pub fn new(config: Config, network: Network) -> Self {
+    pub fn new(config: Config, network: Network) -> (Self, watch::Receiver<Option<block::Height>>) {
+        let (mut best_tip_height, best_tip_height_receiver) = BestTipHeight::new();
         let disk = FinalizedState::new(&config, network);
-        let mem = NonFinalizedState {
-            network,
-            ..Default::default()
-        };
+
+        if let Some(finalized_height) = disk.finalized_tip_height() {
+            best_tip_height.set_finalized_height(finalized_height);
+        }
+
+        let mem = NonFinalizedState::new(network);
         let queued_blocks = QueuedBlocks::default();
         let pending_utxos = PendingUtxos::default();
 
-        Self {
+        let state = Self {
             disk,
             mem,
             queued_blocks,
             pending_utxos,
             network,
             last_prune: Instant::now(),
+            best_tip_height,
+        };
+
+        tracing::info!("starting legacy chain check");
+        if let Some(tip) = state.best_tip() {
+            if let Some(nu5_activation_height) = NetworkUpgrade::Nu5.activation_height(network) {
+                if legacy_chain_check(
+                    nu5_activation_height,
+                    state.any_ancestor_blocks(tip.1),
+                    state.network,
+                )
+                .is_err()
+                {
+                    let legacy_db_path = Some(state.disk.path().to_path_buf());
+                    panic!(
+                        "Cached state contains a legacy chain. \
+                        An outdated Zebra version did not know about a recent network upgrade, \
+                        so it followed a legacy chain using outdated rules. \
+                        Hint: Delete your database, and restart Zebra to do a full sync. \
+                        Database path: {:?}",
+                        legacy_db_path,
+                    );
+                }
+            }
         }
+        tracing::info!("no legacy chain found");
+
+        (state, best_tip_height_receiver)
+    }
+
+    /// Queue a finalized block for verification and storage in the finalized state.
+    fn queue_and_commit_finalized(
+        &mut self,
+        finalized: FinalizedBlock,
+    ) -> oneshot::Receiver<Result<block::Hash, BoxError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+
+        self.disk.queue_and_commit_finalized((finalized, rsp_tx));
+
+        if let Some(finalized_height) = self.disk.finalized_tip_height() {
+            self.best_tip_height.set_finalized_height(finalized_height);
+        }
+
+        rsp_rx
     }
 
     /// Queue a non finalized block for verification and check if any queued
@@ -129,14 +183,23 @@ impl StateService {
             tracing::trace!("finalizing block past the reorg limit");
             let finalized = self.mem.finalize();
             self.disk
-                .commit_finalized_direct(finalized)
-                .expect("expected that disk errors would not occur");
+                .commit_finalized_direct(finalized, "best non-finalized chain root")
+                .expect(
+                    "expected that errors would not occur when writing to disk or updating note commitment and history trees",
+                );
         }
 
-        self.queued_blocks
-            .prune_by_height(self.disk.finalized_tip_height().expect(
+        let finalized_tip_height = self.disk.finalized_tip_height().expect(
             "Finalized state must have at least one block before committing non-finalized state",
-        ));
+        );
+        let non_finalized_tip_height = self.mem.best_tip().map(|(height, _hash)| height);
+
+        self.queued_blocks.prune_by_height(finalized_tip_height);
+
+        self.best_tip_height
+            .set_finalized_height(finalized_tip_height);
+        self.best_tip_height
+            .set_best_non_finalized_height(non_finalized_tip_height);
 
         tracing::trace!("finished processing queued block");
         rsp_rx
@@ -149,9 +212,9 @@ impl StateService {
         let parent_hash = prepared.block.header.previous_block_hash;
 
         if self.disk.finalized_tip_hash() == parent_hash {
-            self.mem.commit_new_chain(prepared);
+            self.mem.commit_new_chain(prepared, &self.disk)?;
         } else {
-            self.mem.commit_block(prepared);
+            self.mem.commit_block(prepared, &self.disk)?;
         }
 
         Ok(())
@@ -165,40 +228,62 @@ impl StateService {
     /// Attempt to validate and commit all queued blocks whose parents have
     /// recently arrived starting from `new_parent`, in breadth-first ordering.
     fn process_queued(&mut self, new_parent: block::Hash) {
-        let mut new_parents = vec![new_parent];
+        let mut new_parents: Vec<(block::Hash, Result<(), CloneError>)> =
+            vec![(new_parent, Ok(()))];
 
-        while let Some(parent_hash) = new_parents.pop() {
+        while let Some((parent_hash, parent_result)) = new_parents.pop() {
             let queued_children = self.queued_blocks.dequeue_children(parent_hash);
 
             for (child, rsp_tx) in queued_children {
                 let child_hash = child.hash;
-                tracing::trace!(?child_hash, "validating queued child");
-                let result = self
-                    .validate_and_commit(child)
-                    .map(|()| child_hash)
-                    .map_err(BoxError::from);
-                let _ = rsp_tx.send(result);
-                new_parents.push(child_hash);
+                let result;
+
+                // If the block is invalid, reject any descendant blocks.
+                //
+                // At this point, we know that the block and all its descendants
+                // are invalid, because we checked all the consensus rules before
+                // committing the block to the non-finalized state.
+                // (These checks also bind the transaction data to the block
+                // header, using the transaction merkle tree and authorizing data
+                // commitment.)
+                if let Err(ref parent_error) = parent_result {
+                    tracing::trace!(
+                        ?child_hash,
+                        ?parent_error,
+                        "rejecting queued child due to parent error"
+                    );
+                    result = Err(parent_error.clone());
+                } else {
+                    tracing::trace!(?child_hash, "validating queued child");
+                    result = self.validate_and_commit(child).map_err(CloneError::from);
+                }
+
+                let _ = rsp_tx.send(result.clone().map(|()| child_hash).map_err(BoxError::from));
+                new_parents.push((child_hash, result));
             }
         }
     }
 
     /// Check that the prepared block is contextually valid for the configured
     /// network, based on the committed finalized and non-finalized state.
+    ///
+    /// Note: some additional contextual validity checks are performed by the
+    /// non-finalized [`Chain`].
     fn check_contextual_validity(
         &mut self,
         prepared: &PreparedBlock,
     ) -> Result<(), ValidateContextError> {
         let relevant_chain = self.any_ancestor_blocks(prepared.block.header.previous_block_hash);
-        assert!(relevant_chain.len() >= POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN,
-                "contextual validation requires at least 28 (POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN) blocks");
 
-        check::block_is_contextually_valid(
+        // Security: check proof of work before any other checks
+        check::block_is_valid_for_recent_chain(
             prepared,
             self.network,
             self.disk.finalized_tip_height(),
             relevant_chain,
         )?;
+
+        check::nullifier::no_duplicates_in_finalized_chain(prepared, &self.disk)?;
 
         Ok(())
     }
@@ -278,7 +363,7 @@ impl StateService {
     }
 
     /// Return the [`Utxo`] pointed to by `outpoint` if it exists in any chain.
-    pub fn any_utxo(&self, outpoint: &transparent::OutPoint) -> Option<Utxo> {
+    pub fn any_utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.mem
             .any_utxo(outpoint)
             .or_else(|| self.queued_blocks.utxo(outpoint))
@@ -286,7 +371,7 @@ impl StateService {
     }
 
     /// Return an iterator over the relevant chain of the block identified by
-    /// `hash`.
+    /// `hash`, in order from the largest height to the genesis block.
     ///
     /// The block identified by `hash` is included in the chain of blocks yielded
     /// by the iterator. `hash` can come from any chain.
@@ -433,9 +518,20 @@ impl StateService {
         let intersection = self.find_best_chain_intersection(known_blocks);
         self.collect_best_chain_hashes(intersection, stop, max_len)
     }
+
+    /// Assert some assumptions about the prepared `block` before it is validated.
+    fn assert_block_can_be_validated(&self, block: &PreparedBlock) {
+        // required by validate_and_commit, moved here to make testing easier
+        assert!(
+            block.height > self.network.mandatory_checkpoint_height(),
+            "invalid non-finalized block height: the canopy checkpoint is mandatory, pre-canopy \
+            blocks, and the canopy activation block, must be committed to the state as finalized \
+            blocks"
+        );
+    }
 }
 
-struct Iter<'a> {
+pub(crate) struct Iter<'a> {
     service: &'a StateService,
     state: IterState,
 }
@@ -569,7 +665,10 @@ impl Service<Request> for StateService {
             Request::CommitBlock(prepared) => {
                 metrics::counter!("state.requests", 1, "type" => "commit_block");
 
-                self.pending_utxos.check_against(&prepared.new_outputs);
+                self.assert_block_can_be_validated(&prepared);
+
+                self.pending_utxos
+                    .check_against_ordered(&prepared.new_outputs);
                 let rsp_rx = self.queue_and_commit_non_finalized(prepared);
 
                 async move {
@@ -584,10 +683,8 @@ impl Service<Request> for StateService {
             Request::CommitFinalizedBlock(finalized) => {
                 metrics::counter!("state.requests", 1, "type" => "commit_finalized_block");
 
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-
                 self.pending_utxos.check_against(&finalized.new_outputs);
-                self.disk.queue_and_commit_finalized((finalized, rsp_tx));
+                let rsp_rx = self.queue_and_commit_finalized(finalized);
 
                 async move {
                     rsp_rx
@@ -676,6 +773,75 @@ impl Service<Request> for StateService {
 /// possible to construct multiple state services in the same application (as
 /// long as they, e.g., use different storage locations), but doing so is
 /// probably not what you want.
-pub fn init(config: Config, network: Network) -> BoxService<Request, Response, BoxError> {
-    BoxService::new(StateService::new(config, network))
+pub fn init(
+    config: Config,
+    network: Network,
+) -> (
+    BoxService<Request, Response, BoxError>,
+    watch::Receiver<Option<block::Height>>,
+) {
+    let (state_service, best_tip_height) = StateService::new(config, network);
+
+    (BoxService::new(state_service), best_tip_height)
+}
+
+/// Initialize a state service with an ephemeral [`Config`] and a buffer with a single slot.
+///
+/// This can be used to create a state service for testing. See also [`init`].
+#[cfg(any(test, feature = "proptest-impl"))]
+pub fn init_test(network: Network) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
+    let (state_service, _) = StateService::new(Config::ephemeral(), network);
+
+    Buffer::new(BoxService::new(state_service), 1)
+}
+
+/// Check if zebra is following a legacy chain and return an error if so.
+fn legacy_chain_check<I>(
+    nu5_activation_height: block::Height,
+    ancestors: I,
+    network: Network,
+) -> Result<(), BoxError>
+where
+    I: Iterator<Item = Arc<Block>>,
+{
+    for (count, block) in ancestors.enumerate() {
+        // Stop checking if the chain reaches Canopy. We won't find any more V5 transactions,
+        // so the rest of our checks are useless.
+        //
+        // If the cached tip is close to NU5 activation, but there aren't any V5 transactions in the
+        // chain yet, we could reach MAX_BLOCKS_TO_CHECK in Canopy, and incorrectly return an error.
+        if block
+            .coinbase_height()
+            .expect("valid blocks have coinbase heights")
+            < nu5_activation_height
+        {
+            return Ok(());
+        }
+
+        // If we are past our NU5 activation height, but there are no V5 transactions in recent blocks,
+        // the Zebra instance that verified those blocks had no NU5 activation height.
+        if count >= constants::MAX_LEGACY_CHAIN_BLOCKS {
+            return Err("giving up after checking too many blocks".into());
+        }
+
+        // If a transaction `network_upgrade` field is different from the network upgrade calculated
+        // using our activation heights, the Zebra instance that verified those blocks had different
+        // network upgrade heights.
+        block
+            .check_transaction_network_upgrade_consistency(network)
+            .map_err(|_| "inconsistent network upgrade found in transaction")?;
+
+        // If we find at least one transaction with a valid `network_upgrade` field, the Zebra instance that
+        // verified those blocks used the same network upgrade heights. (Up to this point in the chain.)
+        let has_network_upgrade = block
+            .transactions
+            .iter()
+            .find_map(|trans| trans.network_upgrade())
+            .is_some();
+        if has_network_upgrade {
+            return Ok(());
+        }
+    }
+
+    Ok(())
 }

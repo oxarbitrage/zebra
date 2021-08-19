@@ -1,13 +1,22 @@
-use std::env;
-use std::io::ErrorKind;
+use std::{env, io::ErrorKind};
 
 use proptest::{arbitrary::any, prelude::*, test_runner::Config};
+
 use zebra_test::prelude::*;
 
-use crate::serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize};
-use crate::{block, parameters::Network, LedgerState};
+use crate::{
+    parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
+    serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
+    LedgerState,
+};
 
-use super::super::{serialize::MAX_BLOCK_BYTES, *};
+use super::super::{
+    arbitrary::{allow_all_transparent_coinbase_spends, PREVOUTS_CHAIN_HEIGHT},
+    serialize::MAX_BLOCK_BYTES,
+    *,
+};
+
+const DEFAULT_BLOCK_ROUNDTRIP_PROPTEST_CASES: u32 = 16;
 
 proptest! {
     #[test]
@@ -17,7 +26,12 @@ proptest! {
         let bytes = hash.zcash_serialize_to_vec()?;
         let other_hash: Hash = bytes.zcash_deserialize_into()?;
 
-        prop_assert_eq![hash, other_hash];
+        prop_assert_eq![&hash, &other_hash];
+
+        let bytes2 = other_hash
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+        prop_assert_eq![bytes, bytes2, "bytes must be equal if structs are equal"];
     }
 
     #[test]
@@ -36,7 +50,12 @@ proptest! {
         let bytes = header.zcash_serialize_to_vec()?;
         let other_header = bytes.zcash_deserialize_into()?;
 
-        prop_assert_eq![header, other_header];
+        prop_assert_eq![&header, &other_header];
+
+        let bytes2 = other_header
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+        prop_assert_eq![bytes, bytes2, "bytes must be equal if structs are equal"];
     }
 
     #[test]
@@ -63,14 +82,13 @@ proptest! {
     #![proptest_config(Config::with_cases(env::var("PROPTEST_CASES")
                                           .ok()
                                           .and_then(|v| v.parse().ok())
-                                          .unwrap_or(16)))]
+                                          .unwrap_or(DEFAULT_BLOCK_ROUNDTRIP_PROPTEST_CASES)))]
 
     #[test]
     fn block_roundtrip(block in any::<Block>(), network in any::<Network>()) {
         zebra_test::init();
 
         let bytes = block.zcash_serialize_to_vec()?;
-        let bytes = &mut bytes.as_slice();
 
         // Check the block commitment
         let commitment = block.commitment(network);
@@ -84,7 +102,12 @@ proptest! {
             // Check deserialization
             let other_block = bytes.zcash_deserialize_into()?;
 
-            prop_assert_eq![block, other_block];
+            prop_assert_eq![&block, &other_block];
+
+            let bytes2 = other_block
+                .zcash_serialize_to_vec()
+                .expect("vec serialization is infallible");
+            prop_assert_eq![bytes, bytes2, "bytes must be equal if structs are equal"];
         } else {
             let serialization_err = bytes.zcash_deserialize_into::<Block>()
                 .expect_err("blocks larger than the maximum size should fail");
@@ -101,21 +124,123 @@ proptest! {
     }
 }
 
+/// Test [`Block::coinbase_height`].
+///
+/// Also makes sure our coinbase strategy correctly generates blocks with
+/// coinbase transactions.
 #[test]
 fn blocks_have_coinbase() -> Result<()> {
     zebra_test::init();
 
-    let strategy = any::<block::Height>()
-        .prop_map(|tip_height| LedgerState {
-            tip_height,
-            is_coinbase: true,
-            network: Network::Mainnet,
-        })
-        .prop_flat_map(Block::arbitrary_with);
+    let strategy =
+        LedgerState::coinbase_strategy(None, None, false).prop_flat_map(Block::arbitrary_with);
 
     proptest!(|(block in strategy)| {
         let has_coinbase = block.coinbase_height().is_some();
         prop_assert!(has_coinbase);
+    });
+
+    Ok(())
+}
+
+/// Make sure our genesis strategy generates blocks with the correct coinbase
+/// height and previous block hash.
+#[test]
+fn block_genesis_strategy() -> Result<()> {
+    zebra_test::init();
+
+    let strategy =
+        LedgerState::genesis_strategy(None, None, false).prop_flat_map(Block::arbitrary_with);
+
+    proptest!(|(block in strategy)| {
+        prop_assert_eq!(block.coinbase_height(), Some(Height(0)));
+        prop_assert_eq!(block.header.previous_block_hash, GENESIS_PREVIOUS_BLOCK_HASH);
+    });
+
+    Ok(())
+}
+
+/// Make sure our genesis partial chain strategy generates a chain with:
+/// - correct coinbase heights
+/// - correct previous block hashes
+/// - no transparent spends in the genesis block, because genesis transparent outputs are ignored
+#[test]
+fn genesis_partial_chain_strategy() -> Result<()> {
+    zebra_test::init();
+
+    let strategy = LedgerState::genesis_strategy(None, None, false).prop_flat_map(|init| {
+        Block::partial_chain_strategy(
+            init,
+            PREVOUTS_CHAIN_HEIGHT,
+            allow_all_transparent_coinbase_spends,
+        )
+    });
+
+    proptest!(|(chain in strategy)| {
+        let mut height = Height(0);
+        let mut previous_block_hash = GENESIS_PREVIOUS_BLOCK_HASH;
+
+        for block in chain {
+            prop_assert_eq!(block.coinbase_height(), Some(height));
+            prop_assert_eq!(block.header.previous_block_hash, previous_block_hash);
+
+            // block 1 can have spends of transparent outputs
+            // of previous transactions in the same block
+            if height == Height(0) {
+                prop_assert_eq!(
+                    block
+                        .transactions
+                        .iter()
+                        .flat_map(|t| t.inputs())
+                        .filter_map(|i| i.outpoint())
+                        .count(),
+                    0,
+                    "unexpected transparent prevout inputs at height {:?}: genesis transparent outputs are ignored",
+                    height,
+                );
+            }
+
+            height = Height(height.0 + 1);
+            previous_block_hash = block.hash();
+        }
+    });
+
+    Ok(())
+}
+
+/// Make sure our block height strategy generates a chain with:
+/// - correct coinbase heights
+/// - correct previous block hashes
+#[test]
+fn arbitrary_height_partial_chain_strategy() -> Result<()> {
+    zebra_test::init();
+
+    let strategy = any::<Height>()
+        .prop_flat_map(|height| LedgerState::height_strategy(height, None, None, false))
+        .prop_flat_map(|init| {
+            Block::partial_chain_strategy(
+                init,
+                PREVOUTS_CHAIN_HEIGHT,
+                allow_all_transparent_coinbase_spends,
+            )
+        });
+
+    proptest!(|(chain in strategy)| {
+        let mut height = None;
+        let mut previous_block_hash = None;
+
+        for block in chain {
+            if height.is_none() {
+                prop_assert!(block.coinbase_height().is_some());
+                height = block.coinbase_height();
+            } else {
+                height = Some(Height(height.unwrap().0 + 1));
+                prop_assert_eq!(block.coinbase_height(), height);
+                prop_assert_eq!(Some(block.header.previous_block_hash), previous_block_hash);
+            }
+
+            previous_block_hash = Some(block.hash());
+        }
     });
 
     Ok(())

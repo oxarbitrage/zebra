@@ -16,12 +16,10 @@ use super::super::block;
 /// activation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Commitment {
-    /// [Pre-Sapling] Reserved field.
+    /// [Pre-Sapling] "A reserved field, to be ignored."
     ///
-    /// The value of this field MUST be all zeroes.
-    ///
-    /// This field is verified in `Commitment::from_bytes`.
-    PreSaplingReserved,
+    /// This field is not verified.
+    PreSaplingReserved([u8; 32]),
 
     /// [Sapling and Blossom] The final Sapling treestate of this block.
     ///
@@ -63,6 +61,13 @@ pub enum Commitment {
     /// chain history hash in their activation block, via the previous block
     /// hash field.)
     ///
+    /// Since Zebra's mandatory checkpoint includes Canopy activation, we only
+    /// need to verify the chain history root from `Canopy + 1 block` onwards,
+    /// using a new history tree based on the `Canopy` activation block.
+    ///
+    /// NU5 and later upgrades use the [`ChainHistoryBlockTxAuthCommitment`]
+    /// variant.
+    ///
     /// TODO: this field is verified during contextual verification
     ChainHistoryRoot(ChainHistoryMmrRootHash),
 
@@ -71,8 +76,10 @@ pub enum Commitment {
     /// - the auth data merkle tree covering this block.
     ///
     /// The chain history Merkle Mountain Range tree commits to the previous
-    /// block and all ancestors in the current network upgrade. The auth data
-    /// merkle tree commits to this block.
+    /// block and all ancestors in the current network upgrade. (A new chain
+    /// history tree starts from each network upgrade's activation block.)
+    ///
+    /// The auth data merkle tree commits to this block.
     ///
     /// This commitment supports the FlyClient protocol and non-malleable
     /// transaction IDs. See ZIP-221 and ZIP-244 for details.
@@ -84,7 +91,7 @@ pub enum Commitment {
 }
 
 /// The required value of reserved `Commitment`s.
-pub(crate) const RESERVED_BYTES: [u8; 32] = [0; 32];
+pub(crate) const CHAIN_HISTORY_ACTIVATION_RESERVED: [u8; 32] = [0; 32];
 
 impl Commitment {
     /// Returns `bytes` as the Commitment variant for `network` and `height`.
@@ -97,16 +104,10 @@ impl Commitment {
         use CommitmentError::*;
 
         match NetworkUpgrade::current(network, height) {
-            Genesis | BeforeOverwinter | Overwinter => {
-                if bytes == RESERVED_BYTES {
-                    Ok(PreSaplingReserved)
-                } else {
-                    Err(InvalidPreSaplingReserved { actual: bytes })
-                }
-            }
+            Genesis | BeforeOverwinter | Overwinter => Ok(PreSaplingReserved(bytes)),
             Sapling | Blossom => Ok(FinalSaplingRoot(sapling::tree::Root(bytes))),
             Heartwood if Some(height) == Heartwood.activation_height(network) => {
-                if bytes == RESERVED_BYTES {
+                if bytes == CHAIN_HISTORY_ACTIVATION_RESERVED {
                     Ok(ChainHistoryActivationReserved)
                 } else {
                     Err(InvalidChainHistoryActivationReserved { actual: bytes })
@@ -125,9 +126,9 @@ impl Commitment {
         use Commitment::*;
 
         match self {
-            PreSaplingReserved => RESERVED_BYTES,
+            PreSaplingReserved(bytes) => bytes,
             FinalSaplingRoot(hash) => hash.0,
-            ChainHistoryActivationReserved => RESERVED_BYTES,
+            ChainHistoryActivationReserved => CHAIN_HISTORY_ACTIVATION_RESERVED,
             ChainHistoryRoot(hash) => hash.0,
             ChainHistoryBlockTxAuthCommitment(hash) => hash.0,
         }
@@ -141,6 +142,18 @@ impl Commitment {
 //    - move to a separate file
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChainHistoryMmrRootHash([u8; 32]);
+
+impl From<[u8; 32]> for ChainHistoryMmrRootHash {
+    fn from(hash: [u8; 32]) -> Self {
+        ChainHistoryMmrRootHash(hash)
+    }
+}
+
+impl From<ChainHistoryMmrRootHash> for [u8; 32] {
+    fn from(hash: ChainHistoryMmrRootHash) -> Self {
+        hash.0
+    }
+}
 
 /// A block commitment to chain history and transaction auth.
 /// - the chain history tree for all ancestors in the current network upgrade,
@@ -156,24 +169,31 @@ pub struct ChainHistoryMmrRootHash([u8; 32]);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChainHistoryBlockTxAuthCommitmentHash([u8; 32]);
 
+impl From<[u8; 32]> for ChainHistoryBlockTxAuthCommitmentHash {
+    fn from(hash: [u8; 32]) -> Self {
+        ChainHistoryBlockTxAuthCommitmentHash(hash)
+    }
+}
+
+impl From<ChainHistoryBlockTxAuthCommitmentHash> for [u8; 32] {
+    fn from(hash: ChainHistoryBlockTxAuthCommitmentHash) -> Self {
+        hash.0
+    }
+}
+
 /// Errors that can occur when checking RootHash consensus rules.
 ///
 /// Each error variant corresponds to a consensus rule, so enumerating
 /// all possible verification failures enumerates the consensus rules we
 /// implement, and ensures that we don't reject blocks or transactions
 /// for a non-enumerated reason.
-#[allow(dead_code)]
-#[derive(Error, Debug, PartialEq)]
+#[allow(dead_code, missing_docs)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum CommitmentError {
-    #[error("invalid pre-Sapling reserved committment: expected all zeroes, actual: {actual:?}")]
-    InvalidPreSaplingReserved {
-        // TODO: are these fields a security risk? If so, open a ticket to remove
-        // similar fields across Zebra
-        actual: [u8; 32],
-    },
-
     #[error("invalid final sapling root: expected {expected:?}, actual: {actual:?}")]
     InvalidFinalSaplingRoot {
+        // TODO: are these fields a security risk? If so, open a ticket to remove
+        // similar fields across Zebra
         expected: [u8; 32],
         actual: [u8; 32],
     },

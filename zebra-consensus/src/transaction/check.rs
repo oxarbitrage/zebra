@@ -3,116 +3,71 @@
 //! Code in this file can freely assume that no pre-V4 transactions are present.
 
 use zebra_chain::{
-    sapling::{AnchorVariant, Output, PerSpendAnchor, ShieldedData, Spend},
+    amount::{Amount, NonNegative},
+    block::Height,
+    orchard::Flags,
+    parameters::{Network, NetworkUpgrade},
+    sapling::{Output, PerSpendAnchor, Spend},
     transaction::Transaction,
 };
 
 use crate::error::TransactionError;
 
+use std::convert::TryFrom;
+
 /// Checks that the transaction has inputs and outputs.
 ///
-/// More specifically:
+/// For `Transaction::V4`:
+/// * At least one of `tx_in_count`, `nSpendsSapling`, and `nJoinSplit` MUST be non-zero.
+/// * At least one of `tx_out_count`, `nOutputsSapling`, and `nJoinSplit` MUST be non-zero.
 ///
-/// * at least one of tx_in_count, nShieldedSpend, and nJoinSplit MUST be non-zero.
-/// * at least one of tx_out_count, nShieldedOutput, and nJoinSplit MUST be non-zero.
+/// For `Transaction::V5`:
+/// * This condition must hold: `tx_in_count` > 0 or `nSpendsSapling` > 0 or
+/// (`nActionsOrchard` > 0 and `enableSpendsOrchard` = 1)
+/// * This condition must hold: `tx_out_count` > 0 or `nOutputsSapling` > 0 or
+/// (`nActionsOrchard` > 0 and `enableOutputsOrchard` = 1)
+///
+/// This check counts both `Coinbase` and `PrevOut` transparent inputs.
 ///
 /// https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
 pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
-    // The consensus rule is written in terms of numbers, but our transactions
-    // hold enum'd data. Mixing pattern matching and numerical checks is risky,
-    // so convert everything to counts and sum up.
-    match tx {
-        Transaction::V4 {
-            inputs,
-            outputs,
-            joinsplit_data,
-            sapling_shielded_data,
-            ..
-        } => {
-            let tx_in_count = inputs.len();
-            let tx_out_count = outputs.len();
-            let n_joinsplit = joinsplit_data
-                .as_ref()
-                .map(|d| d.joinsplits().count())
-                .unwrap_or(0);
-            let n_shielded_spend = sapling_shielded_data
-                .as_ref()
-                .map(|d| d.spends().count())
-                .unwrap_or(0);
-            let n_shielded_output = sapling_shielded_data
-                .as_ref()
-                .map(|d| d.outputs().count())
-                .unwrap_or(0);
-
-            if tx_in_count + n_shielded_spend + n_joinsplit == 0 {
-                Err(TransactionError::NoInputs)
-            } else if tx_out_count + n_shielded_output + n_joinsplit == 0 {
-                Err(TransactionError::NoOutputs)
-            } else {
-                Ok(())
-            }
-        }
-        Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-            unreachable!("tx version is checked first")
-        }
-        Transaction::V5 { .. } => {
-            unimplemented!("v5 transaction format as specified in ZIP-225")
-        }
-    }
-}
-
-/// Check that if there are no Spends or Outputs, that valueBalance is also 0.
-///
-/// https://zips.z.cash/protocol/protocol.pdf#consensusfrombitcoin
-pub fn shielded_balances_match<AnchorV>(
-    shielded_data: &ShieldedData<AnchorV>,
-) -> Result<(), TransactionError>
-where
-    AnchorV: AnchorVariant + Clone,
-{
-    if (shielded_data.spends().count() + shielded_data.outputs().count() != 0)
-        || i64::from(shielded_data.value_balance) == 0
-    {
-        Ok(())
+    if !tx.has_transparent_or_shielded_inputs() {
+        Err(TransactionError::NoInputs)
+    } else if !tx.has_transparent_or_shielded_outputs() {
+        Err(TransactionError::NoOutputs)
     } else {
-        Err(TransactionError::BadBalance)
+        Ok(())
     }
 }
 
-/// Check that a coinbase tx does not have any JoinSplit or Spend descriptions.
+/// Check that a coinbase transaction has no PrevOut inputs, JoinSplits, or spends.
+///
+/// A coinbase transaction MUST NOT have any transparent inputs, JoinSplit descriptions,
+/// or Spend descriptions.
+///
+/// In a version 5 coinbase transaction, the enableSpendsOrchard flag MUST be 0.
+///
+/// This check only counts `PrevOut` transparent inputs.
 ///
 /// https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-pub fn coinbase_tx_no_joinsplit_or_spend(tx: &Transaction) -> Result<(), TransactionError> {
+pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), TransactionError> {
     if tx.is_coinbase() {
-        match tx {
-            // Check if there is any JoinSplitData.
-            Transaction::V4 {
-                joinsplit_data: Some(_),
-                ..
-            } => Err(TransactionError::CoinbaseHasJoinSplit),
+        if tx.contains_prevout_input() {
+            return Err(TransactionError::CoinbaseHasPrevOutInput);
+        } else if tx.joinsplit_count() > 0 {
+            return Err(TransactionError::CoinbaseHasJoinSplit);
+        } else if tx.sapling_spends_per_anchor().count() > 0 {
+            return Err(TransactionError::CoinbaseHasSpend);
+        }
 
-            // The ShieldedData contains both Spends and Outputs, and Outputs
-            // are allowed post-Heartwood, so we have to count Spends.
-            Transaction::V4 {
-                sapling_shielded_data: Some(sapling_shielded_data),
-                ..
-            } if sapling_shielded_data.spends().count() > 0 => {
-                Err(TransactionError::CoinbaseHasSpend)
-            }
-
-            Transaction::V4 { .. } => Ok(()),
-
-            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-                unreachable!("tx version is checked first")
-            }
-
-            Transaction::V5 { .. } => {
-                unimplemented!("v5 coinbase validation as specified in ZIP-225 and the draft spec")
+        if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+            if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+                return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
             }
         }
-    } else {
-        Ok(())
     }
+
+    Ok(())
 }
 
 /// Check that a Spend description's cv and rk are not of small order,
@@ -149,4 +104,34 @@ pub fn output_cv_epk_not_small_order(output: &Output) -> Result<(), TransactionE
     } else {
         Ok(())
     }
+}
+
+/// Check if a transaction is adding to the sprout pool after Canopy
+/// network upgrade given a block height and a network.
+///
+/// https://zips.z.cash/zip-0211
+/// https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+pub fn disabled_add_to_sprout_pool(
+    tx: &Transaction,
+    height: Height,
+    network: Network,
+) -> Result<(), TransactionError> {
+    let canopy_activation_height = NetworkUpgrade::Canopy
+        .activation_height(network)
+        .expect("Canopy activation height must be present for both networks");
+
+    // [Canopy onward]: `vpub_old` MUST be zero.
+    // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+    if height >= canopy_activation_height {
+        let zero = Amount::<NonNegative>::try_from(0).expect("an amount of 0 is always valid");
+
+        let tx_sprout_pool = tx.output_values_to_sprout();
+        for vpub_old in tx_sprout_pool {
+            if *vpub_old != zero {
+                return Err(TransactionError::DisabledAddToSproutPool);
+            }
+        }
+    }
+
+    Ok(())
 }

@@ -1,18 +1,23 @@
 //! Definitions of network messages.
 
-use std::error::Error;
-use std::{fmt, net, sync::Arc};
+use std::{error::Error, fmt, net, sync::Arc};
 
 use chrono::{DateTime, Utc};
 
 use zebra_chain::{
     block::{self, Block},
-    transaction::Transaction,
+    transaction::UnminedTx,
 };
 
-use super::inv::InventoryHash;
-use super::types::*;
 use crate::meta_addr::MetaAddr;
+
+use super::{inv::InventoryHash, types::*};
+
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest_derive::Arbitrary;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+use zebra_chain::serialization::arbitrary::datetime_full;
 
 /// A Bitcoin-like network message for the Zcash protocol.
 ///
@@ -31,6 +36,7 @@ use crate::meta_addr::MetaAddr;
 ///
 /// [btc_wiki_protocol]: https://en.bitcoin.it/wiki/Protocol_documentation
 #[derive(Clone, Eq, PartialEq, Debug)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Message {
     /// A `version` message.
     ///
@@ -47,6 +53,12 @@ pub enum Message {
         services: PeerServices,
 
         /// The time when the version message was sent.
+        ///
+        /// This is a 64-bit field. Zebra rejects out-of-range times as invalid.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "datetime_full()")
+        )]
         timestamp: DateTime<Utc>,
 
         /// The network address of the node receiving this message, and its
@@ -157,6 +169,7 @@ pub enum Message {
     /// `getblocks`.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#inv)
+    /// [ZIP-239](https://zips.z.cash/zip-0239)
     Inv(Vec<InventoryHash>),
 
     /// A `getheaders` message.
@@ -199,6 +212,7 @@ pub enum Message {
     /// Other item or non-item messages can come before or after the batch.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#getdata)
+    /// [ZIP-239](https://zips.z.cash/zip-0239)
     /// [zcashd code](https://github.com/zcash/zcash/blob/e7b425298f6d9a54810cb7183f00be547e4d9415/src/main.cpp#L5523)
     GetData(Vec<InventoryHash>),
 
@@ -209,8 +223,10 @@ pub enum Message {
 
     /// A `tx` message.
     ///
+    /// This message is used to advertise unmined transactions for the mempool.
+    ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#tx)
-    Tx(Arc<Transaction>),
+    Tx(UnminedTx),
 
     /// A `notfound` message.
     ///
@@ -223,6 +239,7 @@ pub enum Message {
     /// silently skipped, without any `NotFound` messages.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#notfound)
+    /// [ZIP-239](https://zips.z.cash/zip-0239)
     /// [zcashd code](https://github.com/zcash/zcash/blob/e7b425298f6d9a54810cb7183f00be547e4d9415/src/main.cpp#L5632)
     // See note above on `Inventory`.
     NotFound(Vec<InventoryHash>),
@@ -307,6 +324,7 @@ where
 ///
 /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#reject)
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[repr(u8)]
 #[allow(missing_docs)]
 pub enum RejectReason {

@@ -1,4 +1,4 @@
-//! The addressbook manages information about what peers exist, when they were
+//! The `AddressBook` manages information about what peers exist, when they were
 //! seen, and what services they provide.
 
 use std::{
@@ -8,22 +8,60 @@ use std::{
     time::Instant,
 };
 
-use chrono::{DateTime, Utc};
 use tracing::Span;
 
-use crate::{constants, types::MetaAddr, PeerAddrState};
+use zebra_chain::serialization::canonical_socket_addr;
 
-/// A database of peers, their advertised services, and information on when they
-/// were last seen.
-#[derive(Debug)]
+use crate::{meta_addr::MetaAddrChange, types::MetaAddr, PeerAddrState};
+
+#[cfg(test)]
+mod tests;
+
+/// A database of peer listener addresses, their advertised services, and
+/// information on when they were last seen.
+///
+/// # Security
+///
+/// Address book state must be based on outbound connections to peers.
+///
+/// If the address book is updated incorrectly:
+/// - malicious peers can interfere with other peers' `AddressBook` state,
+///   or
+/// - Zebra can advertise unreachable addresses to its own peers.
+///
+/// ## Adding Addresses
+///
+/// The address book should only contain Zcash listener port addresses from peers
+/// on the configured network. These addresses can come from:
+/// - DNS seeders
+/// - addresses gossiped by other peers
+/// - the canonical address (`Version.address_from`) provided by each peer,
+///   particularly peers on inbound connections.
+///
+/// The remote addresses of inbound connections must not be added to the address
+/// book, because they contain ephemeral outbound ports, not listener ports.
+///
+/// Isolated connections must not add addresses or update the address book.
+///
+/// ## Updating Address State
+///
+/// Updates to address state must be based on outbound connections to peers.
+///
+/// Updates must not be based on:
+/// - the remote addresses of inbound connections, or
+/// - the canonical address of any connection.
+#[derive(Clone, Debug)]
 pub struct AddressBook {
-    /// Each known peer address has a matching `MetaAddr`
+    /// Each known peer address has a matching `MetaAddr`.
     by_addr: HashMap<SocketAddr, MetaAddr>,
+
+    /// The local listener address.
+    local_listener: SocketAddr,
 
     /// The span for operations on this address book.
     span: Span,
 
-    /// The last time we logged a message about the address metrics
+    /// The last time we logged a message about the address metrics.
     last_address_log: Option<Instant>,
 }
 
@@ -33,8 +71,11 @@ pub struct AddressMetrics {
     /// The number of addresses in the `Responded` state.
     responded: usize,
 
-    /// The number of addresses in the `NeverAttempted` state.
-    never_attempted: usize,
+    /// The number of addresses in the `NeverAttemptedGossiped` state.
+    never_attempted_gossiped: usize,
+
+    /// The number of addresses in the `NeverAttemptedAlternate` state.
+    never_attempted_alternate: usize,
 
     /// The number of addresses in the `Failed` state.
     failed: usize,
@@ -51,13 +92,15 @@ pub struct AddressMetrics {
 
 #[allow(clippy::len_without_is_empty)]
 impl AddressBook {
-    /// Construct an `AddressBook` with the given [`tracing::Span`].
-    pub fn new(span: Span) -> AddressBook {
+    /// Construct an [`AddressBook`] with the given `local_listener` and
+    /// [`tracing::Span`].
+    pub fn new(local_listener: SocketAddr, span: Span) -> AddressBook {
         let constructor_span = span.clone();
         let _guard = constructor_span.enter();
 
         let mut new_book = AddressBook {
             by_addr: HashMap::default(),
+            local_listener: canonical_socket_addr(local_listener),
             span,
             last_address_log: None,
         };
@@ -66,60 +109,140 @@ impl AddressBook {
         new_book
     }
 
+    /// Construct an [`AddressBook`] with the given `local_listener`,
+    /// [`tracing::Span`], and addresses.
+    ///
+    /// This constructor can be used to break address book invariants,
+    /// so it should only be used in tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn new_with_addrs(
+        local_listener: SocketAddr,
+        span: Span,
+        addrs: impl IntoIterator<Item = MetaAddr>,
+    ) -> AddressBook {
+        let mut new_book = AddressBook::new(local_listener, span);
+
+        let addrs = addrs
+            .into_iter()
+            .map(|mut meta_addr| {
+                meta_addr.addr = canonical_socket_addr(meta_addr.addr);
+                meta_addr
+            })
+            .filter(MetaAddr::address_is_valid_for_outbound)
+            .map(|meta_addr| (meta_addr.addr, meta_addr));
+        new_book.by_addr.extend(addrs);
+
+        new_book.update_metrics();
+        new_book
+    }
+
+    /// Get the local listener address.
+    ///
+    /// This address contains minimal state, but it is not sanitized.
+    pub fn local_listener_meta_addr(&self) -> MetaAddr {
+        MetaAddr::new_local_listener_change(&self.local_listener)
+            .into_new_meta_addr()
+            .expect("unexpected invalid new local listener addr")
+    }
+
     /// Get the contents of `self` in random order with sanitized timestamps.
     pub fn sanitized(&self) -> Vec<MetaAddr> {
         use rand::seq::SliceRandom;
         let _guard = self.span.enter();
-        let mut peers = self
-            .peers()
-            .map(|a| MetaAddr::sanitize(&a))
+
+        let mut peers = self.by_addr.clone();
+
+        // Unconditionally add our local listener address to the advertised peers,
+        // to replace any self-connection failures. The address book and change
+        // constructors make sure that the SocketAddr is canonical.
+        let local_listener = self.local_listener_meta_addr();
+        peers.insert(local_listener.addr, local_listener);
+
+        // Then sanitize and shuffle
+        let mut peers = peers
+            .values()
+            .filter_map(MetaAddr::sanitize)
+            // Security: remove peers that:
+            //   - last responded more than three hours ago, or
+            //   - haven't responded yet but were reported last seen more than three hours ago
+            //
+            // This prevents Zebra from gossiping nodes that are likely unreachable. Gossiping such
+            // nodes impacts the network health, because connection attempts end up being wasted on
+            // peers that are less likely to respond.
+            .filter(MetaAddr::is_active_for_gossip)
             .collect::<Vec<_>>();
         peers.shuffle(&mut rand::thread_rng());
         peers
     }
 
-    /// Returns true if the address book has an entry for `addr`.
-    pub fn contains_addr(&self, addr: &SocketAddr) -> bool {
-        let _guard = self.span.enter();
-        self.by_addr.contains_key(addr)
-    }
-
-    /// Returns the entry corresponding to `addr`, or `None` if it does not exist.
-    pub fn get_by_addr(&self, addr: SocketAddr) -> Option<MetaAddr> {
-        let _guard = self.span.enter();
-        self.by_addr.get(&addr).cloned()
-    }
-
-    /// Add `new` to the address book, updating the previous entry if `new` is
-    /// more recent or discarding `new` if it is stale.
+    /// Apply `change` to the address book, returning the updated `MetaAddr`,
+    /// if the change was valid.
     ///
-    /// ## Note
+    /// # Correctness
     ///
-    /// All changes should go through `update` or `take`, to ensure accurate metrics.
-    pub fn update(&mut self, new: MetaAddr) {
+    /// All changes should go through `update`, so that the address book
+    /// only contains valid outbound addresses.
+    ///
+    /// Change addresses must be canonical `SocketAddr`s. This makes sure that
+    /// each address book entry has a unique IP address.
+    ///
+    /// # Security
+    ///
+    /// This function must apply every attempted, responded, and failed change
+    /// to the address book. This prevents rapid reconnections to the same peer.
+    ///
+    /// As an exception, this function can ignore all changes for specific
+    /// [`SocketAddr`]s. Ignored addresses will never be used to connect to
+    /// peers.
+    pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let _guard = self.span.enter();
+
+        let previous = self.by_addr.get(&change.addr()).cloned();
+        let updated = change.apply_to_meta_addr(previous);
+
         trace!(
-            ?new,
+            ?change,
+            ?updated,
+            ?previous,
             total_peers = self.by_addr.len(),
             recent_peers = self.recently_live_peers().count(),
         );
 
-        if let Some(prev) = self.get_by_addr(new.addr) {
-            if prev.get_last_seen() > new.get_last_seen() {
-                return;
+        if let Some(updated) = updated {
+            // Ignore invalid outbound addresses.
+            // (Inbound connections can be monitored via Zebra's metrics.)
+            if !updated.address_is_valid_for_outbound() {
+                return None;
             }
+
+            // Ignore invalid outbound services and other info,
+            // but only if the peer has never been attempted.
+            //
+            // Otherwise, if we got the info directly from the peer,
+            // store it in the address book, so we know not to reconnect.
+            //
+            // TODO: delete peers with invalid info when they get too old (#1873)
+            if !updated.last_known_info_is_valid_for_outbound()
+                && updated.last_connection_state.is_never_attempted()
+            {
+                return None;
+            }
+
+            self.by_addr.insert(updated.addr, updated);
+            std::mem::drop(_guard);
+            self.update_metrics();
         }
 
-        self.by_addr.insert(new.addr, new);
-        std::mem::drop(_guard);
-        self.update_metrics();
+        updated
     }
 
     /// Removes the entry with `addr`, returning it if it exists
     ///
-    /// ## Note
+    /// # Note
     ///
-    /// All changes should go through `update` or `take`, to ensure accurate metrics.
+    /// All address removals should go through `take`, so that the address
+    /// book metrics are accurate.
+    #[allow(dead_code)]
     fn take(&mut self, removed_addr: SocketAddr) -> Option<MetaAddr> {
         let _guard = self.span.enter();
         trace!(
@@ -137,21 +260,6 @@ impl AddressBook {
         }
     }
 
-    /// Compute a cutoff time that can determine whether an entry
-    /// in an address book being updated with peer message timestamps
-    /// represents a likely-dead (or hung) peer, or a potentially-connected peer.
-    ///
-    /// [`constants::LIVE_PEER_DURATION`] represents the time interval in which
-    /// we should receive at least one message from a peer, or close the
-    /// connection. Therefore, if the last-seen timestamp is older than
-    /// [`constants::LIVE_PEER_DURATION`] ago, we know we should have
-    /// disconnected from it. Otherwise, we could potentially be connected to it.
-    fn liveness_cutoff_time() -> DateTime<Utc> {
-        // chrono uses signed durations while stdlib uses unsigned durations
-        use chrono::Duration as CD;
-        Utc::now() - CD::from_std(constants::LIVE_PEER_DURATION).unwrap()
-    }
-
     /// Returns true if the given [`SocketAddr`] has recently sent us a message.
     pub fn recently_live_addr(&self, addr: &SocketAddr) -> bool {
         let _guard = self.span.enter();
@@ -160,7 +268,7 @@ impl AddressBook {
             // NeverAttempted, Failed, and AttemptPending peers should never be live
             Some(peer) => {
                 peer.last_connection_state == PeerAddrState::Responded
-                    && peer.get_last_seen() > AddressBook::liveness_cutoff_time()
+                    && peer.has_connection_recently_responded()
             }
         }
     }
@@ -173,12 +281,6 @@ impl AddressBook {
             None => false,
             Some(peer) => peer.last_connection_state == PeerAddrState::AttemptPending,
         }
-    }
-
-    /// Returns true if the given [`SocketAddr`] might be connected to a node
-    /// feeding timestamps into this address book.
-    pub fn maybe_connected_addr(&self, addr: &SocketAddr) -> bool {
-        self.recently_live_addr(addr) || self.pending_reconnection_addr(addr)
     }
 
     /// Return an iterator over all peers.
@@ -201,7 +303,7 @@ impl AddressBook {
         // Skip live peers, and peers pending a reconnect attempt, then sort using BTreeSet
         self.by_addr
             .values()
-            .filter(move |peer| !self.maybe_connected_addr(&peer.addr))
+            .filter(|peer| peer.is_ready_for_connection_attempt())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .cloned()
@@ -224,7 +326,7 @@ impl AddressBook {
 
         self.by_addr
             .values()
-            .filter(move |peer| self.maybe_connected_addr(&peer.addr))
+            .filter(|peer| !peer.is_ready_for_connection_attempt())
             .cloned()
     }
 
@@ -238,14 +340,6 @@ impl AddressBook {
             .cloned()
     }
 
-    /// Returns an iterator that drains entries from the address book.
-    ///
-    /// Removes entries in reconnection attempt then arbitrary order,
-    /// see [`peers`] for details.
-    pub fn drain(&'_ mut self) -> impl Iterator<Item = MetaAddr> + '_ {
-        Drain { book: self }
-    }
-
     /// Returns the number of entries in this address book.
     pub fn len(&self) -> usize {
         self.by_addr.len()
@@ -254,7 +348,12 @@ impl AddressBook {
     /// Returns metrics for the addresses in this address book.
     pub fn address_metrics(&self) -> AddressMetrics {
         let responded = self.state_peers(PeerAddrState::Responded).count();
-        let never_attempted = self.state_peers(PeerAddrState::NeverAttempted).count();
+        let never_attempted_gossiped = self
+            .state_peers(PeerAddrState::NeverAttemptedGossiped)
+            .count();
+        let never_attempted_alternate = self
+            .state_peers(PeerAddrState::NeverAttemptedAlternate)
+            .count();
         let failed = self.state_peers(PeerAddrState::Failed).count();
         let attempt_pending = self.state_peers(PeerAddrState::AttemptPending).count();
 
@@ -265,7 +364,8 @@ impl AddressBook {
 
         AddressMetrics {
             responded,
-            never_attempted,
+            never_attempted_gossiped,
+            never_attempted_alternate,
             failed,
             attempt_pending,
             recently_live,
@@ -281,7 +381,11 @@ impl AddressBook {
 
         // TODO: rename to address_book.[state_name]
         metrics::gauge!("candidate_set.responded", m.responded as f64);
-        metrics::gauge!("candidate_set.gossiped", m.never_attempted as f64);
+        metrics::gauge!("candidate_set.gossiped", m.never_attempted_gossiped as f64);
+        metrics::gauge!(
+            "candidate_set.alternate",
+            m.never_attempted_alternate as f64
+        );
         metrics::gauge!("candidate_set.failed", m.failed as f64);
         metrics::gauge!("candidate_set.pending", m.attempt_pending as f64);
 
@@ -327,7 +431,12 @@ impl AddressBook {
 
         self.last_address_log = Some(Instant::now());
         // if all peers have failed
-        if m.responded + m.attempt_pending + m.never_attempted == 0 {
+        if m.responded
+            + m.attempt_pending
+            + m.never_attempted_gossiped
+            + m.never_attempted_alternate
+            == 0
+        {
             warn!(
                 address_metrics = ?m,
                 "all peer addresses have failed. Hint: check your network connection"
@@ -341,26 +450,13 @@ impl AddressBook {
     }
 }
 
-impl Extend<MetaAddr> for AddressBook {
+impl Extend<MetaAddrChange> for AddressBook {
     fn extend<T>(&mut self, iter: T)
     where
-        T: IntoIterator<Item = MetaAddr>,
+        T: IntoIterator<Item = MetaAddrChange>,
     {
-        for meta in iter.into_iter() {
-            self.update(meta);
+        for change in iter.into_iter() {
+            self.update(change);
         }
-    }
-}
-
-struct Drain<'a> {
-    book: &'a mut AddressBook,
-}
-
-impl<'a> Iterator for Drain<'a> {
-    type Item = MetaAddr;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next_item_addr = self.book.peers().next()?.addr;
-        self.book.take(next_item_addr)
     }
 }

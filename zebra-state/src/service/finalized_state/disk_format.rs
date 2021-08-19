@@ -1,15 +1,20 @@
 //! Module defining exactly how to move types in and out of rocksdb
-use std::{convert::TryInto, fmt::Debug, sync::Arc};
+use std::{collections::BTreeMap, convert::TryInto, fmt::Debug, sync::Arc};
 
+use bincode::Options;
 use zebra_chain::{
+    amount::NonNegative,
     block,
-    block::Block,
+    block::{Block, Height},
+    history_tree::NonEmptyHistoryTree,
+    orchard,
+    parameters::Network,
+    primitives::zcash_history,
     sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     sprout, transaction, transparent,
+    value_balance::ValueBalance,
 };
-
-use crate::Utxo;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransactionLocation {
@@ -163,6 +168,15 @@ impl IntoDisk for sapling::Nullifier {
     }
 }
 
+impl IntoDisk for orchard::Nullifier {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let nullifier: orchard::Nullifier = *self;
+        nullifier.into()
+    }
+}
+
 impl IntoDisk for () {
     type Bytes = [u8; 0];
 
@@ -186,7 +200,7 @@ impl FromDisk for block::Height {
     }
 }
 
-impl IntoDisk for Utxo {
+impl IntoDisk for transparent::Utxo {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
@@ -200,7 +214,7 @@ impl IntoDisk for Utxo {
     }
 }
 
-impl FromDisk for Utxo {
+impl FromDisk for transparent::Utxo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let (meta_bytes, output_bytes) = bytes.as_ref().split_at(5);
         let height = block::Height(u32::from_be_bytes(meta_bytes[0..4].try_into().unwrap()));
@@ -225,14 +239,135 @@ impl IntoDisk for transparent::OutPoint {
     }
 }
 
+impl IntoDisk for sapling::tree::Root {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.into()
+    }
+}
+
+impl IntoDisk for orchard::tree::Root {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.into()
+    }
+}
+
+impl IntoDisk for ValueBalance<NonNegative> {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.to_bytes()
+    }
+}
+
+impl FromDisk for ValueBalance<NonNegative> {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let array = bytes.as_ref().try_into().unwrap();
+        ValueBalance::from_bytes(array).unwrap()
+    }
+}
+
+// The following implementations for the note commitment trees use `serde` and
+// `bincode` because currently the inner Merkle tree frontier (from
+// `incrementalmerkletree`) only supports `serde` for serialization. `bincode`
+// was chosen because it is small and fast. We explicitly use `DefaultOptions`
+// in particular to disallow trailing bytes; see
+// https://docs.rs/bincode/1.3.3/bincode/config/index.html#options-struct-vs-bincode-functions
+
+impl IntoDisk for sapling::tree::NoteCommitmentTree {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        bincode::DefaultOptions::new()
+            .serialize(self)
+            .expect("serialization to vec doesn't fail")
+    }
+}
+
+impl FromDisk for sapling::tree::NoteCommitmentTree {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        bincode::DefaultOptions::new()
+            .deserialize(bytes.as_ref())
+            .expect("deserialization format should match the serialization format used by IntoDisk")
+    }
+}
+
+impl IntoDisk for orchard::tree::NoteCommitmentTree {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        bincode::DefaultOptions::new()
+            .serialize(self)
+            .expect("serialization to vec doesn't fail")
+    }
+}
+
+impl FromDisk for orchard::tree::NoteCommitmentTree {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        bincode::DefaultOptions::new()
+            .deserialize(bytes.as_ref())
+            .expect("deserialization format should match the serialization format used by IntoDisk")
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryTreeParts {
+    network: Network,
+    size: u32,
+    peaks: BTreeMap<u32, zcash_history::Entry>,
+    current_height: Height,
+}
+
+impl IntoDisk for NonEmptyHistoryTree {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let data = HistoryTreeParts {
+            network: self.network(),
+            size: self.size(),
+            peaks: self.peaks().clone(),
+            current_height: self.current_height(),
+        };
+        bincode::DefaultOptions::new()
+            .serialize(&data)
+            .expect("serialization to vec doesn't fail")
+    }
+}
+
+impl FromDisk for NonEmptyHistoryTree {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let parts: HistoryTreeParts = bincode::DefaultOptions::new()
+            .deserialize(bytes.as_ref())
+            .expect(
+                "deserialization format should match the serialization format used by IntoDisk",
+            );
+        NonEmptyHistoryTree::from_cache(
+            parts.network,
+            parts.size,
+            parts.peaks,
+            parts.current_height,
+        )
+        .expect("deserialization format should match the serialization format used by IntoDisk")
+    }
+}
+
 /// Helper trait for inserting (Key, Value) pairs into rocksdb with a consistently
 /// defined format
 pub trait DiskSerialize {
-    /// Serialize and insert the given key and value into a rocksdb column family.
+    /// Serialize and insert the given key and value into a rocksdb column family,
+    /// overwriting any existing `value` for `key`.
     fn zs_insert<K, V>(&mut self, cf: &rocksdb::ColumnFamily, key: K, value: V)
     where
         K: IntoDisk + Debug,
         V: IntoDisk;
+
+    /// Remove the given key form rocksdb column family if it exists.
+    fn zs_delete<K>(&mut self, cf: &rocksdb::ColumnFamily, key: K)
+    where
+        K: IntoDisk + Debug;
 }
 
 impl DiskSerialize for rocksdb::WriteBatch {
@@ -245,17 +380,29 @@ impl DiskSerialize for rocksdb::WriteBatch {
         let value_bytes = value.as_bytes();
         self.put_cf(cf, key_bytes, value_bytes);
     }
+
+    fn zs_delete<K>(&mut self, cf: &rocksdb::ColumnFamily, key: K)
+    where
+        K: IntoDisk + Debug,
+    {
+        let key_bytes = key.as_bytes();
+        self.delete_cf(cf, key_bytes);
+    }
 }
 
 /// Helper trait for retrieving values from rocksdb column familys with a consistently
 /// defined format
 pub trait DiskDeserialize {
-    /// Serialize the given key and use that to get and deserialize the
-    /// corresponding value from a rocksdb column family, if it is present.
+    /// Returns the value for `key` in the rocksdb column family `cf`, if present.
     fn zs_get<K, V>(&self, cf: &rocksdb::ColumnFamily, key: &K) -> Option<V>
     where
         K: IntoDisk,
         V: FromDisk;
+
+    /// Check if a rocksdb column family `cf` contains the serialized form of `key`.
+    fn zs_contains<K>(&self, cf: &rocksdb::ColumnFamily, key: &K) -> bool
+    where
+        K: IntoDisk;
 }
 
 impl DiskDeserialize for rocksdb::DB {
@@ -267,13 +414,26 @@ impl DiskDeserialize for rocksdb::DB {
         let key_bytes = key.as_bytes();
 
         // We use `get_pinned_cf` to avoid taking ownership of the serialized
-        // format because we're going to deserialize it anyways, which avoids an
+        // value, because we're going to deserialize it anyways, which avoids an
         // extra copy
         let value_bytes = self
             .get_pinned_cf(cf, key_bytes)
             .expect("expected that disk errors would not occur");
 
         value_bytes.map(V::from_bytes)
+    }
+
+    fn zs_contains<K>(&self, cf: &rocksdb::ColumnFamily, key: &K) -> bool
+    where
+        K: IntoDisk,
+    {
+        let key_bytes = key.as_bytes();
+
+        // We use `get_pinned_cf` to avoid taking ownership of the serialized
+        // value, because we don't use the value at all. This avoids an extra copy.
+        self.get_pinned_cf(cf, key_bytes)
+            .expect("expected that disk errors would not occur")
+            .is_some()
     }
 }
 
@@ -386,6 +546,13 @@ mod tests {
     fn roundtrip_transparent_output() {
         zebra_test::init();
 
-        proptest!(|(val in any::<Utxo>())| assert_value_properties(val));
+        proptest!(|(val in any::<transparent::Utxo>())| assert_value_properties(val));
+    }
+
+    #[test]
+    fn roundtrip_value_balance() {
+        zebra_test::init();
+
+        proptest!(|(val in any::<ValueBalance::<NonNegative>>())| assert_value_properties(val));
     }
 }

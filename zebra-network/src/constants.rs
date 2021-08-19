@@ -8,7 +8,7 @@ use regex::Regex;
 // XXX should these constants be split into protocol also?
 use crate::protocol::external::types::*;
 
-use zebra_chain::parameters::NetworkUpgrade;
+use zebra_chain::{parameters::NetworkUpgrade, serialization::Duration32};
 
 /// The buffer size for the peer set.
 ///
@@ -43,52 +43,94 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// This avoids explicit synchronization, but relies on the peer
 /// connector actually setting up channels and these heartbeats in a
 /// specific manner that matches up with this math.
-pub const LIVE_PEER_DURATION: Duration = Duration::from_secs(60 + 20 + 20 + 20);
+pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(60 + 20 + 20 + 20);
+
+/// The maximum duration since a peer was last seen to consider it reachable.
+///
+/// This is used to prevent Zebra from gossiping addresses that are likely unreachable. Peers that
+/// have last been seen more than this duration ago will not be gossiped.
+///
+/// This is determined as a tradeoff between network health and network view leakage. From the
+/// [Bitcoin protocol documentation](https://en.bitcoin.it/wiki/Protocol_documentation#getaddr):
+///
+/// "The typical presumption is that a node is likely to be active if it has been sending a message
+/// within the last three hours."
+pub const MAX_PEER_ACTIVE_FOR_GOSSIP: Duration32 = Duration32::from_hours(3);
 
 /// Regular interval for sending keepalive `Ping` messages to each
 /// connected peer.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The minimum time between successive calls to [`CandidateSet::next()`][Self::next].
+///
+/// ## Security
+///
+/// Zebra resists distributed denial of service attacks by making sure that new peer connections
+/// are initiated at least `MIN_PEER_CONNECTION_INTERVAL` apart.
+pub const MIN_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The minimum time between successive calls to [`CandidateSet::update()`][Self::update].
+///
+/// ## Security
+///
+/// Zebra resists distributed denial of service attacks by making sure that requests for more
+/// peer addresses are sent at least `MIN_PEER_GET_ADDR_INTERVAL` apart.
+pub const MIN_PEER_GET_ADDR_INTERVAL: Duration = Duration::from_secs(10);
+
 /// The number of GetAddr requests sent when crawling for new peers.
 ///
 /// ## SECURITY
 ///
-/// The fanout should be greater than 1, to ensure that Zebra's address book is
-/// not dominated by a single peer.
-pub const GET_ADDR_FANOUT: usize = 2;
+/// The fanout should be greater than 2, so that Zebra avoids getting a majority
+/// of its initial address book entries from a single peer.
+///
+/// Zebra regularly crawls for new peers, initiating a new crawl every
+/// [`crawl_new_peer_interval`](crate::config::Config.crawl_new_peer_interval).
+///
+/// TODO: limit the number of addresses that Zebra uses from a single peer
+///       response (#1869)
+pub const GET_ADDR_FANOUT: usize = 3;
 
 /// Truncate timestamps in outbound address messages to this time interval.
 ///
-/// This is intended to prevent a peer from learning exactly when we received
+/// ## SECURITY
+///
+/// Timestamp truncation prevents a peer from learning exactly when we received
 /// messages from each of our peers.
-pub const TIMESTAMP_TRUNCATION_SECONDS: i64 = 30 * 60;
+pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
 /// The User-Agent string provided by the node.
 ///
 /// This must be a valid [BIP 14] user agent.
 ///
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
-// XXX can we generate this from crate metadata?
-pub const USER_AGENT: &str = "/🦓Zebra🦓:1.0.0-alpha.6/";
+//
+// TODO: generate this from crate metadata (#2375)
+pub const USER_AGENT: &str = "/Zebra:1.0.0-alpha.15/";
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
 ///
 /// The current protocol version is checked by our peers. If it is too old,
-/// newer peers will refuse to connect to us.
+/// newer peers will disconnect from us.
 ///
 /// The current protocol version typically changes before Mainnet and Testnet
 /// network upgrades.
-pub const CURRENT_VERSION: Version = Version(170_013);
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_013);
 
-/// The most recent bilateral consensus upgrade implemented by this crate.
+/// The minimum network protocol version accepted by this crate for each network,
+/// represented as a network upgrade.
 ///
-/// The minimum network upgrade is used to check the protocol versions of our
-/// peers. If their versions are too old, we will disconnect from them.
-//
-// TODO: replace with NetworkUpgrade::current(network, height).
-//       See the detailed comment in handshake.rs, where this constant is used.
-pub const MIN_NETWORK_UPGRADE: NetworkUpgrade = NetworkUpgrade::Canopy;
+/// The minimum protocol version is used to check the protocol versions of our
+/// peers during the initial block download. After the intial block download,
+/// we use the current block height to select the minimum network protocol
+/// version.
+///
+/// If peer versions are too old, we will disconnect from them.
+///
+/// The minimum network protocol version typically changes after Mainnet network
+/// upgrades.
+pub const INITIAL_MIN_NETWORK_PROTOCOL_VERSION: NetworkUpgrade = NetworkUpgrade::Canopy;
 
 /// The default RTT estimate for peer responses.
 ///
@@ -97,8 +139,8 @@ pub const MIN_NETWORK_UPGRADE: NetworkUpgrade = NetworkUpgrade::Canopy;
 /// important on testnet, which has a small number of peers, which are often
 /// slow.
 ///
-/// Make the default RTT one second higher than the response timeout.
-pub const EWMA_DEFAULT_RTT: Duration = Duration::from_secs(20 + 1);
+/// Make the default RTT slightly higher than the request timeout.
+pub const EWMA_DEFAULT_RTT: Duration = Duration::from_secs(REQUEST_TIMEOUT.as_secs() + 1);
 
 /// The decay time for the EWMA response time metric used for load balancing.
 ///
@@ -110,7 +152,7 @@ lazy_static! {
     /// OS-specific error when the port attempting to be opened is already in use.
     pub static ref PORT_IN_USE_ERROR: Regex = if cfg!(unix) {
         #[allow(clippy::trivial_regex)]
-        Regex::new("already in use")
+        Regex::new(&regex::escape("already in use"))
     } else {
         Regex::new("(access a socket in a way forbidden by its access permissions)|(Only one usage of each socket address)")
     }.expect("regex is valid");
@@ -140,7 +182,7 @@ mod tests {
     use super::*;
 
     /// This assures that the `Duration` value we are computing for
-    /// LIVE_PEER_DURATION actually matches the other const values it
+    /// MIN_PEER_RECONNECTION_DELAY actually matches the other const values it
     /// relies on.
     #[test]
     fn ensure_live_peer_duration_value_matches_others() {
@@ -149,7 +191,7 @@ mod tests {
         let constructed_live_peer_duration =
             HEARTBEAT_INTERVAL + REQUEST_TIMEOUT + REQUEST_TIMEOUT + REQUEST_TIMEOUT;
 
-        assert_eq!(LIVE_PEER_DURATION, constructed_live_peer_duration);
+        assert_eq!(MIN_PEER_RECONNECTION_DELAY, constructed_live_peer_duration);
     }
 
     /// Make sure that the timeout values are consistent with each other.

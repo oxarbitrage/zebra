@@ -5,33 +5,78 @@
 mod chain;
 mod queued_blocks;
 
+#[cfg(test)]
+mod tests;
+
 pub use queued_blocks::QueuedBlocks;
 
 use std::{collections::BTreeSet, mem, ops::Deref, sync::Arc};
 
 use zebra_chain::{
     block::{self, Block},
-    parameters::{Network, NetworkUpgrade::Canopy},
+    history_tree::HistoryTree,
+    orchard,
+    parameters::Network,
+    sapling,
     transaction::{self, Transaction},
     transparent,
 };
 
-use crate::{FinalizedBlock, HashOrHeight, PreparedBlock, Utxo};
+#[cfg(test)]
+use zebra_chain::sprout;
+
+use crate::{FinalizedBlock, HashOrHeight, PreparedBlock, ValidateContextError};
 
 use self::chain::Chain;
 
+use super::{check, finalized_state::FinalizedState};
+
 /// The state of the chains in memory, incuding queued blocks.
-#[derive(Default)]
+#[derive(Debug, Clone)]
 pub struct NonFinalizedState {
     /// Verified, non-finalized chains, in ascending order.
     ///
     /// The best chain is `chain_set.last()` or `chain_set.iter().next_back()`.
     pub chain_set: BTreeSet<Box<Chain>>,
-    /// The configured Zcash network
+
+    /// The configured Zcash network.
+    //
+    // Note: this field is currently unused, but it's useful for debugging.
     pub network: Network,
 }
 
 impl NonFinalizedState {
+    /// Returns a new non-finalized state for `network`.
+    pub fn new(network: Network) -> NonFinalizedState {
+        NonFinalizedState {
+            chain_set: Default::default(),
+            network,
+        }
+    }
+
+    /// Is the internal state of `self` the same as `other`?
+    ///
+    /// [`Chain`] has a custom [`Eq`] implementation based on proof of work,
+    /// which is used to select the best chain. So we can't derive [`Eq`] for [`NonFinalizedState`].
+    ///
+    /// Unlike the custom trait impl, this method returns `true` if the entire internal state
+    /// of two non-finalized states is equal.
+    ///
+    /// If the internal states are different, it returns `false`,
+    /// even if the chains and blocks are equal.
+    #[cfg(test)]
+    pub(crate) fn eq_internal_state(&self, other: &NonFinalizedState) -> bool {
+        // this method must be updated every time a field is added to NonFinalizedState
+
+        self.chain_set.len() == other.chain_set.len()
+            && self
+                .chain_set
+                .iter()
+                .zip(other.chain_set.iter())
+                .all(|(self_chain, other_chain)| self_chain.eq_internal_state(other_chain))
+            && self.network == other.network
+    }
+
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizedBlock {
@@ -70,41 +115,89 @@ impl NonFinalizedState {
         finalizing.into()
     }
 
-    /// Commit block to the non-finalized state.
-    pub fn commit_block(&mut self, prepared: PreparedBlock) {
+    /// Commit block to the non-finalized state, on top of:
+    /// - an existing chain's tip, or
+    /// - a newly forked chain.
+    pub fn commit_block(
+        &mut self,
+        prepared: PreparedBlock,
+        finalized_state: &FinalizedState,
+    ) -> Result<(), ValidateContextError> {
         let parent_hash = prepared.block.header.previous_block_hash;
         let (height, hash) = (prepared.height, prepared.hash);
 
-        let canopy_activation_height = Canopy.activation_height(self.network).unwrap();
-        if height < canopy_activation_height {
-            panic!(
-                "invalid non-finalized block height: the canopy checkpoint is mandatory, pre-canopy blocks must be committed to the state as finalized blocks"
-            );
+        let parent_chain = self.parent_chain(
+            parent_hash,
+            finalized_state.sapling_note_commitment_tree(),
+            finalized_state.orchard_note_commitment_tree(),
+            finalized_state.history_tree(),
+        )?;
+
+        // We might have taken a chain, so all validation must happen within
+        // validate_and_commit, so that the chain is restored correctly.
+        match self.validate_and_commit(*parent_chain.clone(), prepared, finalized_state) {
+            Ok(child_chain) => {
+                // if the block is valid, keep the child chain, and drop the parent chain
+                self.chain_set.insert(Box::new(child_chain));
+                self.update_metrics_for_committed_block(height, hash);
+                Ok(())
+            }
+            Err(err) => {
+                // if the block is invalid, restore the unmodified parent chain
+                // (the child chain might have been modified before the error)
+                //
+                // If the chain was forked, this adds an extra chain to the
+                // chain set. This extra chain will eventually get deleted
+                // (or re-used for a valid fork).
+                self.chain_set.insert(parent_chain);
+                Err(err)
+            }
         }
-
-        let mut parent_chain = self
-            .take_chain_if(|chain| chain.non_finalized_tip_hash() == parent_hash)
-            .or_else(|| {
-                self.chain_set
-                    .iter()
-                    .find_map(|chain| chain.fork(parent_hash))
-                    .map(Box::new)
-            })
-            .expect("commit_block is only called with blocks that are ready to be commited");
-
-        parent_chain.push(prepared);
-        self.chain_set.insert(parent_chain);
-        self.update_metrics_for_committed_block(height, hash);
     }
 
     /// Commit block to the non-finalized state as a new chain where its parent
     /// is the finalized tip.
-    pub fn commit_new_chain(&mut self, prepared: PreparedBlock) {
-        let mut chain = Chain::default();
+    pub fn commit_new_chain(
+        &mut self,
+        prepared: PreparedBlock,
+        finalized_state: &FinalizedState,
+    ) -> Result<(), ValidateContextError> {
+        let chain = Chain::new(
+            self.network,
+            finalized_state.sapling_note_commitment_tree(),
+            finalized_state.orchard_note_commitment_tree(),
+            finalized_state.history_tree(),
+        );
         let (height, hash) = (prepared.height, prepared.hash);
-        chain.push(prepared);
+
+        // if the block is invalid, drop the newly created chain fork
+        let chain = self.validate_and_commit(chain, prepared, finalized_state)?;
         self.chain_set.insert(Box::new(chain));
         self.update_metrics_for_committed_block(height, hash);
+        Ok(())
+    }
+
+    /// Contextually validate `prepared` using `finalized_state`.
+    /// If validation succeeds, push `prepared` onto `parent_chain`.
+    fn validate_and_commit(
+        &self,
+        parent_chain: Chain,
+        prepared: PreparedBlock,
+        finalized_state: &FinalizedState,
+    ) -> Result<Chain, ValidateContextError> {
+        check::utxo::transparent_spend(
+            &prepared,
+            &parent_chain.unspent_utxos(),
+            &parent_chain.spent_utxos,
+            finalized_state,
+        )?;
+        check::block_commitment_is_valid_for_chain_history(
+            &prepared,
+            self.network,
+            &parent_chain.history_tree,
+        )?;
+
+        parent_chain.push(prepared)
     }
 
     /// Returns the length of the non-finalized portion of the current best chain.
@@ -153,10 +246,10 @@ impl NonFinalizedState {
 
     /// Returns the `transparent::Output` pointed to by the given
     /// `transparent::OutPoint` if it is present in any chain.
-    pub fn any_utxo(&self, outpoint: &transparent::OutPoint) -> Option<Utxo> {
+    pub fn any_utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         for chain in self.chain_set.iter().rev() {
-            if let Some(output) = chain.created_utxos.get(outpoint) {
-                return Some(output.clone());
+            if let Some(utxo) = chain.created_utxos.get(outpoint) {
+                return Some(utxo.clone());
             }
         }
 
@@ -234,12 +327,74 @@ impl NonFinalizedState {
             .map(|(height, index)| best_chain.blocks[height].block.transactions[*index].clone())
     }
 
+    /// Returns `true` if the best chain contains `sprout_nullifier`.
+    #[cfg(test)]
+    pub fn best_contains_sprout_nullifier(&self, sprout_nullifier: &sprout::Nullifier) -> bool {
+        self.best_chain()
+            .map(|best_chain| best_chain.sprout_nullifiers.contains(sprout_nullifier))
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if the best chain contains `sapling_nullifier`.
+    #[cfg(test)]
+    pub fn best_contains_sapling_nullifier(&self, sapling_nullifier: &sapling::Nullifier) -> bool {
+        self.best_chain()
+            .map(|best_chain| best_chain.sapling_nullifiers.contains(sapling_nullifier))
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if the best chain contains `orchard_nullifier`.
+    #[cfg(test)]
+    pub fn best_contains_orchard_nullifier(&self, orchard_nullifier: &orchard::Nullifier) -> bool {
+        self.best_chain()
+            .map(|best_chain| best_chain.orchard_nullifiers.contains(orchard_nullifier))
+            .unwrap_or(false)
+    }
+
     /// Return the non-finalized portion of the current best chain
     fn best_chain(&self) -> Option<&Chain> {
         self.chain_set
             .iter()
             .next_back()
             .map(|box_chain| box_chain.deref())
+    }
+
+    /// Return the chain whose tip block hash is `parent_hash`.
+    ///
+    /// The chain can be an existing chain in the non-finalized state or a freshly
+    /// created fork, if needed.
+    ///
+    /// The trees must be the trees of the finalized tip.
+    /// They are used to recreate the trees if a fork is needed.
+    fn parent_chain(
+        &mut self,
+        parent_hash: block::Hash,
+        sapling_note_commitment_tree: sapling::tree::NoteCommitmentTree,
+        orchard_note_commitment_tree: orchard::tree::NoteCommitmentTree,
+        history_tree: HistoryTree,
+    ) -> Result<Box<Chain>, ValidateContextError> {
+        match self.take_chain_if(|chain| chain.non_finalized_tip_hash() == parent_hash) {
+            // An existing chain in the non-finalized state
+            Some(chain) => Ok(chain),
+            // Create a new fork
+            None => Ok(Box::new(
+                self.chain_set
+                    .iter()
+                    .find_map(|chain| {
+                        chain
+                            .fork(
+                                parent_hash,
+                                sapling_note_commitment_tree.clone(),
+                                orchard_note_commitment_tree.clone(),
+                                history_tree.clone(),
+                            )
+                            .transpose()
+                    })
+                    .expect(
+                        "commit_block is only called with blocks that are ready to be commited",
+                    )?,
+            )),
+        }
     }
 
     /// Update the metrics after `block` is committed
@@ -269,244 +424,5 @@ impl NonFinalizedState {
     fn update_metrics_for_chains(&self) {
         metrics::gauge!("state.memory.chain.count", self.chain_set.len() as _);
         metrics::gauge!("state.memory.best.chain.length", self.best_chain_len() as _);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use zebra_chain::serialization::ZcashDeserializeInto;
-    use zebra_test::prelude::*;
-
-    use crate::tests::{FakeChainHelper, Prepare};
-
-    use self::assert_eq;
-    use super::*;
-
-    #[test]
-    fn best_chain_wins() -> Result<()> {
-        zebra_test::init();
-
-        best_chain_wins_for_network(Network::Mainnet)?;
-        best_chain_wins_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-
-    fn best_chain_wins_for_network(network: Network) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let block2 = block1.make_fake_child().set_work(10);
-        let child = block1.make_fake_child().set_work(1);
-
-        let expected_hash = block2.hash();
-
-        let mut state = NonFinalizedState::default();
-        state.commit_new_chain(block2.prepare());
-        state.commit_new_chain(child.prepare());
-
-        let best_chain = state.best_chain().unwrap();
-        assert!(best_chain.height_by_hash.contains_key(&expected_hash));
-
-        Ok(())
-    }
-
-    #[test]
-    fn finalize_pops_from_best_chain() -> Result<()> {
-        zebra_test::init();
-
-        finalize_pops_from_best_chain_for_network(Network::Mainnet)?;
-        finalize_pops_from_best_chain_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-
-    fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let block2 = block1.make_fake_child().set_work(10);
-        let child = block1.make_fake_child().set_work(1);
-
-        let mut state = NonFinalizedState::default();
-        state.commit_new_chain(block1.clone().prepare());
-        state.commit_block(block2.clone().prepare());
-        state.commit_block(child.prepare());
-
-        let finalized = state.finalize();
-        assert_eq!(block1, finalized.block);
-
-        let finalized = state.finalize();
-        assert_eq!(block2, finalized.block);
-
-        assert!(state.best_chain().is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    // This test gives full coverage for `take_chain_if`
-    fn commit_block_extending_best_chain_doesnt_drop_worst_chains() -> Result<()> {
-        zebra_test::init();
-
-        commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(Network::Mainnet)?;
-        commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-
-    fn commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(
-        network: Network,
-    ) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let block2 = block1.make_fake_child().set_work(10);
-        let child1 = block1.make_fake_child().set_work(1);
-        let child2 = block2.make_fake_child().set_work(1);
-
-        let mut state = NonFinalizedState::default();
-        assert_eq!(0, state.chain_set.len());
-        state.commit_new_chain(block1.prepare());
-        assert_eq!(1, state.chain_set.len());
-        state.commit_block(block2.prepare());
-        assert_eq!(1, state.chain_set.len());
-        state.commit_block(child1.prepare());
-        assert_eq!(2, state.chain_set.len());
-        state.commit_block(child2.prepare());
-        assert_eq!(2, state.chain_set.len());
-
-        Ok(())
-    }
-
-    #[test]
-    fn shorter_chain_can_be_best_chain() -> Result<()> {
-        zebra_test::init();
-
-        shorter_chain_can_be_best_chain_for_network(Network::Mainnet)?;
-        shorter_chain_can_be_best_chain_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-
-    fn shorter_chain_can_be_best_chain_for_network(network: Network) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let long_chain_block1 = block1.make_fake_child().set_work(1);
-        let long_chain_block2 = long_chain_block1.make_fake_child().set_work(1);
-
-        let short_chain_block = block1.make_fake_child().set_work(3);
-
-        let mut state = NonFinalizedState::default();
-        state.commit_new_chain(block1.prepare());
-        state.commit_block(long_chain_block1.prepare());
-        state.commit_block(long_chain_block2.prepare());
-        state.commit_block(short_chain_block.prepare());
-        assert_eq!(2, state.chain_set.len());
-
-        assert_eq!(2, state.best_chain_len());
-
-        Ok(())
-    }
-
-    #[test]
-    fn longer_chain_with_more_work_wins() -> Result<()> {
-        zebra_test::init();
-
-        longer_chain_with_more_work_wins_for_network(Network::Mainnet)?;
-        longer_chain_with_more_work_wins_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-
-    fn longer_chain_with_more_work_wins_for_network(network: Network) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let long_chain_block1 = block1.make_fake_child().set_work(1);
-        let long_chain_block2 = long_chain_block1.make_fake_child().set_work(1);
-        let long_chain_block3 = long_chain_block2.make_fake_child().set_work(1);
-        let long_chain_block4 = long_chain_block3.make_fake_child().set_work(1);
-
-        let short_chain_block = block1.make_fake_child().set_work(3);
-
-        let mut state = NonFinalizedState::default();
-        state.commit_new_chain(block1.prepare());
-        state.commit_block(long_chain_block1.prepare());
-        state.commit_block(long_chain_block2.prepare());
-        state.commit_block(long_chain_block3.prepare());
-        state.commit_block(long_chain_block4.prepare());
-        state.commit_block(short_chain_block.prepare());
-        assert_eq!(2, state.chain_set.len());
-
-        assert_eq!(5, state.best_chain_len());
-
-        Ok(())
-    }
-
-    #[test]
-    fn equal_length_goes_to_more_work() -> Result<()> {
-        zebra_test::init();
-
-        equal_length_goes_to_more_work_for_network(Network::Mainnet)?;
-        equal_length_goes_to_more_work_for_network(Network::Testnet)?;
-
-        Ok(())
-    }
-    fn equal_length_goes_to_more_work_for_network(network: Network) -> Result<()> {
-        let block1: Arc<Block> = match network {
-            Network::Mainnet => {
-                zebra_test::vectors::BLOCK_MAINNET_1180900_BYTES.zcash_deserialize_into()?
-            }
-            Network::Testnet => {
-                zebra_test::vectors::BLOCK_TESTNET_1326100_BYTES.zcash_deserialize_into()?
-            }
-        };
-
-        let less_work_child = block1.make_fake_child().set_work(1);
-        let more_work_child = block1.make_fake_child().set_work(3);
-        let expected_hash = more_work_child.hash();
-
-        let mut state = NonFinalizedState::default();
-        state.commit_new_chain(block1.prepare());
-        state.commit_block(less_work_child.prepare());
-        state.commit_block(more_work_child.prepare());
-        assert_eq!(2, state.chain_set.len());
-
-        let tip_hash = state.best_tip().unwrap().1;
-        assert_eq!(expected_hash, tip_hash);
-
-        Ok(())
     }
 }

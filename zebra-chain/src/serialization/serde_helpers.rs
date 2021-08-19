@@ -1,3 +1,5 @@
+use group::GroupEncoding;
+use halo2::{arithmetic::FieldExt, pasta::pallas};
 use serde_big_array::big_array;
 
 big_array! {
@@ -37,8 +39,40 @@ impl From<Fq> for jubjub::Fq {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(remote = "futures::future::Either")]
-pub enum Either<A, B> {
-    Left(A),
-    Right(B),
+#[serde(remote = "pallas::Affine")]
+pub struct Affine {
+    #[serde(getter = "pallas::Affine::to_bytes")]
+    bytes: [u8; 32],
+}
+
+impl From<Affine> for pallas::Affine {
+    fn from(local: Affine) -> Self {
+        pallas::Affine::from_bytes(&local.bytes).unwrap()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "pallas::Scalar")]
+pub struct Scalar {
+    #[serde(getter = "pallas::Scalar::to_bytes")]
+    bytes: [u8; 32],
+}
+
+impl From<Scalar> for pallas::Scalar {
+    fn from(local: Scalar) -> Self {
+        pallas::Scalar::from_bytes(&local.bytes).unwrap()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "pallas::Base")]
+pub struct Base {
+    #[serde(getter = "pallas::Base::to_bytes")]
+    bytes: [u8; 32],
+}
+
+impl From<Base> for pallas::Base {
+    fn from(local: Base) -> Self {
+        pallas::Base::from_bytes(&local.bytes).unwrap()
+    }
 }

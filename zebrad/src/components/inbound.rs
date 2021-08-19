@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -31,7 +31,7 @@ type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Req
 type Verifier = Buffer<BoxService<Arc<Block>, block::Hash, VerifyChainError>, Arc<Block>>;
 type InboundDownloads = Downloads<Timeout<Outbound>, Timeout<Verifier>, State>;
 
-pub type NetworkSetupData = (Outbound, Arc<Mutex<AddressBook>>);
+pub type NetworkSetupData = (Outbound, Arc<std::sync::Mutex<AddressBook>>);
 
 /// Tracks the internal state of the [`Inbound`] service during network setup.
 pub enum Setup {
@@ -54,9 +54,9 @@ pub enum Setup {
     /// All requests are answered.
     Initialized {
         /// A shared list of peer addresses.
-        address_book: Arc<Mutex<zn::AddressBook>>,
+        address_book: Arc<std::sync::Mutex<zn::AddressBook>>,
 
-        /// A `futures::Stream` that downloads and verifies gossipped blocks.
+        /// A `futures::Stream` that downloads and verifies gossiped blocks.
         downloads: Pin<Box<InboundDownloads>>,
     },
 
@@ -228,11 +228,22 @@ impl Service<zn::Request> for Inbound {
         match req {
             zn::Request::Peers => {
                 if let Setup::Initialized { address_book, .. } = &self.network_setup {
+                    // # Security
+                    //
                     // We could truncate the list to try to not reveal our entire
                     // peer set. But because we don't monitor repeated requests,
                     // this wouldn't actually achieve anything, because a crawler
                     // could just repeatedly query it.
-                    let mut peers = address_book.lock().unwrap().sanitized();
+                    //
+                    // # Correctness
+                    //
+                    // Briefly hold the address book threaded mutex while
+                    // cloning the address book. Then sanitize after releasing
+                    // the lock.
+                    let peers = address_book.lock().unwrap().clone();
+
+                    // Send a sanitized response
+                    let mut peers = peers.sanitized();
                     const MAX_ADDR: usize = 1000; // bitcoin protocol constant
                     peers.truncate(MAX_ADDR);
                     async { Ok(zn::Response::Peers(peers)) }.boxed()
@@ -270,7 +281,7 @@ impl Service<zn::Request> for Inbound {
                     .map_ok(zn::Response::Blocks)
                     .boxed()
             }
-            zn::Request::TransactionsByHash(_transactions) => {
+            zn::Request::TransactionsById(_transactions) => {
                 // `zcashd` returns a list of found transactions, followed by a
                 // `NotFound` message if any transactions are missing. `zcashd`
                 // says that Simplified Payment Verification (SPV) clients rely on
@@ -303,7 +314,7 @@ impl Service<zn::Request> for Inbound {
                 debug!("ignoring unimplemented request");
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::AdvertiseTransactions(_transactions) => {
+            zn::Request::AdvertiseTransactionIds(_transactions) => {
                 debug!("ignoring unimplemented request");
                 async { Ok(zn::Response::Nil) }.boxed()
             }
@@ -318,7 +329,7 @@ impl Service<zn::Request> for Inbound {
                 }
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::MempoolTransactions => {
+            zn::Request::MempoolTransactionIds => {
                 debug!("ignoring unimplemented request");
                 async { Ok(zn::Response::Nil) }.boxed()
             }

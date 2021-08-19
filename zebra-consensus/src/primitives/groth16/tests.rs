@@ -25,39 +25,29 @@ where
     let mut async_checks = FuturesUnordered::new();
 
     for tx in transactions {
-        match &*tx {
-            Transaction::V1 { .. }
-            | Transaction::V2 { .. }
-            | Transaction::V3 { .. }
-            | Transaction::V5 { .. } => (),
-            Transaction::V4 {
-                sapling_shielded_data,
-                ..
-            } => {
-                if let Some(shielded_data) = sapling_shielded_data {
-                    for spend in shielded_data.spends_per_anchor() {
-                        tracing::trace!(?spend);
+        let spends = tx.sapling_spends_per_anchor();
+        let outputs = tx.sapling_outputs();
 
-                        let spend_rsp = spend_verifier
-                            .ready_and()
-                            .await?
-                            .call(groth16::ItemWrapper::from(&spend).into());
+        for spend in spends {
+            tracing::trace!(?spend);
 
-                        async_checks.push(spend_rsp);
-                    }
+            let spend_rsp = spend_verifier
+                .ready_and()
+                .await?
+                .call(groth16::ItemWrapper::from(&spend).into());
 
-                    for output in shielded_data.outputs() {
-                        tracing::trace!(?output);
+            async_checks.push(spend_rsp);
+        }
 
-                        let output_rsp = output_verifier
-                            .ready_and()
-                            .await?
-                            .call(groth16::ItemWrapper::from(output).into());
+        for output in outputs {
+            tracing::trace!(?output);
 
-                        async_checks.push(output_rsp);
-                    }
-                }
-            }
+            let output_rsp = output_verifier
+                .ready_and()
+                .await?
+                .call(groth16::ItemWrapper::from(output).into());
+
+            async_checks.push(output_rsp);
         }
 
         while let Some(result) = async_checks.next().await {
@@ -71,9 +61,31 @@ where
 
 #[tokio::test]
 async fn verify_sapling_groth16() {
-    // Since we expect these to pass, we can use the communal verifiers.
-    let mut spend_verifier = groth16::SPEND_VERIFIER.clone();
-    let mut output_verifier = groth16::OUTPUT_VERIFIER.clone();
+    // Use separate verifiers so shared batch tasks aren't killed when the test ends (#2390)
+    let mut spend_verifier = Fallback::new(
+        Batch::new(
+            Verifier::new(&PARAMS.sapling.spend.vk),
+            crate::primitives::MAX_BATCH_SIZE,
+            crate::primitives::MAX_BATCH_LATENCY,
+        ),
+        tower::service_fn(
+            (|item: Item| {
+                ready(item.verify_single(&prepare_verifying_key(&PARAMS.sapling.spend.vk)))
+            }) as fn(_) -> _,
+        ),
+    );
+    let mut output_verifier = Fallback::new(
+        Batch::new(
+            Verifier::new(&PARAMS.sapling.output.vk),
+            crate::primitives::MAX_BATCH_SIZE,
+            crate::primitives::MAX_BATCH_LATENCY,
+        ),
+        tower::service_fn(
+            (|item: Item| {
+                ready(item.verify_single(&prepare_verifying_key(&PARAMS.sapling.output.vk)))
+            }) as fn(_) -> _,
+        ),
+    );
 
     let transactions = zebra_test::vectors::MAINNET_BLOCKS
         .clone()
@@ -108,33 +120,22 @@ where
     let mut async_checks = FuturesUnordered::new();
 
     for tx in transactions {
-        match &*tx {
-            Transaction::V1 { .. }
-            | Transaction::V2 { .. }
-            | Transaction::V3 { .. }
-            | Transaction::V5 { .. } => (),
-            Transaction::V4 {
-                sapling_shielded_data,
-                ..
-            } => {
-                if let Some(shielded_data) = sapling_shielded_data {
-                    for output in shielded_data.outputs() {
-                        // This changes the primary inputs to the proof
-                        // verification, causing it to fail for this proof.
-                        let mut modified_output = output.clone();
-                        modified_output.cm_u = jubjub::Fq::zero();
+        let outputs = tx.sapling_outputs();
 
-                        tracing::trace!(?modified_output);
+        for output in outputs {
+            // This changes the primary inputs to the proof
+            // verification, causing it to fail for this proof.
+            let mut modified_output = output.clone();
+            modified_output.cm_u = jubjub::Fq::zero();
 
-                        let output_rsp = output_verifier
-                            .ready_and()
-                            .await?
-                            .call(groth16::ItemWrapper::from(&modified_output).into());
+            tracing::trace!(?modified_output);
 
-                        async_checks.push(output_rsp);
-                    }
-                }
-            }
+            let output_rsp = output_verifier
+                .ready_and()
+                .await?
+                .call(groth16::ItemWrapper::from(&modified_output).into());
+
+            async_checks.push(output_rsp);
         }
 
         while let Some(result) = async_checks.next().await {
@@ -146,10 +147,9 @@ where
 }
 
 #[tokio::test]
-#[should_panic]
 async fn correctly_err_on_invalid_output_proof() {
-    // Since we expect these to fail, we don't want to poison the communal
-    // verifiers.
+    // Use separate verifiers so shared batch tasks aren't killed when the test ends (#2390).
+    // Also, since we expect these to fail, we don't want to slow down the communal verifiers.
     let mut output_verifier = Fallback::new(
         Batch::new(
             Verifier::new(&PARAMS.sapling.output.vk),
@@ -170,5 +170,5 @@ async fn correctly_err_on_invalid_output_proof() {
 
     verify_invalid_groth16_output_description(&mut output_verifier, block.transactions)
         .await
-        .unwrap()
+        .expect_err("unexpected success checking invalid groth16 inputs");
 }

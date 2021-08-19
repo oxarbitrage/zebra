@@ -6,7 +6,7 @@ use std::{
 use tracing::instrument;
 use zebra_chain::{block, transparent};
 
-use crate::{service::QueuedBlock, Utxo};
+use crate::service::QueuedBlock;
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
 #[derive(Default)]
@@ -18,7 +18,7 @@ pub struct QueuedBlocks {
     /// Hashes from `queued_blocks`, indexed by block height.
     by_height: BTreeMap<block::Height, HashSet<block::Hash>>,
     /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, Utxo>,
+    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
 }
 
 impl QueuedBlocks {
@@ -33,8 +33,9 @@ impl QueuedBlocks {
         let parent_hash = new.0.block.header.previous_block_hash;
 
         // Track known UTXOs in queued blocks.
-        for (outpoint, output) in new.0.new_outputs.iter() {
-            self.known_utxos.insert(*outpoint, output.clone());
+        for (outpoint, ordered_utxo) in new.0.new_outputs.iter() {
+            self.known_utxos
+                .insert(*outpoint, ordered_utxo.utxo.clone());
         }
 
         let replaced = self.blocks.insert(new_hash, new);
@@ -135,7 +136,7 @@ impl QueuedBlocks {
 
     /// Return the queued block if it has already been registered
     pub fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut QueuedBlock> {
-        self.blocks.get_mut(&hash)
+        self.blocks.get_mut(hash)
     }
 
     /// Update metrics after the queue is modified
@@ -150,7 +151,7 @@ impl QueuedBlocks {
     }
 
     /// Try to look up this UTXO in any queued block.
-    pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<Utxo> {
+    pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.known_utxos.get(outpoint).cloned()
     }
 }
@@ -163,7 +164,7 @@ mod tests {
     use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
     use zebra_test::prelude::*;
 
-    use crate::tests::{FakeChainHelper, Prepare};
+    use crate::{arbitrary::Prepare, tests::FakeChainHelper};
 
     use self::assert_eq;
     use super::*;

@@ -3,10 +3,7 @@
 // Portions of this submodule were adapted from tower-balance,
 // which is (c) 2019 Tower Contributors (MIT licensed).
 
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use futures::{
     channel::mpsc,
@@ -16,8 +13,8 @@ use futures::{
     TryFutureExt,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::broadcast,
+    net::TcpListener,
+    sync::{broadcast, watch},
     time::Instant,
 };
 use tower::{
@@ -32,11 +29,14 @@ use crate::{
     BoxError, Config, Request, Response,
 };
 
-use zebra_chain::parameters::Network;
+use zebra_chain::{block, parameters::Network};
 
 use super::CandidateSet;
 use super::PeerSet;
 use peer::Client;
+
+#[cfg(test)]
+mod tests;
 
 type PeerChange = Result<Change<SocketAddr, peer::Client>, BoxError>;
 
@@ -63,22 +63,25 @@ type PeerChange = Result<Change<SocketAddr, peer::Client>, BoxError>;
 pub async fn init<S>(
     config: Config,
     inbound_service: S,
+    best_tip_height: Option<watch::Receiver<Option<block::Height>>>,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
-    Arc<Mutex<AddressBook>>,
+    Arc<std::sync::Mutex<AddressBook>>,
 )
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
-    let (address_book, timestamp_collector) = TimestampCollector::spawn();
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+
+    let (address_book, timestamp_collector) = TimestampCollector::spawn(listen_addr);
     let (inv_sender, inv_receiver) = broadcast::channel(100);
 
     // Construct services that handle inbound handshakes and perform outbound
     // handshakes. These use the same handshake service internally to detect
     // self-connection attempts. Both are decorated with a tower TimeoutLayer to
     // enforce timeouts as specified in the Config.
-    let (listener, connector) = {
+    let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
         use crate::protocol::external::types::PeerServices;
@@ -89,6 +92,7 @@ where
             .with_timestamp_collector(timestamp_collector)
             .with_advertised_services(PeerServices::NODE_NETWORK)
             .with_user_agent(crate::constants::USER_AGENT.to_string())
+            .with_best_tip_height(best_tip_height)
             .want_transactions(true)
             .finish()
             .expect("configured all required parameters");
@@ -122,36 +126,22 @@ where
     let peer_set = Buffer::new(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
 
     // 1. Incoming peer connections, via a listener.
-
-    // Warn if we're configured using the wrong network port.
-    // TODO: use the right port if the port is unspecified
-    //       split the address and port configs?
-    let (wrong_net, wrong_net_port) = match config.network {
-        Network::Mainnet => (Network::Testnet, 18233),
-        Network::Testnet => (Network::Mainnet, 8233),
-    };
-    if config.listen_addr.port() == wrong_net_port {
-        warn!(
-            "We are configured with port {} for {:?}, but that port is the default port for {:?}",
-            config.listen_addr.port(),
-            config.network,
-            wrong_net
-        );
-    }
-
     let listen_guard = tokio::spawn(
-        listen(config.listen_addr, listener, peerset_tx.clone()).instrument(Span::current()),
+        accept_inbound_connections(tcp_listener, listen_handshaker, peerset_tx.clone())
+            .instrument(Span::current()),
     );
 
     // 2. Initial peers, specified in the config.
+    let (initial_peer_count_tx, initial_peer_count_rx) = tokio::sync::oneshot::channel();
     let initial_peers_fut = {
         let config = config.clone();
-        let connector = connector.clone();
+        let outbound_connector = outbound_connector.clone();
         let peerset_tx = peerset_tx.clone();
         async move {
             let initial_peers = config.initial_peers().await;
+            let _ = initial_peer_count_tx.send(initial_peers.len());
             // Connect the tx end to the 3 peer sources:
-            add_initial_peers(initial_peers, connector, peerset_tx).await
+            add_initial_peers(initial_peers, outbound_connector, peerset_tx).await
         }
         .boxed()
     };
@@ -164,10 +154,11 @@ where
     // We need to await candidates.update() here, because zcashd only sends one
     // `addr` message per connection, and if we only have one initial peer we
     // need to ensure that its `addr` message is used by the crawler.
-    // XXX this should go in CandidateSet::new, but we need init() -> Result<_,_>
 
     info!("Sending initial request for peers");
-    let _ = candidates.update().await;
+    let _ = candidates
+        .update_initial(initial_peer_count_rx.await.expect("value sent before drop"))
+        .await;
 
     for _ in 0..config.peerset_initial_target_size {
         let _ = demand_tx.try_send(());
@@ -179,7 +170,7 @@ where
             demand_tx,
             demand_rx,
             candidates,
-            connector,
+            outbound_connector,
             peerset_tx,
         )
         .instrument(Span::current()),
@@ -194,10 +185,10 @@ where
 
 /// Use the provided `handshaker` to connect to `initial_peers`, then send
 /// the results over `tx`.
-#[instrument(skip(initial_peers, connector, tx))]
+#[instrument(skip(initial_peers, outbound_connector, tx))]
 async fn add_initial_peers<S>(
     initial_peers: std::collections::HashSet<SocketAddr>,
-    connector: S,
+    outbound_connector: S,
     mut tx: mpsc::Sender<PeerChange>,
 ) -> Result<(), BoxError>
 where
@@ -205,41 +196,68 @@ where
     S::Future: Send + 'static,
 {
     info!(?initial_peers, "connecting to initial peer set");
-    // ## Correctness:
+    // # Security
     //
-    // Each `CallAll` can hold one `Buffer` or `Batch` reservation for
-    // an indefinite period. We can use `CallAllUnordered` without filling
-    // the underlying `Inbound` buffer, because we immediately drive this
-    // single `CallAll` to completion, and handshakes have a short timeout.
-    use tower::util::CallAllUnordered;
-    let addr_stream = futures::stream::iter(initial_peers.into_iter());
-    let mut handshakes = CallAllUnordered::new(connector, addr_stream);
+    // TODO: rate-limit initial seed peer connections (#2326)
+    //
+    // # Correctness
+    //
+    // Each `FuturesUnordered` can hold one `Buffer` or `Batch` reservation for
+    // an indefinite period. We can use `FuturesUnordered` without filling
+    // the underlying network buffers, because we immediately drive this
+    // single `FuturesUnordered` to completion, and handshakes have a short timeout.
+    let mut handshakes: FuturesUnordered<_> = initial_peers
+        .into_iter()
+        .map(|addr| {
+            outbound_connector
+                .clone()
+                .oneshot(addr)
+                .map_err(move |e| (addr, e))
+        })
+        .collect();
 
     while let Some(handshake_result) = handshakes.next().await {
         // this is verbose, but it's better than just hanging with no output
-        if let Err(ref e) = handshake_result {
-            info!(?e, "an initial peer connection failed");
+        if let Err((addr, ref e)) = handshake_result {
+            info!(?addr, ?e, "an initial peer connection failed");
         }
-        tx.send(handshake_result).await?;
+        tx.send(handshake_result.map_err(|(_addr, e)| e)).await?;
     }
 
     Ok(())
 }
 
-/// Bind to `addr`, listen for peers using `handshaker`, then send the
-/// results over `tx`.
-#[instrument(skip(tx, handshaker))]
-async fn listen<S>(
-    addr: SocketAddr,
-    mut handshaker: S,
-    tx: mpsc::Sender<PeerChange>,
-) -> Result<(), BoxError>
-where
-    S: Service<(TcpStream, SocketAddr), Response = peer::Client, Error = BoxError> + Clone,
-    S::Future: Send + 'static,
-{
-    info!("Trying to open Zcash protocol endpoint at {}...", addr);
-    let listener_result = TcpListener::bind(addr).await;
+/// Open a peer connection listener on `config.listen_addr`,
+/// returning the opened [`TcpListener`], and the address it is bound to.
+///
+/// If the listener is configured to use an automatically chosen port (port `0`),
+/// then the returned address will contain the actual port.
+///
+/// # Panics
+///
+/// If opening the listener fails.
+#[instrument(skip(config), fields(addr = ?config.listen_addr))]
+async fn open_listener(config: &Config) -> (TcpListener, SocketAddr) {
+    // Warn if we're configured using the wrong network port.
+    use Network::*;
+    let wrong_net = match config.network {
+        Mainnet => Testnet,
+        Testnet => Mainnet,
+    };
+    if config.listen_addr.port() == wrong_net.default_port() {
+        warn!(
+            "We are configured with port {} for {:?}, but that port is the default port for {:?}",
+            config.listen_addr.port(),
+            config.network,
+            wrong_net
+        );
+    }
+
+    info!(
+        "Trying to open Zcash protocol endpoint at {}...",
+        config.listen_addr
+    );
+    let listener_result = TcpListener::bind(config.listen_addr).await;
 
     let listener = match listener_result {
         Ok(l) => l,
@@ -247,25 +265,55 @@ where
             "Opening Zcash network protocol listener {:?} failed: {:?}. \
              Hint: Check if another zebrad or zcashd process is running. \
              Try changing the network listen_addr in the Zebra config.",
-            addr, e,
+            config.listen_addr, e,
         ),
     };
 
-    let local_addr = listener.local_addr()?;
+    let local_addr = listener
+        .local_addr()
+        .expect("unexpected missing local addr for open listener");
     info!("Opened Zcash protocol endpoint at {}", local_addr);
+
+    (listener, local_addr)
+}
+
+/// Listens for peer connections on `addr`, then sets up each connection as a
+/// Zcash peer.
+///
+/// Uses `handshaker` to perform a Zcash network protocol handshake, and sends
+/// the [`Client`][peer::Client] result over `tx`.
+#[instrument(skip(listener, handshaker, tx), fields(listener_addr = ?listener.local_addr()))]
+async fn accept_inbound_connections<S>(
+    listener: TcpListener,
+    mut handshaker: S,
+    tx: mpsc::Sender<PeerChange>,
+) -> Result<(), BoxError>
+where
+    S: Service<peer::HandshakeRequest, Response = peer::Client, Error = BoxError> + Clone,
+    S::Future: Send + 'static,
+{
     loop {
         if let Ok((tcp_stream, addr)) = listener.accept().await {
-            debug!(?addr, "got incoming connection");
+            let connected_addr = peer::ConnectedAddr::new_inbound_direct(addr);
+            let accept_span = info_span!("listen_accept", peer = ?connected_addr);
+            let _guard = accept_span.enter();
+
+            debug!("got incoming connection");
             handshaker.ready_and().await?;
+            // TODO: distinguish between proxied listeners and direct listeners
+            let handshaker_span = info_span!("listen_handshaker", peer = ?connected_addr);
             // Construct a handshake future but do not drive it yet....
-            let handshake = handshaker.call((tcp_stream, addr));
+            let handshake = handshaker.call((tcp_stream, connected_addr));
             // ... instead, spawn a new task to handle this connection
             let mut tx2 = tx.clone();
-            tokio::spawn(async move {
-                if let Ok(client) = handshake.await {
-                    let _ = tx2.send(Ok(Change::Insert(addr, client))).await;
+            tokio::spawn(
+                async move {
+                    if let Ok(client) = handshake.await {
+                        let _ = tx2.send(Ok(Change::Insert(addr, client))).await;
+                    }
                 }
-            });
+                .instrument(handshaker_span),
+            );
         }
     }
 }
@@ -296,7 +344,7 @@ enum CrawlerAction {
 ///
 /// Crawl for new peers every `crawl_new_peer_interval`, and whenever there is
 /// demand, but no new peers in `candidates`. After crawling, try to connect to
-/// one new peer using `connector`.
+/// one new peer using `outbound_connector`.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`.
@@ -304,13 +352,13 @@ enum CrawlerAction {
 /// The crawler terminates when `candidates.update()` or `success_tx` returns a
 /// permanent internal error. Transient errors and individual peer errors should
 /// be handled within the crawler.
-#[instrument(skip(demand_tx, demand_rx, candidates, connector, success_tx))]
+#[instrument(skip(demand_tx, demand_rx, candidates, outbound_connector, success_tx))]
 async fn crawl_and_dial<C, S>(
     crawl_new_peer_interval: std::time::Duration,
     mut demand_tx: mpsc::Sender<()>,
     mut demand_rx: mpsc::Receiver<()>,
     mut candidates: CandidateSet<S>,
-    connector: C,
+    outbound_connector: C,
     mut success_tx: mpsc::Sender<PeerChange>,
 ) -> Result<(), BoxError>
 where
@@ -383,13 +431,14 @@ where
             DemandHandshake { candidate } => {
                 // spawn each handshake into an independent task, so it can make
                 // progress independently of the crawls
-                let hs_join =
-                    tokio::spawn(dial(candidate, connector.clone())).map(move |res| match res {
+                let hs_join = tokio::spawn(dial(candidate, outbound_connector.clone()))
+                    .map(move |res| match res {
                         Ok(crawler_action) => crawler_action,
                         Err(e) => {
                             panic!("panic during handshaking with {:?}: {:?} ", candidate, e);
                         }
-                    });
+                    })
+                    .instrument(Span::current());
                 handshakes.push(Box::pin(hs_join));
             }
             DemandCrawl => {
@@ -435,12 +484,12 @@ where
     }
 }
 
-/// Try to connect to `candidate` using `connector`.
+/// Try to connect to `candidate` using `outbound_connector`.
 ///
 /// Returns a `HandshakeConnected` action on success, and a
 /// `HandshakeFailed` action on error.
-#[instrument(skip(connector,))]
-async fn dial<C>(candidate: MetaAddr, mut connector: C) -> CrawlerAction
+#[instrument(skip(outbound_connector,))]
+async fn dial<C>(candidate: MetaAddr, mut outbound_connector: C) -> CrawlerAction
 where
     C: Service<SocketAddr, Response = Change<SocketAddr, peer::Client>, Error = BoxError>
         + Clone
@@ -457,10 +506,13 @@ where
     debug!(?candidate.addr, "attempting outbound connection in response to demand");
 
     // the connector is always ready, so this can't hang
-    let connector = connector.ready_and().await.expect("connector never errors");
+    let outbound_connector = outbound_connector
+        .ready_and()
+        .await
+        .expect("outbound connector never errors");
 
     // the handshake has timeouts, so it shouldn't hang
-    connector
+    outbound_connector
         .call(candidate.addr)
         .map_err(|e| (candidate, e))
         .map(Into::into)

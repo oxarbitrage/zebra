@@ -24,7 +24,10 @@ pub enum TransactionError {
     CoinbasePosition,
 
     #[error("coinbase input found in non-coinbase transaction")]
-    CoinbaseInputFound,
+    CoinbaseAfterFirst,
+
+    #[error("coinbase transaction MUST NOT have any transparent (PrevOut) inputs")]
+    CoinbaseHasPrevOutInput,
 
     #[error("coinbase transaction MUST NOT have any JoinSplit descriptions")]
     CoinbaseHasJoinSplit,
@@ -35,11 +38,17 @@ pub enum TransactionError {
     #[error("coinbase transaction MUST NOT have any Output descriptions pre-Heartwood")]
     CoinbaseHasOutputPreHeartwood,
 
+    #[error("coinbase transaction MUST NOT have the EnableSpendsOrchard flag set")]
+    CoinbaseHasEnableSpendsOrchard,
+
     #[error("coinbase transaction failed subsidy validation")]
     Subsidy(#[from] SubsidyError),
 
     #[error("transaction version number MUST be >= 4")]
     WrongVersion,
+
+    #[error("transaction version {0} not supported by the network upgrade {1:?}")]
+    UnsupportedByNetworkUpgrade(u32, zebra_chain::parameters::NetworkUpgrade),
 
     #[error("must have at least one input: transparent, shielded spend, or joinsplit")]
     NoInputs,
@@ -62,20 +71,27 @@ pub enum TransactionError {
     Groth16,
 
     #[error(
-        "joinSplitSig MUST represent a valid signature under joinSplitPubKey of dataToBeSigned"
+        "Sprout joinSplitSig MUST represent a valid signature under joinSplitPubKey of dataToBeSigned"
     )]
     Ed25519(#[from] zebra_chain::primitives::ed25519::Error),
 
-    #[error("bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash")]
+    #[error("Sapling bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash")]
     RedJubjub(zebra_chain::primitives::redjubjub::Error),
+
+    #[error("Orchard bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash")]
+    RedPallas(zebra_chain::primitives::redpallas::Error),
 
     // temporary error type until #1186 is fixed
     #[error("Downcast from BoxError to redjubjub::Error failed")]
     InternalDowncastError(String),
+
+    #[error("adding to the sprout pool is disabled after Canopy")]
+    DisabledAddToSproutPool,
 }
 
 impl From<BoxError> for TransactionError {
     fn from(err: BoxError) -> Self {
+        // TODO: handle redpallas Error?
         match err.downcast::<zebra_chain::primitives::redjubjub::Error>() {
             Ok(e) => TransactionError::RedJubjub(*e),
             Err(e) => TransactionError::InternalDowncastError(format!(
@@ -143,4 +159,7 @@ pub enum BlockError {
         zebra_chain::work::difficulty::ExpandedDifficulty,
         zebra_chain::parameters::Network,
     ),
+
+    #[error("transaction has wrong consensus branch id for block network upgrade")]
+    WrongTransactionConsensusBranchId,
 }

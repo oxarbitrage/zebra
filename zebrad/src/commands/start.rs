@@ -21,7 +21,7 @@
 //!  * Inbound Service
 //!    * handles requests from peers for network data and chain data
 //!    * performs transaction and block diffusion
-//!    * downloads and verifies gossipped blocks and transactions
+//!    * downloads and verifies gossiped blocks and transactions
 
 use abscissa_core::{config, Command, FrameworkError, Options, Runnable};
 use color_eyre::eyre::{eyre, Report};
@@ -49,12 +49,11 @@ impl StartCmd {
         info!(?config);
 
         info!("initializing node state");
-        let state = ServiceBuilder::new().buffer(20).service(zebra_state::init(
-            config.state.clone(),
-            config.network.network,
-        ));
+        let (state_service, best_tip_height) =
+            zebra_state::init(config.state.clone(), config.network.network);
+        let state = ServiceBuilder::new().buffer(20).service(state_service);
 
-        info!("initializing chain verifier");
+        info!("initializing verifiers");
         let verifier = zebra_consensus::chain::init(
             config.consensus.clone(),
             config.network.network,
@@ -63,7 +62,6 @@ impl StartCmd {
         .await;
 
         info!("initializing network");
-
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set
         // in response to excess load.
@@ -73,7 +71,8 @@ impl StartCmd {
             .buffer(20)
             .service(Inbound::new(setup_rx, state.clone(), verifier.clone()));
 
-        let (peer_set, address_book) = zebra_network::init(config.network.clone(), inbound).await;
+        let (peer_set, address_book) =
+            zebra_network::init(config.network.clone(), inbound, Some(best_tip_height)).await;
         setup_tx
             .send((peer_set.clone(), address_book))
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;

@@ -15,41 +15,43 @@ use zebra_chain::{
     block::{self, Block, Height},
     parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    transaction::{arbitrary::transaction_to_fake_v5, Transaction},
     work::difficulty::{ExpandedDifficulty, INVALID_COMPACT_DIFFICULTY},
 };
-use zebra_test::transcript::{TransError, Transcript};
+use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
-static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Arc<Block>, Result<block::Hash, TransError>)>> =
-    Lazy::new(|| {
-        let block: Arc<_> =
-            Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap()
-                .into();
-        let hash = Ok(block.as_ref().into());
-        vec![(block, hash)]
-    });
+static VALID_BLOCK_TRANSCRIPT: Lazy<
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+    let hash = Ok(block.as_ref().into());
+    vec![(block, hash)]
+});
 
-static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<Vec<(Arc<Block>, Result<block::Hash, TransError>)>> =
-    Lazy::new(|| {
-        let mut block: Block =
-            Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap();
+static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let mut block: Block =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
 
-        // Modify the block's time
-        // Changing the block header also invalidates the header hashes, but
-        // those checks should be performed later in validation, because they
-        // are more expensive.
-        let three_hours_in_the_future = Utc::now()
-            .checked_add_signed(chrono::Duration::hours(3))
-            .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
-            .unwrap();
-        block.header.time = three_hours_in_the_future;
+    // Modify the block's time
+    // Changing the block header also invalidates the header hashes, but
+    // those checks should be performed later in validation, because they
+    // are more expensive.
+    let three_hours_in_the_future = Utc::now()
+        .checked_add_signed(chrono::Duration::hours(3))
+        .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
+        .unwrap();
+    block.header.time = three_hours_in_the_future;
 
-        vec![(Arc::new(block), Err(TransError::Any))]
-    });
+    vec![(Arc::new(block), Err(ExpectedTranscriptError::Any))]
+});
 
 static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
-    Vec<(Arc<Block>, Result<block::Hash, TransError>)>,
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
 > = Lazy::new(|| {
     let mut block: Block =
         Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
@@ -57,50 +59,49 @@ static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
     // Change nonce to something invalid
     block.header.nonce = [0; 32];
 
-    vec![(Arc::new(block), Err(TransError::Any))]
+    vec![(Arc::new(block), Err(ExpectedTranscriptError::Any))]
 });
 
-static INVALID_COINBASE_TRANSCRIPT: Lazy<Vec<(Arc<Block>, Result<block::Hash, TransError>)>> =
-    Lazy::new(|| {
-        let header =
-            block::Header::zcash_deserialize(&zebra_test::vectors::DUMMY_HEADER[..]).unwrap();
+static INVALID_COINBASE_TRANSCRIPT: Lazy<
+    Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let header = block::Header::zcash_deserialize(&zebra_test::vectors::DUMMY_HEADER[..]).unwrap();
 
-        // Test 1: Empty transaction
-        let block1 = Block {
-            header,
-            transactions: Vec::new(),
-        };
+    // Test 1: Empty transaction
+    let block1 = Block {
+        header,
+        transactions: Vec::new(),
+    };
 
-        // Test 2: Transaction at first position is not coinbase
-        let mut transactions = Vec::new();
-        let tx = zebra_test::vectors::DUMMY_TX1
-            .zcash_deserialize_into()
-            .unwrap();
-        transactions.push(tx);
-        let block2 = Block {
-            header,
-            transactions,
-        };
+    // Test 2: Transaction at first position is not coinbase
+    let mut transactions = Vec::new();
+    let tx = zebra_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .unwrap();
+    transactions.push(tx);
+    let block2 = Block {
+        header,
+        transactions,
+    };
 
-        // Test 3: Invalid coinbase position
-        let mut block3 =
-            Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap();
-        assert_eq!(block3.transactions.len(), 1);
+    // Test 3: Invalid coinbase position
+    let mut block3 =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
+    assert_eq!(block3.transactions.len(), 1);
 
-        // Extract the coinbase transaction from the block
-        let coinbase_transaction = block3.transactions.get(0).unwrap().clone();
+    // Extract the coinbase transaction from the block
+    let coinbase_transaction = block3.transactions.get(0).unwrap().clone();
 
-        // Add another coinbase transaction to block
-        block3.transactions.push(coinbase_transaction);
-        assert_eq!(block3.transactions.len(), 2);
+    // Add another coinbase transaction to block
+    block3.transactions.push(coinbase_transaction);
+    assert_eq!(block3.transactions.len(), 2);
 
-        vec![
-            (Arc::new(block1), Err(TransError::Any)),
-            (Arc::new(block2), Err(TransError::Any)),
-            (Arc::new(block3), Err(TransError::Any)),
-        ]
-    });
+    vec![
+        (Arc::new(block1), Err(ExpectedTranscriptError::Any)),
+        (Arc::new(block2), Err(ExpectedTranscriptError::Any)),
+        (Arc::new(block3), Err(ExpectedTranscriptError::Any)),
+    ]
+});
 
 // TODO: enable this test after implementing contextual verification
 // #[tokio::test]
@@ -116,10 +117,7 @@ async fn check_transcripts() -> Result<(), Report> {
     zebra_test::init();
 
     let network = Network::Mainnet;
-    let state_service = Buffer::new(
-        zebra_state::init(zebra_state::Config::ephemeral(), network),
-        1,
-    );
+    let state_service = zebra_state::init_test(network);
 
     let block_verifier = Buffer::new(BlockVerifier::new(network, state_service.clone()), 1);
 
@@ -283,9 +281,7 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
             .expect("block is structurally valid");
 
         // TODO: first halving, second halving, third halving, and very large halvings
-        if block::Height(height) > SLOW_START_INTERVAL
-            && block::Height(height) < NetworkUpgrade::Canopy.activation_height(network).unwrap()
-        {
+        if block::Height(height) > SLOW_START_INTERVAL {
             check::subsidy_is_valid(&block, network).expect("subsidies should pass for this block");
         }
     }
@@ -356,7 +352,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
 
     // Validate the block using coinbase_is_first
     let result = check::coinbase_is_first(&block).unwrap_err();
-    let expected = BlockError::Transaction(TransactionError::CoinbaseInputFound);
+    let expected = BlockError::Transaction(TransactionError::CoinbaseAfterFirst);
     assert_eq!(expected, result);
 
     // Validate the block using subsidy_is_valid, which does not detect this error
@@ -433,6 +429,95 @@ fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
             &block.hash(),
         )
         .expect("the header time from a historical block should be valid, based on the test machine's local clock. Hint: check the test machine's time, date, and timezone.");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn merkle_root_is_valid() -> Result<(), Report> {
+    zebra_test::init();
+
+    // test all original blocks available, all blocks validate
+    merkle_root_is_valid_for_network(Network::Mainnet)?;
+    merkle_root_is_valid_for_network(Network::Testnet)?;
+
+    // create and test fake blocks with v5 transactions, all blocks fail validation
+    merkle_root_fake_v5_for_network(Network::Mainnet)?;
+    merkle_root_fake_v5_for_network(Network::Testnet)?;
+
+    Ok(())
+}
+
+fn merkle_root_is_valid_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (_height, block) in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Vec<_>>();
+
+        check::merkle_root_validity(network, &block, &transaction_hashes)
+            .expect("merkle root should be valid for this block");
+    }
+
+    Ok(())
+}
+
+fn merkle_root_fake_v5_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (height, block) in block_iter {
+        let mut block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        // skip blocks that are before overwinter as they will not have a valid consensus branch id
+        if *height
+            < NetworkUpgrade::Overwinter
+                .activation_height(network)
+                .expect("a valid overwinter activation height")
+                .0
+        {
+            continue;
+        }
+
+        // convert all transactions from the block to V5
+        let transactions: Vec<Arc<Transaction>> = block
+            .transactions
+            .iter()
+            .map(AsRef::as_ref)
+            .map(|t| transaction_to_fake_v5(t, network, Height(*height)))
+            .map(Into::into)
+            .collect();
+
+        block.transactions = transactions;
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Vec<_>>();
+
+        // Replace the merkle root so that it matches the modified transactions.
+        // This test provides some transaction id and merkle root coverage,
+        // but we also need to test against zcashd test vectors.
+        block.header.merkle_root = transaction_hashes.iter().cloned().collect();
+
+        check::merkle_root_validity(network, &block, &transaction_hashes)
+            .expect("merkle root should be valid for this block");
     }
 
     Ok(())

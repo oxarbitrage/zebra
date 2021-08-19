@@ -7,13 +7,13 @@ use abscissa_core::{
     config::Configurable,
     terminal::component::Terminal,
     terminal::ColorChoice,
-    Application, Component, EntryPoint, FrameworkError, Shutdown, StandardPaths,
+    Application, Component, EntryPoint, FrameworkError, Shutdown, StandardPaths, Version,
 };
 use application::fatal_error;
 use std::process;
 
 use zebra_network::constants::PORT_IN_USE_ERROR;
-use zebra_state::constants::LOCK_FILE_ERROR;
+use zebra_state::constants::{DATABASE_FORMAT_VERSION, LOCK_FILE_ERROR};
 
 /// Application state
 pub static APPLICATION: AppCell<ZebradApp> = AppCell::new();
@@ -37,6 +37,59 @@ pub fn app_config() -> config::Reader<ZebradApp> {
     config::Reader::new(&APPLICATION)
 }
 
+/// Returns the zebrad version for this build, in SemVer 2.0 format.
+///
+/// Includes the git commit and the number of commits since the last version
+/// tag, if available.
+///
+/// For details, see https://semver.org/
+pub fn app_version() -> Version {
+    const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+    let vergen_git_semver: Option<&str> = option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT");
+
+    match vergen_git_semver {
+        // change the git semver format to the semver 2.0 format
+        Some(mut vergen_git_semver) if !vergen_git_semver.is_empty() => {
+            // strip the leading "v", if present
+            if &vergen_git_semver[0..1] == "v" {
+                vergen_git_semver = &vergen_git_semver[1..];
+            }
+
+            // split into tag, commit count, hash
+            let rparts: Vec<_> = vergen_git_semver.rsplitn(3, '-').collect();
+
+            match rparts.as_slice() {
+                // assume it's a cargo package version or a git tag with no hash
+                [_] | [_, _] => vergen_git_semver.parse().unwrap_or_else(|_| {
+                    panic!(
+                        "VERGEN_GIT_SEMVER without a hash {:?} must be valid semver 2.0",
+                        vergen_git_semver
+                    )
+                }),
+
+                // it's the "git semver" format, which doesn't quite match SemVer 2.0
+                [hash, commit_count, tag] => {
+                    let semver_fix = format!("{}+{}.{}", tag, commit_count, hash);
+                    semver_fix.parse().unwrap_or_else(|_|
+                                                      panic!("Modified VERGEN_GIT_SEMVER {:?} -> {:?} -> {:?} must be valid. Note: CARGO_PKG_VERSION was {:?}.",
+                                                             vergen_git_semver,
+                                                             rparts,
+                                                             semver_fix,
+                                                             CARGO_PKG_VERSION))
+                }
+
+                _ => unreachable!("split is limited to 3 parts"),
+            }
+        }
+        _ => CARGO_PKG_VERSION.parse().unwrap_or_else(|_| {
+            panic!(
+                "CARGO_PKG_VERSION {:?} must be valid semver 2.0",
+                CARGO_PKG_VERSION
+            )
+        }),
+    }
+}
+
 /// Zebrad Application
 #[derive(Debug)]
 pub struct ZebradApp {
@@ -53,11 +106,18 @@ impl ZebradApp {
         atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr)
     }
 
-    pub fn git_commit() -> &'static str {
-        const GIT_COMMIT_VERGEN: &str = env!("VERGEN_SHA_SHORT");
+    /// Returns the git commit for this build, if available.
+    ///
+    ///
+    /// # Accuracy
+    ///
+    /// If the user makes changes, but does not commit them, the git commit will
+    /// not match the compiled source code.
+    pub fn git_commit() -> Option<&'static str> {
         const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
+        const GIT_COMMIT_VERGEN: Option<&str> = option_env!("VERGEN_GIT_SHA_SHORT");
 
-        GIT_COMMIT_GCLOUD.unwrap_or(GIT_COMMIT_VERGEN)
+        GIT_COMMIT_GCLOUD.or(GIT_COMMIT_VERGEN)
     }
 }
 
@@ -154,19 +214,54 @@ impl Application for ZebradApp {
             color_eyre::config::Theme::new()
         };
 
-        // collect the common metadata for the issue URL and panic report
-        let network = config.network.network.to_string();
-        let panic_metadata = vec![
-            ("version", env!("CARGO_PKG_VERSION").to_string()),
-            ("git commit", Self::git_commit().to_string()),
-            ("Zcash network", network),
+        // collect the common metadata for the issue URL and panic report,
+        // skipping any env vars that aren't present
+
+        let app_metadata = vec![
+            // cargo or git tag + short commit
+            ("version", app_version().to_string()),
+            // config
+            ("Zcash network", config.network.network.to_string()),
+            // constants
+            ("state version", DATABASE_FORMAT_VERSION.to_string()),
         ];
+
+        // git env vars can be skipped if there is no `.git` during the
+        // build, so they must all be optional
+        let git_metadata: &[(_, Option<_>)] = &[
+            ("branch", option_env!("VERGEN_GIT_BRANCH")),
+            ("git commit", Self::git_commit()),
+            (
+                "commit timestamp",
+                option_env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
+            ),
+        ];
+        // skip missing metadata
+        let git_metadata: Vec<(_, String)> = git_metadata
+            .iter()
+            .filter_map(|(k, v)| Some((k, (*v)?)))
+            .map(|(k, v)| (*k, v.to_string()))
+            .collect();
+
+        let build_metadata: Vec<_> = [
+            ("target triple", env!("VERGEN_CARGO_TARGET_TRIPLE")),
+            ("build profile", env!("VERGEN_CARGO_PROFILE")),
+        ]
+        .iter()
+        .map(|(k, v)| (*k, v.to_string()))
+        .collect();
+
+        let panic_metadata: Vec<_> = app_metadata
+            .iter()
+            .chain(git_metadata.iter())
+            .chain(build_metadata.iter())
+            .collect();
 
         let mut builder = color_eyre::config::HookBuilder::default();
         let mut metadata_section = "Metadata:".to_string();
         for (k, v) in panic_metadata {
             builder = builder.add_issue_metadata(k, v.clone());
-            metadata_section.push_str(&format!("\n{}: {}", k, v));
+            metadata_section.push_str(&format!("\n{}: {}", k, &v));
         }
 
         builder = builder
@@ -213,7 +308,7 @@ impl Application for ZebradApp {
         let guard = sentry::init(
             sentry::ClientOptions {
                 debug: true,
-                release: Some(Self::git_commit().into()),
+                release: Some(app_version().to_string().into()),
                 ..Default::default()
             }
             .add_integration(sentry_tracing::TracingIntegration::default()),
@@ -249,30 +344,29 @@ impl Application for ZebradApp {
             .unwrap_or(false);
 
         // Ignore the tracing filter for short-lived commands
+        let mut tracing_config = cfg_ref.tracing.clone();
         if is_server {
             // Override the default tracing filter based on the command-line verbosity.
-            let mut tracing_config = cfg_ref.tracing.clone();
             tracing_config.filter = tracing_config
                 .filter
                 .or_else(|| Some(default_filter.to_owned()));
-
-            components.push(Box::new(Tracing::new(tracing_config)?));
         } else {
             // Don't apply the configured filter for short-lived commands.
-            let mut tracing_config = cfg_ref.tracing.clone();
             tracing_config.filter = Some(default_filter.to_owned());
             tracing_config.flamegraph = None;
-            components.push(Box::new(Tracing::new(tracing_config)?));
         }
+        components.push(Box::new(Tracing::new(tracing_config)?));
 
         // Activate the global span, so it's visible when we load the other
         // components. Space is at a premium here, so we use an empty message,
         // short commit hash, and the unique part of the network name.
-        let global_span = error_span!(
-            "",
-            zebrad = ZebradApp::git_commit(),
-            net = &self.config.clone().unwrap().network.network.to_string()[..4],
-        );
+        let net = &self.config.clone().unwrap().network.network.to_string()[..4];
+        let global_span = if let Some(git_commit) = ZebradApp::git_commit() {
+            error_span!("", zebrad = git_commit, net)
+        } else {
+            error_span!("", net)
+        };
+
         let global_guard = global_span.enter();
         // leak the global span, to make sure it stays active
         std::mem::forget(global_guard);
@@ -327,5 +421,9 @@ impl Application for ZebradApp {
             Shutdown::Forced => process::exit(1),
             Shutdown::Crash => process::exit(2),
         }
+    }
+
+    fn version(&self) -> Version {
+        app_version()
     }
 }

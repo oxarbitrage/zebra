@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 ///
 /// Network upgrades can change the Zcash network protocol or consensus rules in
 /// incompatible ways.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum NetworkUpgrade {
     /// The Zcash protocol for a Genesis block.
     ///
@@ -37,7 +37,7 @@ pub enum NetworkUpgrade {
     Heartwood,
     /// The Zcash protocol after the Canopy upgrade.
     Canopy,
-    /// The Zcash protocol after the NU5 upgrade.
+    /// The Zcash protocol after the Nu5 upgrade.
     ///
     /// Note: Network Upgrade 5 includes the Orchard Shielded Protocol, and
     /// other changes. The Nu5 code name has not been chosen yet.
@@ -56,7 +56,7 @@ pub(crate) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
     (block::Height(653_600), Blossom),
     (block::Height(903_000), Heartwood),
     (block::Height(1_046_400), Canopy),
-    // TODO: Add NU5 mainnet activation height
+    // TODO: Add Nu5 mainnet activation height
 ];
 
 /// Testnet network upgrade activation heights.
@@ -71,7 +71,7 @@ pub(crate) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
     (block::Height(584_000), Blossom),
     (block::Height(903_800), Heartwood),
     (block::Height(1_028_500), Canopy),
-    // TODO: Add NU5 testnet activation height
+    // TODO: Add Nu5 testnet activation height
 ];
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a
@@ -161,7 +161,8 @@ impl NetworkUpgrade {
 
     /// Returns the next network upgrade for `network` and `height`.
     ///
-    /// Returns None if the name of the next upgrade has not been decided yet.
+    /// Returns None if the next upgrade has not been implemented in Zebra
+    /// yet.
     pub fn next(network: Network, height: block::Height) -> Option<NetworkUpgrade> {
         NetworkUpgrade::activation_list(network)
             .range((Excluded(height), Unbounded))
@@ -197,7 +198,7 @@ impl NetworkUpgrade {
     ///
     /// Returns None if this network upgrade has no consensus branch id.
     pub fn branch_id(&self) -> Option<ConsensusBranchId> {
-        NetworkUpgrade::branch_id_list().get(&self).cloned()
+        NetworkUpgrade::branch_id_list().get(self).cloned()
     }
 
     /// Returns the target block spacing for the network upgrade.
@@ -224,9 +225,6 @@ impl NetworkUpgrade {
     /// Returns `None` if the testnet minimum difficulty consensus rule is not active.
     ///
     /// Based on https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network
-    ///
-    /// `zcashd` requires a gap that's strictly greater than 6 times the target
-    /// threshold, but ZIP-205 and ZIP-208 are ambiguous. See bug #1276.
     pub fn minimum_difficulty_spacing_for_height(
         network: Network,
         height: block::Height,
@@ -302,6 +300,13 @@ impl NetworkUpgrade {
             Network::Mainnet => true,
             Network::Testnet => height >= TESTNET_MAX_TIME_START_HEIGHT,
         }
+    }
+    /// Returns the NetworkUpgrade given an u32 as ConsensusBranchId
+    pub fn from_branch_id(branch_id: u32) -> Option<NetworkUpgrade> {
+        CONSENSUS_BRANCH_IDS
+            .iter()
+            .find(|id| id.1 == ConsensusBranchId(branch_id))
+            .map(|nu| nu.0)
     }
 }
 
