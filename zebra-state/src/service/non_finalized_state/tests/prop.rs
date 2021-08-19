@@ -3,11 +3,13 @@ use std::{env, sync::Arc};
 use zebra_test::prelude::*;
 
 use zebra_chain::{
+    amount::NonNegative,
     block::{self, arbitrary::allow_all_transparent_coinbase_spends, Block},
     fmt::DisplayToDebug,
     history_tree::{HistoryTree, NonEmptyHistoryTree},
     parameters::NetworkUpgrade::*,
     parameters::{Network, *},
+    value_balance::ValueBalance,
     LedgerState,
 };
 
@@ -42,8 +44,9 @@ fn forked_equals_pushed() -> Result<()> {
             // use `fork_at_count` as the fork tip
             let fork_tip_hash = chain[fork_at_count - 1].hash;
 
-            let mut full_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree.clone());
-            let mut partial_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree.clone());
+            let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+            let mut full_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree.clone(), fake_value_pool);
+            let mut partial_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree.clone(), fake_value_pool);
 
             for block in chain.iter().take(fork_at_count) {
                 partial_chain = partial_chain.push(block.clone())?;
@@ -113,7 +116,9 @@ fn finalized_equals_pushed() -> Result<()> {
         let chain = &chain[1..];
         // use `end_count` as the number of non-finalized blocks at the end of the chain
         let finalized_count = chain.len() - end_count;
-        let mut full_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree);
+
+        let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+        let mut full_chain = Chain::new(network, Default::default(), Default::default(), finalized_tree, fake_value_pool);
 
         for block in chain.iter().take(finalized_count) {
             full_chain = full_chain.push(block.clone())?;
@@ -123,6 +128,7 @@ fn finalized_equals_pushed() -> Result<()> {
             full_chain.sapling_note_commitment_tree.clone(),
             full_chain.orchard_note_commitment_tree.clone(),
             full_chain.history_tree.clone(),
+            full_chain.value_balance,
         );
         for block in chain.iter().skip(finalized_count) {
             partial_chain = partial_chain.push(block.clone())?;
@@ -173,6 +179,9 @@ fn rejection_restores_internal_state() -> Result<()> {
                 ))| {
                   let mut state = NonFinalizedState::new(network);
                   let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+
+                  let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+                  finalized_state.set_current_value_pool(fake_value_pool);
 
                   // use `valid_count` as the number of valid blocks before an invalid block
                   let valid_tip_height = chain[valid_count - 1].height;
@@ -250,8 +259,8 @@ fn different_blocks_different_chains() -> Result<()> {
         } else {
             Default::default()
         };
-        let chain1 = Chain::new(Network::Mainnet, Default::default(), Default::default(), finalized_tree1);
-        let chain2 = Chain::new(Network::Mainnet, Default::default(), Default::default(), finalized_tree2);
+        let chain1 = Chain::new(Network::Mainnet, Default::default(), Default::default(), finalized_tree1, ValueBalance::zero());
+        let chain2 = Chain::new(Network::Mainnet, Default::default(), Default::default(), finalized_tree2, ValueBalance::zero());
 
         let block1 = vec1[1].clone().prepare();
         let block2 = vec2[1].clone().prepare();
