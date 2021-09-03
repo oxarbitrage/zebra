@@ -1,0 +1,24 @@
+{
+  "files": [
+    "README.md"
+  ],
+  "imageSize": 100,
+  "commit": false,
+  "contributors": [
+    {
+      "login": "oxarbitrage",
+      "name": "Alfredo Garcia",
+      "avatar_url": "https://avatars.githubusercontent.com/u/21685097?v=4",
+      "profile": "http://oxarbitrage.com",
+      "contributions": [
+        "code"
+      ]
+    }
+  ],
+  "contributorsPerLine": 7,
+  "projectName": "zebra",
+  "projectOwner": "oxarbitrage",
+  "repoType": "github",
+  "repoHost": "https://github.com",
+  "skipCi": true
+}
