@@ -29,21 +29,21 @@ use zebra_chain::{
 };
 use zebra_state as zs;
 
-use crate::{error::*, transaction as tx};
-use crate::{script, BoxError};
+use crate::{error::*, transaction as tx, BoxError};
 
 pub mod check;
 mod subsidy;
+
 #[cfg(test)]
 mod tests;
 
 /// Asynchronous block verification.
 #[derive(Debug)]
-pub struct BlockVerifier<S> {
+pub struct BlockVerifier<S, V> {
     /// The network to be verified.
     network: Network,
     state_service: S,
-    transaction_verifier: tx::Verifier<S>,
+    transaction_verifier: V,
 }
 
 // TODO: dedupe with crate::error::BlockError
@@ -72,18 +72,17 @@ pub enum VerifyBlockError {
     Commit(#[source] BoxError),
 
     #[error("invalid transaction")]
-    Transaction(#[source] TransactionError),
+    Transaction(#[from] TransactionError),
 }
 
-impl<S> BlockVerifier<S>
+impl<S, V> BlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
+    V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    V::Future: Send + 'static,
 {
-    pub fn new(network: Network, state_service: S) -> Self {
-        let transaction_verifier =
-            tx::Verifier::new(network, script::Verifier::new(state_service.clone()));
-
+    pub fn new(network: Network, state_service: S, transaction_verifier: V) -> Self {
         Self {
             network,
             state_service,
@@ -92,10 +91,12 @@ where
     }
 }
 
-impl<S> Service<Arc<Block>> for BlockVerifier<S>
+impl<S, V> Service<Arc<Block>> for BlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
+    V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    V::Future: Send + 'static,
 {
     type Response = block::Hash;
     type Error = VerifyBlockError;
@@ -154,11 +155,8 @@ where
             // the header binds to the transactions in the blocks.
 
             // Precomputing this avoids duplicating transaction hash computations.
-            let transaction_hashes = block
-                .transactions
-                .iter()
-                .map(|t| t.hash())
-                .collect::<Vec<_>>();
+            let transaction_hashes: Arc<[_]> =
+                block.transactions.iter().map(|t| t.hash()).collect();
 
             check::merkle_root_validity(network, &block, &transaction_hashes)?;
 
@@ -195,7 +193,9 @@ where
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
-                result.map_err(VerifyBlockError::Transaction)?;
+                result
+                    .map_err(Into::into)
+                    .map_err(VerifyBlockError::Transaction)?;
             }
 
             // Update the metrics after all the validation is finished

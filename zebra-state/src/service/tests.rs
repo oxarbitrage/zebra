@@ -1,10 +1,12 @@
-use std::{env, sync::Arc};
+use std::{convert::TryInto, env, sync::Arc};
 
-use futures::stream::FuturesUnordered;
+use futures::{stream::FuturesUnordered, FutureExt};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zebra_chain::{
-    block::Block,
+    block::{self, Block},
+    chain_tip::ChainTip,
+    fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction, transparent,
@@ -15,7 +17,7 @@ use zebra_test::{prelude::*, transcript::Transcript};
 use crate::{
     arbitrary::Prepare,
     constants, init_test,
-    service::StateService,
+    service::{chain_tip::TipAction, StateService},
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, Config, FinalizedBlock, PreparedBlock, Request, Response,
 };
@@ -89,7 +91,7 @@ async fn test_populated_state_responds_correctly(
                     Ok(Response::Transaction(Some(transaction.clone()))),
                 ));
 
-                let from_coinbase = transaction.is_coinbase();
+                let from_coinbase = transaction.has_valid_coinbase_transaction_inputs();
                 for (index, output) in transaction.outputs().iter().cloned().enumerate() {
                     let outpoint = transparent::OutPoint {
                         hash: transaction_hash,
@@ -289,30 +291,69 @@ proptest! {
     /// 4. Commit the non-finalized blocks and check that the best tip height is also updated
     ///    accordingly.
     #[test]
-    fn best_tip_height_is_updated(
+    fn chain_tip_sender_is_updated(
         (network, finalized_blocks, non_finalized_blocks)
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         zebra_test::init();
 
-        let (mut state_service, best_tip_height) = StateService::new(Config::ephemeral(), network);
+        let (mut state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), network);
 
-        prop_assert_eq!(*best_tip_height.borrow(), None);
+        prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
+        prop_assert_eq!(
+            chain_tip_change
+                .tip_change()
+                .now_or_never()
+                .transpose()
+                .expect("watch sender is not dropped"),
+            None
+        );
 
         for block in finalized_blocks {
-            let expected_height = block.height;
+            let expected_block = block.clone();
+
+            let expected_action = if expected_block.height <= block::Height(1) {
+                // 0: reset by both initialization and the Genesis network upgrade
+                // 1: reset by the BeforeOverwinter network upgrade
+                TipAction::reset_with(expected_block.clone().into())
+            } else {
+                TipAction::grow_with(expected_block.clone().into())
+            };
 
             state_service.queue_and_commit_finalized(block);
 
-            prop_assert_eq!(*best_tip_height.borrow(), Some(expected_height));
+            prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
+            prop_assert_eq!(
+                chain_tip_change
+                    .tip_change()
+                    .now_or_never()
+                    .transpose()
+                    .expect("watch sender is not dropped"),
+                Some(expected_action)
+            );
         }
 
         for block in non_finalized_blocks {
-            let expected_height = block.height;
+            let expected_block = block.clone();
+
+            let expected_action = if expected_block.height == block::Height(1) {
+                // 1: reset by the BeforeOverwinter network upgrade
+                TipAction::reset_with(expected_block.clone().into())
+            } else {
+                TipAction::grow_with(expected_block.clone().into())
+            };
 
             state_service.queue_and_commit_non_finalized(block);
 
-            prop_assert_eq!(*best_tip_height.borrow(), Some(expected_height));
+            prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
+            prop_assert_eq!(
+                chain_tip_change
+                    .tip_change()
+                    .now_or_never()
+                    .transpose()
+                    .expect("watch sender is not dropped"),
+                Some(expected_action)
+            );
         }
     }
 
@@ -321,29 +362,77 @@ proptest! {
     /// 1. Generate a finalized chain and some non-finalized blocks.
     /// 2. Check that initially the value pool is empty.
     /// 3. Commit the finalized blocks and check that the value pool is updated accordingly.
-    /// 4. TODO: Commit the non-finalized blocks and check that the value pool is also updated
+    /// 4. Commit the non-finalized blocks and check that the value pool is also updated
     ///    accordingly.
     #[test]
     fn value_pool_is_updated(
-        (network, finalized_blocks, _non_finalized_blocks)
+        (network, finalized_blocks, non_finalized_blocks)
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         zebra_test::init();
 
-        let (mut state_service, _) = StateService::new(Config::ephemeral(), network);
+        let (mut state_service, _, _) = StateService::new(Config::ephemeral(), network);
 
         prop_assert_eq!(state_service.disk.current_value_pool(), ValueBalance::zero());
+        prop_assert_eq!(
+            state_service.mem.best_chain().map(|chain| chain.chain_value_pools).unwrap_or_else(ValueBalance::zero),
+            ValueBalance::zero()
+        );
 
-        let mut expected_value_pool = Ok(ValueBalance::zero());
+        // the slow start rate for the first few blocks, as in the spec
+        const SLOW_START_RATE: i64 = 62500;
+        // the expected transparent pool value, calculated using the slow start rate
+        let mut expected_transparent_pool = ValueBalance::zero();
+
+        let mut expected_finalized_value_pool = Ok(ValueBalance::zero());
         for block in finalized_blocks {
-            let utxos = &block.new_outputs;
-            let block_value_pool = &block.block.chain_value_pool_change(utxos)?;
-            expected_value_pool += *block_value_pool;
+            // the genesis block has a zero-valued transparent output,
+            // which is not included in the UTXO set
+            if block.height > block::Height(0) {
+                let utxos = &block.new_outputs;
+                let block_value_pool = &block.block.chain_value_pool_change(utxos)?;
+                expected_finalized_value_pool += *block_value_pool;
+            }
 
-            state_service.queue_and_commit_finalized(block);
+            state_service.queue_and_commit_finalized(block.clone());
+
+            prop_assert_eq!(
+                state_service.disk.current_value_pool(),
+                expected_finalized_value_pool.clone()?.constrain()?
+            );
+
+            let transparent_value = SLOW_START_RATE * i64::from(block.height.0);
+            let transparent_value = transparent_value.try_into().unwrap();
+            let transparent_value = ValueBalance::from_transparent_amount(transparent_value);
+            expected_transparent_pool = (expected_transparent_pool + transparent_value).unwrap();
+            prop_assert_eq!(
+                state_service.disk.current_value_pool(),
+                expected_transparent_pool
+            );
         }
 
-        prop_assert_eq!(state_service.disk.current_value_pool(), expected_value_pool?.constrain()?);
+        let mut expected_non_finalized_value_pool = Ok(expected_finalized_value_pool?);
+        for block in non_finalized_blocks {
+            let utxos = block.new_outputs.clone();
+            let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos))?;
+            expected_non_finalized_value_pool += *block_value_pool;
+
+            state_service.queue_and_commit_non_finalized(block.clone());
+
+            prop_assert_eq!(
+                state_service.mem.best_chain().unwrap().chain_value_pools,
+                expected_non_finalized_value_pool.clone()?.constrain()?
+            );
+
+            let transparent_value = SLOW_START_RATE * i64::from(block.height.0);
+            let transparent_value = transparent_value.try_into().unwrap();
+            let transparent_value = ValueBalance::from_transparent_amount(transparent_value);
+            expected_transparent_pool = (expected_transparent_pool + transparent_value).unwrap();
+            prop_assert_eq!(
+                state_service.mem.best_chain().unwrap().chain_value_pools,
+                expected_transparent_pool
+            );
+        }
     }
 }
 
@@ -352,8 +441,13 @@ proptest! {
 /// Selects either the mainnet or testnet chain test vector and randomly splits the chain in two
 /// lists of blocks. The first containing the blocks to be finalized (which always includes at
 /// least the genesis block) and the blocks to be stored in the non-finalized state.
-fn continuous_empty_blocks_from_test_vectors(
-) -> impl Strategy<Value = (Network, Vec<FinalizedBlock>, Vec<PreparedBlock>)> {
+fn continuous_empty_blocks_from_test_vectors() -> impl Strategy<
+    Value = (
+        Network,
+        SummaryDebug<Vec<FinalizedBlock>>,
+        SummaryDebug<Vec<PreparedBlock>>,
+    ),
+> {
     any::<Network>()
         .prop_flat_map(|network| {
             // Select the test vector based on the network
@@ -389,6 +483,10 @@ fn continuous_empty_blocks_from_test_vectors(
                 .map(|prepared_block| FinalizedBlock::from(prepared_block.block))
                 .collect();
 
-            (network, finalized_blocks, non_finalized_blocks)
+            (
+                network,
+                finalized_blocks.into(),
+                non_finalized_blocks.into(),
+            )
         })
 }

@@ -25,13 +25,14 @@
 
 use abscissa_core::{config, Command, FrameworkError, Options, Runnable};
 use color_eyre::eyre::{eyre, Report};
+use futures::{select, FutureExt};
 use tokio::sync::oneshot;
 use tower::builder::ServiceBuilder;
 
 use crate::components::{tokio::RuntimeRun, Inbound};
 use crate::config::ZebradConfig;
 use crate::{
-    components::{tokio::TokioComponent, ChainSync},
+    components::{mempool, tokio::TokioComponent, ChainSync},
     prelude::*,
 };
 
@@ -49,17 +50,22 @@ impl StartCmd {
         info!(?config);
 
         info!("initializing node state");
-        let (state_service, best_tip_height) =
+        // TODO: use ChainTipChange to get tip changes (#2374, #2710, #2711, #2712, #2713, #2714)
+        let (state_service, latest_chain_tip, _chain_tip_change) =
             zebra_state::init(config.state.clone(), config.network.network);
         let state = ServiceBuilder::new().buffer(20).service(state_service);
 
         info!("initializing verifiers");
-        let verifier = zebra_consensus::chain::init(
+        // TODO: use the transaction verifier to verify mempool transactions (#2637, #2606)
+        let (chain_verifier, tx_verifier) = zebra_consensus::chain::init(
             config.consensus.clone(),
             config.network.network,
             state.clone(),
         )
         .await;
+
+        info!("initializing mempool");
+        let mempool = mempool::Mempool::new(config.network.network);
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
@@ -69,18 +75,31 @@ impl StartCmd {
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(20)
-            .service(Inbound::new(setup_rx, state.clone(), verifier.clone()));
+            .service(Inbound::new(
+                setup_rx,
+                state.clone(),
+                chain_verifier.clone(),
+                tx_verifier.clone(),
+                mempool,
+            ));
 
         let (peer_set, address_book) =
-            zebra_network::init(config.network.clone(), inbound, Some(best_tip_height)).await;
+            zebra_network::init(config.network.clone(), inbound, latest_chain_tip).await;
         setup_tx
             .send((peer_set.clone(), address_book))
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;
 
         info!("initializing syncer");
-        let syncer = ChainSync::new(&config, peer_set, state, verifier);
+        // TODO: use sync_status to activate the mempool (#2592)
+        let (syncer, sync_status) =
+            ChainSync::new(&config, peer_set.clone(), state, chain_verifier);
 
-        syncer.sync().await
+        select! {
+            result = syncer.sync().fuse() => result,
+            _ = mempool::Crawler::spawn(peer_set, sync_status).fuse() => {
+                unreachable!("The mempool crawler only stops if it panics");
+            }
+        }
     }
 }
 

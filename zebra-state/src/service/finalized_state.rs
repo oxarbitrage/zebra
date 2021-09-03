@@ -19,7 +19,7 @@ use zebra_chain::{
     value_balance::ValueBalance,
 };
 
-use crate::{BoxError, Config, FinalizedBlock, HashOrHeight};
+use crate::{service::check, BoxError, Config, FinalizedBlock, HashOrHeight};
 
 use self::disk_format::{DiskDeserialize, DiskSerialize, FromDisk, IntoDisk, TransactionLocation};
 
@@ -146,15 +146,27 @@ impl FinalizedState {
     ///
     /// After queueing a finalized block, this method checks whether the newly
     /// queued block (and any of its descendants) can be committed to the state.
-    pub fn queue_and_commit_finalized(&mut self, queued: QueuedFinalized) {
+    ///
+    /// Returns the highest finalized tip block committed from the queue,
+    /// or `None` if no blocks were committed in this call.
+    /// (Use [`tip_block`] to get the finalized tip, regardless of when it was committed.)
+    pub fn queue_and_commit_finalized(
+        &mut self,
+        queued: QueuedFinalized,
+    ) -> Option<FinalizedBlock> {
+        let mut highest_queue_commit = None;
+
         let prev_hash = queued.0.block.header.previous_block_hash;
         let height = queued.0.height;
         self.queued_by_prev_hash.insert(prev_hash, queued);
 
         while let Some(queued_block) = self.queued_by_prev_hash.remove(&self.finalized_tip_hash()) {
-            self.commit_finalized(queued_block);
-            metrics::counter!("state.finalized.committed.block.count", 1);
-            metrics::gauge!("state.finalized.committed.block.height", height.0 as _);
+            if let Ok(finalized) = self.commit_finalized(queued_block) {
+                highest_queue_commit = Some(finalized);
+            } else {
+                // the last block in the queue failed, so we can't commit the next block
+                break;
+            }
         }
 
         if self.queued_by_prev_hash.is_empty() {
@@ -173,6 +185,8 @@ impl FinalizedState {
             "state.finalized.queued.block.count",
             self.queued_by_prev_hash.len() as f64
         );
+
+        highest_queue_commit
     }
 
     /// Returns the hash of the current finalized tip block.
@@ -207,20 +221,14 @@ impl FinalizedState {
     ///
     /// - Propagates any errors from writing to the DB
     /// - Propagates any errors from updating history and note commitment trees
+    /// - If `hashFinalSaplingRoot` / `hashLightClientRoot` / `hashBlockCommitments`
+    ///   does not match the expected value
     pub fn commit_finalized_direct(
         &mut self,
         finalized: FinalizedBlock,
         source: &str,
     ) -> Result<block::Hash, BoxError> {
         block_precommit_metrics(&finalized);
-
-        let FinalizedBlock {
-            block,
-            hash,
-            height,
-            new_outputs,
-            transaction_hashes,
-        } = finalized;
 
         let finalized_tip_height = self.finalized_tip_height();
 
@@ -248,27 +256,27 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.is_empty(hash_by_height) {
             assert_eq!(
-                GENESIS_PREVIOUS_BLOCK_HASH, block.header.previous_block_hash,
+                GENESIS_PREVIOUS_BLOCK_HASH, finalized.block.header.previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {}",
                 source,
             );
             assert_eq!(
                 block::Height(0),
-                height,
+                finalized.height,
                 "cannot commit genesis: invalid height, source: {}",
                 source,
             );
         } else {
             assert_eq!(
                 finalized_tip_height.expect("state must have a genesis block committed") + 1,
-                Some(height),
+                Some(finalized.height),
                 "committed block height must be 1 more than the finalized tip height, source: {}",
                 source,
             );
 
             assert_eq!(
                 self.finalized_tip_hash(),
-                block.header.previous_block_hash,
+                finalized.block.header.previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {}",
                 source,
             );
@@ -279,6 +287,27 @@ impl FinalizedState {
         let mut sapling_note_commitment_tree = self.sapling_note_commitment_tree();
         let mut orchard_note_commitment_tree = self.orchard_note_commitment_tree();
         let mut history_tree = self.history_tree();
+
+        // Check the block commitment. For Nu5-onward, the block hash commits only
+        // to non-authorizing data (see ZIP-244). This checks the authorizing data
+        // commitment, making sure the entire block contents were commited to.
+        // The test is done here (and not during semantic validation) because it needs
+        // the history tree root. While it _is_ checked during contextual validation,
+        // that is not called by the checkpoint verifier, and keeping a history tree there
+        // would be harder to implement.
+        check::finalized_block_commitment_is_valid_for_chain_history(
+            &finalized,
+            self.network,
+            &history_tree,
+        )?;
+
+        let FinalizedBlock {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+        } = finalized;
 
         // Prepare a batch of DB modifications and return it (without actually writing anything).
         // We use a closure so we can use an early return for control flow in
@@ -326,7 +355,7 @@ impl FinalizedState {
             for (transaction_index, (transaction, transaction_hash)) in block
                 .transactions
                 .iter()
-                .zip(transaction_hashes.into_iter())
+                .zip(transaction_hashes.iter())
                 .enumerate()
             {
                 let transaction_location = TransactionLocation {
@@ -405,8 +434,7 @@ impl FinalizedState {
             all_utxos_spent_by_block.extend(new_outputs);
 
             let current_pool = self.current_value_pool();
-            let new_pool =
-                current_pool.update_with_block(block.borrow(), &all_utxos_spent_by_block)?;
+            let new_pool = current_pool.add_block(block.borrow(), &all_utxos_spent_by_block)?;
             batch.zs_insert(tip_chain_value_pool, (), new_pool);
 
             Ok(batch)
@@ -439,10 +467,32 @@ impl FinalizedState {
     /// order. This function is called by [`queue`], which ensures order.
     /// It is intentionally not exposed as part of the public API of the
     /// [`FinalizedState`].
-    fn commit_finalized(&mut self, queued_block: QueuedFinalized) {
+    fn commit_finalized(&mut self, queued_block: QueuedFinalized) -> Result<FinalizedBlock, ()> {
         let (finalized, rsp_tx) = queued_block;
-        let result = self.commit_finalized_direct(finalized, "CommitFinalized request");
+        let result = self.commit_finalized_direct(finalized.clone(), "CommitFinalized request");
+
+        let block_result;
+        if result.is_ok() {
+            metrics::counter!("state.finalized.committed.block.count", 1);
+            metrics::gauge!(
+                "state.finalized.committed.block.height",
+                finalized.height.0 as _
+            );
+
+            block_result = Ok(finalized);
+        } else {
+            metrics::counter!("state.finalized.error.block.count", 1);
+            metrics::gauge!(
+                "state.finalized.error.block.height",
+                finalized.height.0 as _
+            );
+
+            block_result = Err(());
+        }
+
         let _ = rsp_tx.send(result.map_err(Into::into));
+
+        block_result
     }
 
     /// Returns the tip height and hash if there is one.
@@ -457,6 +507,12 @@ impl FinalizedState {
 
                 (height, hash)
             })
+    }
+
+    /// Returns the tip block, if there is one.
+    pub fn tip_block(&self) -> Option<Arc<Block>> {
+        let (height, _hash) = self.tip()?;
+        self.block(height.into())
     }
 
     /// Returns the height of the given block if it exists.
@@ -598,6 +654,16 @@ impl FinalizedState {
         self.db
             .zs_get(value_pool_cf, &())
             .unwrap_or_else(ValueBalance::zero)
+    }
+
+    /// Allow to set up a fake value pool in the database for testing purposes.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[allow(dead_code)]
+    pub fn set_current_value_pool(&self, fake_value_pool: ValueBalance<NonNegative>) {
+        let mut batch = rocksdb::WriteBatch::default();
+        let value_pool_cf = self.db.cf_handle("tip_chain_value_pool").unwrap();
+        batch.zs_insert(value_pool_cf, (), fake_value_pool);
+        self.db.write(batch).unwrap();
     }
 }
 

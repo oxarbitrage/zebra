@@ -1,8 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use zebra_chain::{
+    amount::NegativeAllowed,
     block::{self, Block},
-    transaction, transparent,
+    transaction,
+    transparent::{self, utxos_from_ordered_utxos},
+    value_balance::{ValueBalance, ValueBalanceError},
 };
 
 // Allow *only* this unused import, so that rustdoc link resolution
@@ -76,24 +79,27 @@ pub struct PreparedBlock {
     /// be unspent, since a later transaction in a block can spend outputs of an
     /// earlier transaction.
     pub new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    /// A precomputed list of the hashes of the transactions in this block.
-    pub transaction_hashes: Vec<transaction::Hash>,
-    // TODO: add these parameters when we can compute anchors.
-    // sprout_anchor: sprout::tree::Root,
-    // sapling_anchor: sapling::tree::Root,
+    /// A precomputed list of the hashes of the transactions in this block,
+    /// in the same order as `block.transactions`.
+    pub transaction_hashes: Arc<[transaction::Hash]>,
 }
+
+// Some fields are pub(crate), so we can add whatever db-format-dependent
+// precomputation we want here without leaking internal details.
 
 /// A contextually validated block, ready to be committed directly to the finalized state with
 /// no checks, if it becomes the root of the best non-finalized chain.
 ///
 /// Used by the state service and non-finalized [`Chain`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ContextuallyValidBlock {
+pub struct ContextuallyValidBlock {
     pub(crate) block: Arc<Block>,
     pub(crate) hash: block::Hash,
     pub(crate) height: block::Height,
     pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::Utxo>,
-    pub(crate) transaction_hashes: Vec<transaction::Hash>,
+    pub(crate) transaction_hashes: Arc<[transaction::Hash]>,
+    /// The sum of the chain value pool changes of all transactions in this block.
+    pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
 }
 
 /// A finalized block, ready to be committed directly to the finalized state with
@@ -102,30 +108,88 @@ pub(crate) struct ContextuallyValidBlock {
 /// This is exposed for use in checkpointing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedBlock {
-    // These are pub(crate) so we can add whatever db-format-dependent
-    // precomputation we want here without leaking internal details.
-    pub(crate) block: Arc<Block>,
-    pub(crate) hash: block::Hash,
-    pub(crate) height: block::Height,
+    /// The block to commit to the state.
+    pub block: Arc<Block>,
+    /// The hash of the block.
+    pub hash: block::Hash,
+    /// The height of the block.
+    pub height: block::Height,
+    /// New transparent outputs created in this block, indexed by
+    /// [`Outpoint`](transparent::Outpoint).
+    ///
+    /// Each output is tagged with its transaction index in the block.
+    /// (The outputs of earlier transactions in a block can be spent by later
+    /// transactions.)
+    ///
+    /// Note: although these transparent outputs are newly created, they may not
+    /// be unspent, since a later transaction in a block can spend outputs of an
+    /// earlier transaction.
     pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::Utxo>,
-    pub(crate) transaction_hashes: Vec<transaction::Hash>,
+    /// A precomputed list of the hashes of the transactions in this block,
+    /// in the same order as `block.transactions`.
+    pub transaction_hashes: Arc<[transaction::Hash]>,
 }
 
-// Doing precomputation in this From impl means that it will be done in
+impl From<&PreparedBlock> for PreparedBlock {
+    fn from(prepared: &PreparedBlock) -> Self {
+        prepared.clone()
+    }
+}
+
+// Doing precomputation in these impls means that it will be done in
 // the *service caller*'s task, not inside the service call itself.
 // This allows moving work out of the single-threaded state service.
-impl From<Arc<Block>> for FinalizedBlock {
-    fn from(block: Arc<Block>) -> Self {
-        let height = block
-            .coinbase_height()
-            .expect("finalized blocks must have a valid coinbase height");
-        let hash = block.hash();
-        let transaction_hashes = block
-            .transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect::<Vec<_>>();
-        let new_outputs = transparent::new_outputs(&block, transaction_hashes.as_slice());
+
+impl ContextuallyValidBlock {
+    /// Create a block that's ready for non-finalized [`Chain`] contextual validation,
+    /// using a [`PreparedBlock`] and the UTXOs it spends.
+    ///
+    /// When combined, `prepared.new_outputs` and `spent_utxos` must contain
+    /// the [`Utxo`]s spent by every transparent input in this block,
+    /// including UTXOs created by earlier transactions in this block.
+    ///
+    /// Note: a [`ContextuallyValidBlock`] isn't actually contextually valid until
+    /// [`Chain::update_chain_state_with`] returns success.
+    pub fn with_block_and_spent_utxos(
+        prepared: PreparedBlock,
+        mut spent_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    ) -> Result<Self, ValueBalanceError> {
+        let PreparedBlock {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+        } = prepared;
+
+        // This is redundant for the non-finalized state,
+        // but useful to make some tests pass more easily.
+        spent_utxos.extend(utxos_from_ordered_utxos(new_outputs.clone()));
+
+        Ok(Self {
+            block: block.clone(),
+            hash,
+            height,
+            new_outputs: transparent::utxos_from_ordered_utxos(new_outputs),
+            transaction_hashes,
+            chain_value_pool_change: block.chain_value_pool_change(&spent_utxos)?,
+        })
+    }
+}
+
+impl FinalizedBlock {
+    /// Create a block that's ready to be committed to the finalized state,
+    /// using a precalculated [`block::Hash`] and [`block::Height`].
+    ///
+    /// Note: a [`FinalizedBlock`] isn't actually finalized
+    /// until [`Request::CommitFinalizedBlock`] returns success.
+    pub fn with_hash_and_height(
+        block: Arc<Block>,
+        hash: block::Hash,
+        height: block::Height,
+    ) -> Self {
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = transparent::new_outputs(&block, &transaction_hashes);
 
         Self {
             block,
@@ -137,22 +201,14 @@ impl From<Arc<Block>> for FinalizedBlock {
     }
 }
 
-impl From<PreparedBlock> for ContextuallyValidBlock {
-    fn from(prepared: PreparedBlock) -> Self {
-        let PreparedBlock {
-            block,
-            hash,
-            height,
-            new_outputs,
-            transaction_hashes,
-        } = prepared;
-        Self {
-            block,
-            hash,
-            height,
-            new_outputs: transparent::utxos_from_ordered_utxos(new_outputs),
-            transaction_hashes,
-        }
+impl From<Arc<Block>> for FinalizedBlock {
+    fn from(block: Arc<Block>) -> Self {
+        let hash = block.hash();
+        let height = block
+            .coinbase_height()
+            .expect("finalized blocks must have a valid coinbase height");
+
+        FinalizedBlock::with_hash_and_height(block, hash, height)
     }
 }
 
@@ -164,6 +220,7 @@ impl From<ContextuallyValidBlock> for FinalizedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            chain_value_pool_change: _,
         } = contextually_valid;
         Self {
             block,

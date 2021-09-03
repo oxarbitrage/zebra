@@ -25,7 +25,10 @@ use zebra_chain::{
 #[cfg(test)]
 use zebra_chain::sprout;
 
-use crate::{FinalizedBlock, HashOrHeight, PreparedBlock, ValidateContextError};
+use crate::{
+    request::ContextuallyValidBlock, FinalizedBlock, HashOrHeight, PreparedBlock,
+    ValidateContextError,
+};
 
 use self::chain::Chain;
 
@@ -167,6 +170,7 @@ impl NonFinalizedState {
             finalized_state.sapling_note_commitment_tree(),
             finalized_state.orchard_note_commitment_tree(),
             finalized_state.history_tree(),
+            finalized_state.current_value_pool(),
         );
         let (height, hash) = (prepared.height, prepared.hash);
 
@@ -185,19 +189,33 @@ impl NonFinalizedState {
         prepared: PreparedBlock,
         finalized_state: &FinalizedState,
     ) -> Result<Chain, ValidateContextError> {
-        check::utxo::transparent_spend(
+        let spent_utxos = check::utxo::transparent_spend(
             &prepared,
             &parent_chain.unspent_utxos(),
             &parent_chain.spent_utxos,
             finalized_state,
         )?;
-        check::block_commitment_is_valid_for_chain_history(
+        check::prepared_block_commitment_is_valid_for_chain_history(
             &prepared,
             self.network,
             &parent_chain.history_tree,
         )?;
 
-        parent_chain.push(prepared)
+        let contextual = ContextuallyValidBlock::with_block_and_spent_utxos(
+            prepared.clone(),
+            spent_utxos.clone(),
+        )
+        .map_err(|value_balance_error| {
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error,
+                height: prepared.height,
+                block_hash: prepared.hash,
+                transaction_count: prepared.block.transactions.len(),
+                spent_utxo_count: spent_utxos.len(),
+            }
+        })?;
+
+        parent_chain.push(contextual)
     }
 
     /// Returns the length of the non-finalized portion of the current best chain.
@@ -271,16 +289,13 @@ impl NonFinalizedState {
         None
     }
 
-    /// Returns the `block` at a given height or hash in the best chain.
-    pub fn best_block(&self, hash_or_height: HashOrHeight) -> Option<Arc<Block>> {
+    /// Returns the [`ContextuallyValidBlock`] at a given height or hash in the best chain.
+    pub fn best_block(&self, hash_or_height: HashOrHeight) -> Option<ContextuallyValidBlock> {
         let best_chain = self.best_chain()?;
         let height =
             hash_or_height.height_or_else(|hash| best_chain.height_by_hash.get(&hash).cloned())?;
 
-        best_chain
-            .blocks
-            .get(&height)
-            .map(|prepared| prepared.block.clone())
+        best_chain.blocks.get(&height).map(Clone::clone)
     }
 
     /// Returns the hash for a given `block::Height` if it is present in the best chain.
@@ -298,6 +313,12 @@ impl NonFinalizedState {
         let hash = best_chain.non_finalized_tip_hash();
 
         Some((height, hash))
+    }
+
+    /// Returns the block at the tip of the best chain.
+    pub fn best_tip_block(&self) -> Option<ContextuallyValidBlock> {
+        let (height, _hash) = self.best_tip()?;
+        self.best_block(height.into())
     }
 
     /// Returns the height of `hash` in the best chain.
@@ -352,7 +373,7 @@ impl NonFinalizedState {
     }
 
     /// Return the non-finalized portion of the current best chain
-    fn best_chain(&self) -> Option<&Chain> {
+    pub(crate) fn best_chain(&self) -> Option<&Chain> {
         self.chain_set
             .iter()
             .next_back()

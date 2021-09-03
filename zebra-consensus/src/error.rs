@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::BoxError;
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Copy, Clone, Debug, PartialEq)]
 pub enum SubsidyError {
     #[error("no coinbase transaction in block")]
     NoCoinbase,
@@ -18,7 +18,7 @@ pub enum SubsidyError {
     FoundersRewardNotFound,
 }
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Clone, Debug, PartialEq)]
 pub enum TransactionError {
     #[error("first transaction must be coinbase")]
     CoinbasePosition,
@@ -40,6 +40,9 @@ pub enum TransactionError {
 
     #[error("coinbase transaction MUST NOT have the EnableSpendsOrchard flag set")]
     CoinbaseHasEnableSpendsOrchard,
+
+    #[error("coinbase inputs MUST NOT exist in mempool")]
+    CoinbaseInMempool,
 
     #[error("coinbase transaction failed subsidy validation")]
     Subsidy(#[from] SubsidyError),
@@ -90,15 +93,23 @@ pub enum TransactionError {
 }
 
 impl From<BoxError> for TransactionError {
-    fn from(err: BoxError) -> Self {
-        // TODO: handle redpallas Error?
+    fn from(mut err: BoxError) -> Self {
+        // TODO: handle redpallas::Error, ScriptInvalid, InvalidSignature
         match err.downcast::<zebra_chain::primitives::redjubjub::Error>() {
-            Ok(e) => TransactionError::RedJubjub(*e),
-            Err(e) => TransactionError::InternalDowncastError(format!(
-                "downcast to redjubjub::Error failed, original error: {:?}",
-                e
-            )),
+            Ok(e) => return TransactionError::RedJubjub(*e),
+            Err(e) => err = e,
         }
+
+        // buffered transaction verifier service error
+        match err.downcast::<TransactionError>() {
+            Ok(e) => return *e,
+            Err(e) => err = e,
+        }
+
+        TransactionError::InternalDowncastError(format!(
+            "downcast to known transaction error type failed, original error: {:?}",
+            err,
+        ))
     }
 }
 
@@ -108,7 +119,7 @@ impl From<SubsidyError> for BlockError {
     }
 }
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Clone, Debug, PartialEq)]
 pub enum BlockError {
     #[error("block contains invalid transactions")]
     Transaction(#[from] TransactionError),

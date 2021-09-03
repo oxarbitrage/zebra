@@ -17,7 +17,7 @@ use std::{
     collections::BTreeMap,
     ops::{Bound, Bound::*},
     pin::Pin,
-    sync::Arc,
+    sync::{mpsc, Arc},
     task::{Context, Poll},
 };
 
@@ -32,7 +32,7 @@ use zebra_chain::{
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     work::equihash,
 };
-use zebra_state as zs;
+use zebra_state::{self as zs, FinalizedBlock};
 
 use crate::{block::VerifyBlockError, error::BlockError, BoxError};
 
@@ -49,12 +49,19 @@ use types::{TargetHeight, TargetHeight::*};
 /// An unverified block, which is in the queue for checkpoint verification.
 #[derive(Debug)]
 struct QueuedBlock {
-    /// The block data.
-    block: Arc<Block>,
-    /// `block`'s cached header hash.
-    hash: block::Hash,
+    /// The block, with additional precalculated data.
+    block: FinalizedBlock,
     /// The transmitting end of the oneshot channel for this block's result.
     tx: oneshot::Sender<Result<block::Hash, VerifyCheckpointError>>,
+}
+
+/// The unverified block, with a receiver for the [`QueuedBlock`]'s result.
+#[derive(Debug)]
+struct RequestBlock {
+    /// The block, with additional precalculated data.
+    block: FinalizedBlock,
+    /// The receiving end of the oneshot channel for this block's result.
+    rx: oneshot::Receiver<Result<block::Hash, VerifyCheckpointError>>,
 }
 
 /// A list of unverified blocks at a particular height.
@@ -96,6 +103,26 @@ pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 400;
 /// serialized size.
 pub const MAX_CHECKPOINT_BYTE_COUNT: u64 = 32 * 1024 * 1024;
 
+/// Convert a tip into its hash and matching progress.
+fn progress_from_tip(
+    checkpoint_list: &CheckpointList,
+    tip: Option<(block::Height, block::Hash)>,
+) -> (Option<block::Hash>, Progress<block::Height>) {
+    match tip {
+        Some((height, hash)) => {
+            if height >= checkpoint_list.max_height() {
+                (None, Progress::FinalCheckpoint)
+            } else {
+                metrics::gauge!("checkpoint.verified.height", height.0 as f64);
+                metrics::gauge!("checkpoint.processing.next.height", height.0 as f64);
+                (Some(hash), Progress::InitialTip(height))
+            }
+        }
+        // We start by verifying the genesis block, by itself
+        None => (None, Progress::BeforeGenesis),
+    }
+}
+
 /// A checkpointing block verifier.
 ///
 /// Verifies blocks using a supplied list of checkpoints. There must be at
@@ -132,6 +159,13 @@ where
 
     /// The current progress of this verifier.
     verifier_progress: Progress<block::Height>,
+
+    /// A channel to receive requests to reset the verifier,
+    /// receiving the tip of the state.
+    reset_receiver: mpsc::Receiver<Option<(block::Height, block::Hash)>>,
+    /// A channel to send requests to reset the verifier,
+    /// passing the tip of the state.
+    reset_sender: mpsc::Sender<Option<(block::Height, block::Hash)>>,
 }
 
 impl<S> CheckpointVerifier<S>
@@ -212,19 +246,10 @@ where
     ) -> Self {
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
-        let (initial_tip_hash, verifier_progress) = match initial_tip {
-            Some((height, hash)) => {
-                if height >= checkpoint_list.max_height() {
-                    (None, Progress::FinalCheckpoint)
-                } else {
-                    metrics::gauge!("checkpoint.verified.height", height.0 as f64);
-                    metrics::gauge!("checkpoint.processing.next.height", height.0 as f64);
-                    (Some(hash), Progress::InitialTip(height))
-                }
-            }
-            // We start by verifying the genesis block, by itself
-            None => (None, Progress::BeforeGenesis),
-        };
+        let (initial_tip_hash, verifier_progress) =
+            progress_from_tip(&checkpoint_list, initial_tip);
+
+        let (sender, receiver) = mpsc::channel();
         CheckpointVerifier {
             checkpoint_list,
             network,
@@ -232,7 +257,16 @@ where
             state_service,
             queued: BTreeMap::new(),
             verifier_progress,
+            reset_receiver: receiver,
+            reset_sender: sender,
         }
+    }
+
+    /// Reset the verifier progress back to given tip.
+    fn reset_progress(&mut self, tip: Option<(block::Height, block::Hash)>) {
+        let (initial_tip_hash, verifier_progress) = progress_from_tip(&self.checkpoint_list, tip);
+        self.initial_tip_hash = initial_tip_hash;
+        self.verifier_progress = verifier_progress;
     }
 
     /// Return the current verifier's progress.
@@ -440,6 +474,8 @@ where
 
     /// Check that the block height, proof of work, and Merkle root are valid.
     ///
+    /// Returns a [`FinalizedBlock`] with precalculated block data.
+    ///
     /// ## Security
     ///
     /// Checking the proof of work makes resource exhaustion attacks harder to
@@ -448,7 +484,7 @@ where
     /// Checking the Merkle root ensures that the block hash binds the block
     /// contents. To prevent malleability (CVE-2012-2459), we also need to check
     /// whether the transaction hashes are unique.
-    fn check_block(&self, block: &Block) -> Result<block::Height, VerifyCheckpointError> {
+    fn check_block(&self, block: Arc<Block>) -> Result<FinalizedBlock, VerifyCheckpointError> {
         let hash = block.hash();
         let height = block
             .coinbase_height()
@@ -458,40 +494,42 @@ where
         crate::block::check::difficulty_is_valid(&block.header, self.network, &height, &hash)?;
         crate::block::check::equihash_solution_is_valid(&block.header)?;
 
-        let transaction_hashes = block
-            .transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect::<Vec<_>>();
+        // don't do precalculation until the block passes basic difficulty checks
+        let block = FinalizedBlock::with_hash_and_height(block, hash, height);
 
-        crate::block::check::merkle_root_validity(self.network, block, &transaction_hashes)?;
+        crate::block::check::merkle_root_validity(
+            self.network,
+            &block.block,
+            &block.transaction_hashes,
+        )?;
 
-        Ok(height)
+        Ok(block)
     }
 
-    /// Queue `block` for verification, and return the `Receiver` for the
-    /// block's verification result.
+    /// Queue `block` for verification.
+    ///
+    /// On success, returns a [`RequestBlock`] containing the block,
+    /// precalculated request data, and the queued result receiver.
     ///
     /// Verification will finish when the chain to the next checkpoint is
     /// complete, and the caller will be notified via the channel.
     ///
-    /// If the block does not have a coinbase height, sends an error on `tx`,
-    /// and does not queue the block.
-    fn queue_block(
-        &mut self,
-        block: Arc<Block>,
-    ) -> oneshot::Receiver<Result<block::Hash, VerifyCheckpointError>> {
+    /// If the block does not pass basic validity checks,
+    /// returns an error immediately.
+    fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
         // Check that the height and Merkle roots are valid.
-        let height = match self.check_block(&block) {
-            Ok(height) => height,
-            Err(error) => {
-                tx.send(Err(error)).expect("rx has not been dropped yet");
-                return rx;
-            }
+        let block = self.check_block(block)?;
+        let height = block.height;
+        let hash = block.hash;
+
+        let new_qblock = QueuedBlock {
+            block: block.clone(),
+            tx,
         };
+        let req_block = RequestBlock { block, rx };
 
         // Since we're using Arc<Block>, each entry is a single pointer to the
         // Arc. But there are a lot of QueuedBlockLists in the queue, so we keep
@@ -501,16 +539,24 @@ where
             .entry(height)
             .or_insert_with(|| QueuedBlockList::with_capacity(1));
 
-        let hash = block.hash();
-
-        // Replace older requests by newer ones by swapping the oneshot.
+        // Replace older requests with newer ones.
+        // The newer block is ok, the older block is an error.
         for qb in qblocks.iter_mut() {
-            if qb.hash == hash {
+            if qb.block.hash == hash {
                 let e = VerifyCheckpointError::NewerRequest { height, hash };
                 tracing::trace!(?e, "failing older of duplicate requests");
-                let old_tx = std::mem::replace(&mut qb.tx, tx);
-                let _ = old_tx.send(Err(e));
-                return rx;
+
+                // ## Security
+                //
+                // Replace the entire queued block.
+                //
+                // We don't check the authorizing data hash until checkpoint blocks reach the state.
+                // So signatures, proofs, or scripts could be different,
+                // even if the block hash is the same.
+
+                let old = std::mem::replace(qb, new_qblock);
+                let _ = old.tx.send(Err(e));
+                return Ok(req_block);
             }
         }
 
@@ -518,12 +564,10 @@ where
         if qblocks.len() >= MAX_QUEUED_BLOCKS_PER_HEIGHT {
             let e = VerifyCheckpointError::QueuedLimit;
             tracing::warn!(?e);
-            let _ = tx.send(Err(e));
-            return rx;
+            return Err(e);
         }
 
         // Add the block to the list of queued blocks at this height
-        let new_qblock = QueuedBlock { block, hash, tx };
         // This is a no-op for the first block in each QueuedBlockList.
         qblocks.reserve_exact(1);
         qblocks.push(new_qblock);
@@ -540,7 +584,7 @@ where
         let is_checkpoint = self.checkpoint_list.contains(height);
         tracing::debug!(?height, ?hash, ?is_checkpoint, "queued block");
 
-        rx
+        Ok(req_block)
     }
 
     /// During checkpoint range processing, process all the blocks at `height`.
@@ -579,21 +623,21 @@ where
         // If there are any side-chain blocks, they fail validation.
         let mut valid_qblock = None;
         for qblock in qblocks.drain(..) {
-            if qblock.hash == expected_hash {
+            if qblock.block.hash == expected_hash {
                 if valid_qblock.is_none() {
                     // The first valid block at the current height
                     valid_qblock = Some(qblock);
                 } else {
                     unreachable!("unexpected duplicate block {:?} {:?}: duplicate blocks should be rejected before being queued",
-                                 height, qblock.hash);
+                                 height, qblock.block.hash);
                 }
             } else {
-                tracing::info!(?height, ?qblock.hash, ?expected_hash,
+                tracing::info!(?height, ?qblock.block.hash, ?expected_hash,
                                "Side chain hash at height in CheckpointVerifier");
                 let _ = qblock
                     .tx
                     .send(Err(VerifyCheckpointError::UnexpectedSideChain {
-                        found: qblock.hash,
+                        found: qblock.block.hash,
                         expected: expected_hash,
                     }));
             }
@@ -666,7 +710,7 @@ where
         for current_height in range_heights {
             let valid_qblock = self.process_height(current_height, expected_hash);
             if let Some(qblock) = valid_qblock {
-                expected_hash = qblock.block.header.previous_block_hash;
+                expected_hash = qblock.block.block.header.previous_block_hash;
                 // Add the block to the end of the pending block list
                 // (since we're walking the chain backwards, the list is
                 // in reverse chain order)
@@ -687,11 +731,10 @@ where
                 // The order here shouldn't matter, but add the blocks in
                 // height order, for consistency.
                 for vblock in rev_valid_blocks.drain(..).rev() {
-                    let height = vblock
-                        .block
-                        .coinbase_height()
-                        .expect("queued blocks have a block height");
-                    self.queued.entry(height).or_default().push(vblock);
+                    self.queued
+                        .entry(vblock.block.height)
+                        .or_default()
+                        .push(vblock);
                 }
 
                 // Make sure the current progress hasn't changed
@@ -730,7 +773,7 @@ where
         // in height order.
         for qblock in rev_valid_blocks.drain(..).rev() {
             // Sending can fail, but there's nothing we can do about it.
-            let _ = qblock.tx.send(Ok(qblock.hash));
+            let _ = qblock.tx.send(Ok(qblock.block.hash));
         }
 
         // Finally, update the checkpoint bounds
@@ -825,6 +868,8 @@ pub enum VerifyCheckpointError {
     #[error(transparent)]
     CommitFinalized(BoxError),
     #[error(transparent)]
+    Tip(BoxError),
+    #[error(transparent)]
     CheckpointList(BoxError),
     #[error(transparent)]
     VerifyBlock(BoxError),
@@ -876,12 +921,22 @@ where
 
     #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
+        // Reset the verifier back to the state tip if requested
+        // (e.g. due to an error when committing a block to to the state)
+        if let Ok(tip) = self.reset_receiver.try_recv() {
+            self.reset_progress(tip);
+        }
+
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let rx = self.queue_block(block.clone());
+        let req_block = match self.queue_block(block) {
+            Ok(req_block) => req_block,
+            Err(e) => return async { Err(e) }.boxed(),
+        };
+
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots", self.queued.len() as f64);
@@ -894,6 +949,8 @@ where
         // verifier to reject blocks not already in the state as
         // already-verified.
         //
+        // # Dropped Receivers
+        //
         // To commit blocks transactionally on a per-checkpoint basis, we must
         // commit all verified blocks in a checkpoint range, regardless of
         // whether or not the response futures for each block were dropped.
@@ -902,25 +959,27 @@ where
         // commit-if-verified logic. This task will always execute, except if
         // the program is interrupted, in which case there is no longer a
         // checkpoint verifier to keep in sync with the state.
+        //
+        // # State Commit Failures
+        //
+        // If the state commit fails due to corrupt block data,
+        // we don't reject the entire checkpoint.
+        // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
         let commit_finalized_block = tokio::spawn(async move {
-            let hash = rx
+            let hash = req_block
+                .rx
                 .await
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitFinalized)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
-            // Once we get a verified hash, we must commit it to the chain state
-            // as a finalized block, or exit the program, so .expect rather than
-            // propagate errors from the state service.
-            //
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.
             match state_service
-                .oneshot(zs::Request::CommitFinalizedBlock(block.into()))
+                .oneshot(zs::Request::CommitFinalizedBlock(req_block.block))
                 .map_err(VerifyCheckpointError::CommitFinalized)
-                .await
-                .expect("state service commit block failed: verified checkpoints must be committed transactionally")
+                .await?
             {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
@@ -930,6 +989,8 @@ where
             }
         });
 
+        let state_service = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
         async move {
             let result = commit_finalized_block.await;
             // Avoid a panic on shutdown
@@ -939,11 +1000,29 @@ where
             // so we don't need to panic here. The persistent state is correct even when the
             // task is cancelled, because block data is committed inside transactions, in
             // height order.
-            if zebra_chain::shutdown::is_shutting_down() {
+            let result = if zebra_chain::shutdown::is_shutting_down() {
                 Err(VerifyCheckpointError::ShuttingDown)
             } else {
                 result.expect("commit_finalized_block should not panic")
+            };
+            if result.is_err() {
+                // If there was an error comitting the block, then this verifier
+                // will be out of sync with the state. In that case, reset
+                // its progress back to the state tip.
+                let tip = match state_service
+                    .oneshot(zs::Request::Tip)
+                    .await
+                    .map_err(Into::into)
+                    .map_err(VerifyCheckpointError::Tip)?
+                {
+                    zs::Response::Tip(tip) => tip,
+                    _ => unreachable!("wrong response for Tip"),
+                };
+                // Ignore errors since send() can fail only when the verifier
+                // is being dropped, and then it doesn't matter anymore.
+                let _ = reset_sender.send(tip);
             }
+            result
         }
         .boxed()
     }

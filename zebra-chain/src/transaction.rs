@@ -132,11 +132,22 @@ pub enum Transaction {
 }
 
 impl Transaction {
-    // hashes
+    // identifiers and hashes
 
-    /// Compute the hash (id) of this transaction.
+    /// Compute the hash (mined transaction ID) of this transaction.
+    ///
+    /// The hash uniquely identifies mined v5 transactions,
+    /// and all v1-v4 transactions, whether mined or unmined.
     pub fn hash(&self) -> Hash {
         Hash::from(self)
+    }
+
+    /// Compute the unmined transaction ID of this transaction.
+    ///
+    /// This ID uniquely identifies unmined transactions,
+    /// regardless of version.
+    pub fn unmined_id(&self) -> UnminedTxId {
+        UnminedTxId::from(self)
     }
 
     /// Calculate the sighash for the current transaction
@@ -365,8 +376,9 @@ impl Transaction {
         }
     }
 
-    /// Returns `true` if this transaction is a coinbase transaction.
-    pub fn is_coinbase(&self) -> bool {
+    /// Returns `true` if this transaction has valid inputs for a coinbase
+    /// transaction, that is, has a single input and it is a coinbase input.
+    pub fn has_valid_coinbase_transaction_inputs(&self) -> bool {
         self.inputs().len() == 1
             && matches!(
                 self.inputs().get(0),
@@ -375,7 +387,7 @@ impl Transaction {
     }
 
     /// Returns `true` if transaction contains any coinbase inputs.
-    pub fn contains_coinbase_input(&self) -> bool {
+    pub fn has_any_coinbase_inputs(&self) -> bool {
         self.inputs()
             .iter()
             .any(|input| matches!(input, transparent::Input::Coinbase { .. }))
