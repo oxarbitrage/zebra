@@ -12,7 +12,8 @@
       "profile": "http://oxarbitrage.com",
       "contributions": [
         "code",
-        "doc"
+        "doc",
+        "plugin"
       ]
     }
   ],
