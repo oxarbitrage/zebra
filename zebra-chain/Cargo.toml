@@ -1,73 +1,80 @@
 [package]
 name = "zebra-chain"
-version = "1.0.0-alpha.16"
+version = "1.0.0-beta.3"
 authors = ["Zcash Foundation <zebra@zfnd.org>"]
 license = "MIT OR Apache-2.0"
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
 default = []
-proptest-impl = ["proptest", "proptest-derive", "itertools", "zebra-test", "rand", "rand_chacha"]
+proptest-impl = ["proptest", "proptest-derive", "zebra-test", "rand", "rand_chacha", "tokio"]
 bench = ["zebra-test"]
 
 [dependencies]
-aes = "0.6"
+aes = "0.7.5"
 bech32 = "0.8.1"
-bigint = "4"
+bigint = "4.4.3"
 bitflags = "1.2.1"
 bitvec = "0.22"
-blake2b_simd = "0.5.11"
+blake2b_simd = "1.0.0"
 blake2s_simd = "0.5.11"
-bls12_381 = "0.5.0"
+bls12_381 = "0.6.0"
 bs58 = { version = "0.4", features = ["check"] }
 byteorder = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 displaydoc = "0.2.2"
-fpe = "0.4"
+fpe = "0.5.1"
 futures = "0.3"
-group = "0.10"
-# TODO: replace w/ crate version when released: https://github.com/ZcashFoundation/zebra/issues/2083
-# Note: if updating this, also update the workspace Cargo.toml to match.
-halo2 = { git = "https://github.com/zcash/halo2.git", rev = "236115917df9db45282fec24d1e1e36f275f71ab" }
+group = "0.11.0"
+halo2 = "=0.1.0-beta.1"
 hex = "0.4"
 incrementalmerkletree = "0.1.0"
-jubjub = "0.7.0"
+itertools = "0.10.3"
+jubjub = "0.8.0"
 lazy_static = "1.4.0"
 rand_core = "0.6"
 ripemd160 = "0.9"
-secp256k1 = { version = "0.20.3", features = ["serde"] }
+secp256k1 = { version = "0.21.2", features = ["serde"] }
 serde = { version = "1", features = ["serde_derive", "rc"] }
 serde-big-array = "0.3.2"
-sha2 = { version = "0.9.6", features=["compress"] }
+sha2 = { version = "0.9.8", features=["compress"] }
+static_assertions = "1.1.0"
 subtle = "2.4"
 thiserror = "1"
 uint = "0.9.1"
-x25519-dalek = { version = "1.1", features = ["serde"] }
-zcash_history = { git = "https://github.com/zcash/librustzcash.git", rev = "0c3ed159985affa774e44d10172d4471d798a85a" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "0c3ed159985affa774e44d10172d4471d798a85a" }
+x25519-dalek = { version = "1.2.0", features = ["serde"] }
+
+# TODO: replace with upstream orchard (#3056)
+orchard = { git = "https://github.com/ZcashFoundation/orchard.git", rev = "568e24cd5f129158375d7ac7d98c89ebff4f982f" }
+
+# TODO: replace with upstream librustzcash when these changes are merged (#3037)
+equihash = { git = "https://github.com/ZcashFoundation/librustzcash.git", tag = "0.5.1-zebra-v1.0.0-beta.4" }
+zcash_note_encryption = { git = "https://github.com/ZcashFoundation/librustzcash.git", tag = "0.5.1-zebra-v1.0.0-beta.4" }
+zcash_primitives = { git = "https://github.com/ZcashFoundation/librustzcash.git", tag = "0.5.1-zebra-v1.0.0-beta.4" }
+zcash_history = { git = "https://github.com/ZcashFoundation/librustzcash.git", tag = "0.5.1-zebra-v1.0.0-beta.4" }
 
 proptest = { version = "0.10", optional = true }
 proptest-derive = { version = "0.3.0", optional = true }
-itertools = { version = "0.10.1", optional = true }
+
 rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
+tokio = { version = "1.15.0", optional = true }
 
 # ZF deps
-ed25519-zebra = "2"
-equihash = "0.1"
+ed25519-zebra = "3.0.0"
 # TODO: Update to 0.5 release when published
-redjubjub = { git = "https://github.com/ZcashFoundation/redjubjub.git", rev = "f772176560b0b7daf25eff2460e08dc127ac8407" }
+redjubjub = { git = "https://github.com/ZcashFoundation/redjubjub.git", rev = "a32ae3fc871bc72558ac2ce7eac933d1ad5f4a9c" }
 
 zebra-test = { path = "../zebra-test/", optional = true }
 
 [dev-dependencies]
 color-eyre = "0.5.11"
 criterion = { version = "0.3", features = ["html_reports"] }
-itertools = "0.10.1"
+itertools = "0.10.3"
 spandoc = "0.2"
-tracing = "0.1.26"
+tracing = "0.1.29"
 
 proptest = "0.10"
 proptest-derive = "0.3"
