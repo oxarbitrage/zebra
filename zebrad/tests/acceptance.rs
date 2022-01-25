@@ -21,17 +21,11 @@
 //! or you have poor network connectivity,
 //! skip all the network tests by setting the `ZEBRA_SKIP_NETWORK_TESTS` environmental variable.
 
-// Standard lints
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
-
 use color_eyre::{
     eyre::{Result, WrapErr},
     Help,
 };
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 use std::{collections::HashSet, convert::TryInto, path::Path, path::PathBuf, time::Duration};
 
@@ -46,7 +40,10 @@ use zebra_test::{
     net::random_known_port,
     prelude::*,
 };
-use zebrad::config::ZebradConfig;
+use zebrad::{
+    components::{mempool, sync},
+    config::{SyncSection, ZebradConfig},
+};
 
 /// The amount of time we wait after launching `zebrad`.
 ///
@@ -54,18 +51,47 @@ use zebrad::config::ZebradConfig;
 /// metrics or tracing test failures in Windows CI.
 const LAUNCH_DELAY: Duration = Duration::from_secs(10);
 
+/// Returns a config with:
+/// - a Zcash listener on an unused port on IPv4 localhost, and
+/// - an ephemeral state,
+/// - the minimum syncer lookahead limit, and
+/// - shorter task intervals, to improve test coverage.
 fn default_test_config() -> Result<ZebradConfig> {
-    let auto_port_ipv4_local = zebra_network::Config {
+    const TEST_DURATION: Duration = Duration::from_secs(30);
+
+    let network = zebra_network::Config {
+        // The OS automatically chooses an unused port.
         listen_addr: "127.0.0.1:0".parse()?,
-        crawl_new_peer_interval: Duration::from_secs(30),
+        crawl_new_peer_interval: TEST_DURATION,
         ..zebra_network::Config::default()
     };
-    let local_ephemeral = ZebradConfig {
+
+    let sync = SyncSection {
+        // Avoid downloading unnecessary blocks.
+        lookahead_limit: sync::MIN_LOOKAHEAD_LIMIT,
+        ..SyncSection::default()
+    };
+
+    let mempool = mempool::Config {
+        eviction_memory_time: TEST_DURATION,
+        ..mempool::Config::default()
+    };
+
+    let consensus = zebra_consensus::Config {
+        debug_skip_parameter_preload: true,
+        ..zebra_consensus::Config::default()
+    };
+
+    let config = ZebradConfig {
+        network,
         state: zebra_state::Config::ephemeral(),
-        network: auto_port_ipv4_local,
+        sync,
+        mempool,
+        consensus,
         ..ZebradConfig::default()
     };
-    Ok(local_ephemeral)
+
+    Ok(config)
 }
 
 fn persistent_test_config() -> Result<ZebradConfig> {
@@ -75,10 +101,13 @@ fn persistent_test_config() -> Result<ZebradConfig> {
 }
 
 fn testdir() -> Result<TempDir> {
-    TempDir::new("zebrad_tests").map_err(Into::into)
+    tempfile::Builder::new()
+        .prefix("zebrad_tests")
+        .tempdir()
+        .map_err(Into::into)
 }
 
-/// Extension trait for methods on `tempdir::TempDir` for using it as a test
+/// Extension trait for methods on `tempfile::TempDir` for using it as a test
 /// directory for `zebrad`.
 trait ZebradTestDirExt
 where
@@ -492,7 +521,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
     zebra_test::init();
 
     let mut config = default_test_config()?;
-    let run_dir = TempDir::new("zebrad_tests")?;
+    let run_dir = testdir()?;
 
     let ignored_cache_dir = run_dir.path().join("state");
     if cache_dir_config == EphemeralConfig::MisconfiguredCacheDir {
@@ -692,14 +721,25 @@ fn valid_generated_config(command: &str, expect_stdout_line_contains: &str) -> R
     Ok(())
 }
 
+const TINY_CHECKPOINT_TEST_HEIGHT: Height = Height(0);
+const MEDIUM_CHECKPOINT_TEST_HEIGHT: Height =
+    Height(zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP as u32);
 const LARGE_CHECKPOINT_TEST_HEIGHT: Height =
     Height((zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP * 2) as u32);
 
 const STOP_AT_HEIGHT_REGEX: &str = "stopping at configured height";
 
-const STOP_ON_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
-// usually it's much shorter than this
-const SMALL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+/// The maximum amount of time Zebra should take to reload after shutting down.
+///
+/// This should only take a second, but sometimes CI VMs or RocksDB can be slow.
+const STOP_ON_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The maximum amount of time Zebra should take to sync a few hundred blocks.
+///
+/// Usually the small checkpoint is much shorter than this.
+const TINY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The maximum amount of time Zebra should take to sync a thousand blocks.
 const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Test if `zebrad` can sync the first checkpoint on mainnet.
@@ -708,12 +748,13 @@ const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
 #[test]
 fn sync_one_checkpoint_mainnet() -> Result<()> {
     sync_until(
-        Height(0),
+        TINY_CHECKPOINT_TEST_HEIGHT,
         Mainnet,
         STOP_AT_HEIGHT_REGEX,
-        SMALL_CHECKPOINT_TIMEOUT,
+        TINY_CHECKPOINT_TIMEOUT,
         None,
         true,
+        None,
     )
     .map(|_tempdir| ())
 }
@@ -724,12 +765,13 @@ fn sync_one_checkpoint_mainnet() -> Result<()> {
 #[test]
 fn sync_one_checkpoint_testnet() -> Result<()> {
     sync_until(
-        Height(0),
+        TINY_CHECKPOINT_TEST_HEIGHT,
         Testnet,
         STOP_AT_HEIGHT_REGEX,
-        SMALL_CHECKPOINT_TIMEOUT,
+        TINY_CHECKPOINT_TIMEOUT,
         None,
         true,
+        None,
     )
     .map(|_tempdir| ())
 }
@@ -739,8 +781,8 @@ fn sync_one_checkpoint_testnet() -> Result<()> {
 fn restart_stop_at_height() -> Result<()> {
     zebra_test::init();
 
-    restart_stop_at_height_for_network(Network::Mainnet, Height(0))?;
-    restart_stop_at_height_for_network(Network::Testnet, Height(0))?;
+    restart_stop_at_height_for_network(Network::Mainnet, TINY_CHECKPOINT_TEST_HEIGHT)?;
+    restart_stop_at_height_for_network(Network::Testnet, TINY_CHECKPOINT_TEST_HEIGHT)?;
 
     Ok(())
 }
@@ -750,9 +792,10 @@ fn restart_stop_at_height_for_network(network: Network, height: Height) -> Resul
         height,
         network,
         STOP_AT_HEIGHT_REGEX,
-        SMALL_CHECKPOINT_TIMEOUT,
+        TINY_CHECKPOINT_TIMEOUT,
         None,
         true,
+        None,
     )?;
     // if stopping corrupts the rocksdb database, zebrad might hang or crash here
     // if stopping does not write the rocksdb database to disk, Zebra will
@@ -762,11 +805,28 @@ fn restart_stop_at_height_for_network(network: Network, height: Height) -> Resul
         network,
         "state is already at the configured height",
         STOP_ON_LOAD_TIMEOUT,
-        Some(reuse_tempdir),
+        reuse_tempdir,
         false,
+        None,
     )?;
 
     Ok(())
+}
+
+/// Test if `zebrad` can activate the mempool on mainnet.
+/// Debug activation happens after committing the genesis block.
+#[test]
+fn activate_mempool_mainnet() -> Result<()> {
+    sync_until(
+        Height(TINY_CHECKPOINT_TEST_HEIGHT.0 + 1),
+        Mainnet,
+        STOP_AT_HEIGHT_REGEX,
+        TINY_CHECKPOINT_TIMEOUT,
+        None,
+        true,
+        Some(TINY_CHECKPOINT_TEST_HEIGHT),
+    )
+    .map(|_tempdir| ())
 }
 
 /// Test if `zebrad` can sync some larger checkpoints on mainnet.
@@ -784,6 +844,7 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
         LARGE_CHECKPOINT_TIMEOUT,
         None,
         true,
+        None,
     )?;
     // if this sync fails, see the failure notes in `restart_stop_at_height`
     sync_until(
@@ -791,19 +852,45 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
         Mainnet,
         "previous state height is greater than the stop height",
         STOP_ON_LOAD_TIMEOUT,
-        Some(reuse_tempdir),
+        reuse_tempdir,
         false,
+        None,
     )?;
 
     Ok(())
 }
 
-// TODO: We had a `sync_large_checkpoints_testnet` here but it was removed because
-// the testnet is unreliable (#1222). Enable after we have more testnet instances (#1791).
+// TODO: We had `sync_large_checkpoints_testnet` and `sync_large_checkpoints_mempool_testnet`,
+// but they were removed because the testnet is unreliable (#1222).
+// We should re-add them after we have more testnet instances (#1791).
+
+/// Test if `zebrad` can run side by side with the mempool.
+/// This is done by running the mempool and syncing some checkpoints.
+#[test]
+#[ignore]
+fn sync_large_checkpoints_mempool_mainnet() -> Result<()> {
+    sync_until(
+        MEDIUM_CHECKPOINT_TEST_HEIGHT,
+        Mainnet,
+        STOP_AT_HEIGHT_REGEX,
+        LARGE_CHECKPOINT_TIMEOUT,
+        None,
+        true,
+        Some(TINY_CHECKPOINT_TEST_HEIGHT),
+    )
+    .map(|_tempdir| ())
+}
 
 /// Sync `network` until `zebrad` reaches `height`, and ensure that
 /// the output contains `stop_regex`. If `reuse_tempdir` is supplied,
 /// use it as the test's temporary directory.
+///
+/// If `check_legacy_chain` is true,
+/// make sure the logs contain the legacy chain check.
+///
+/// If `enable_mempool_at_height` is `Some(Height(_))`,
+/// configure `zebrad` to debug-enable the mempool at that height.
+/// Then check the logs for the mempool being enabled.
 ///
 /// If `stop_regex` is encountered before the process exits, kills the
 /// process, and mark the test as successful, even if `height` has not
@@ -819,8 +906,9 @@ fn sync_until(
     network: Network,
     stop_regex: &str,
     timeout: Duration,
-    reuse_tempdir: Option<TempDir>,
+    reuse_tempdir: impl Into<Option<TempDir>>,
     check_legacy_chain: bool,
+    enable_mempool_at_height: impl Into<Option<Height>>,
 ) -> Result<TempDir> {
     zebra_test::init();
 
@@ -828,11 +916,15 @@ fn sync_until(
         return testdir();
     }
 
+    let reuse_tempdir = reuse_tempdir.into();
+    let enable_mempool_at_height = enable_mempool_at_height.into();
+
     // Use a persistent state, so we can handle large syncs
     let mut config = persistent_test_config()?;
     // TODO: add convenience methods?
     config.network.network = network;
     config.state.debug_stop_at_height = Some(height.0);
+    config.mempool.debug_enable_at_height = enable_mempool_at_height.map(|height| height.0);
 
     let tempdir = if let Some(reuse_tempdir) = reuse_tempdir {
         reuse_tempdir.replace_config(&mut config)?
@@ -850,8 +942,35 @@ fn sync_until(
         child.expect_stdout_line_matches("no legacy chain found")?;
     }
 
+    if enable_mempool_at_height.is_some() {
+        child.expect_stdout_line_matches("enabling mempool for debugging")?;
+        child.expect_stdout_line_matches("activating mempool")?;
+
+        // make sure zebra is running with the mempool
+        child.expect_stdout_line_matches("verified checkpoint range")?;
+    }
+
     child.expect_stdout_line_matches(stop_regex)?;
-    child.kill()?;
+
+    // make sure there is never a mempool if we don't explicitly enable it
+    if enable_mempool_at_height.is_none() {
+        // if there is no matching line, the `expect_stdout_line_matches` error kills the `zebrad` child.
+        // the error is delayed until the test timeout, or until the child reaches the stop height and exits.
+        let mempool_is_activated = child
+            .expect_stdout_line_matches("activating mempool")
+            .is_ok();
+
+        // if there is a matching line, we panic and kill the test process.
+        // but we also need to kill the `zebrad` child before the test panics.
+        if mempool_is_activated {
+            child.kill()?;
+            panic!("unexpected mempool activation: mempool should not activate while syncing lots of blocks")
+        }
+    }
+
+    // make sure the child process is dead
+    // if it has already exited, ignore that error
+    let _ = child.kill();
 
     Ok(child.dir)
 }
@@ -859,6 +978,7 @@ fn sync_until(
 fn cached_mandatory_checkpoint_test_config() -> Result<ZebradConfig> {
     let mut config = persistent_test_config()?;
     config.state.cache_dir = "/zebrad-cache".into();
+    config.sync.lookahead_limit = sync::DEFAULT_LOOKAHEAD_LIMIT;
     Ok(config)
 }
 
@@ -873,6 +993,7 @@ fn cached_mandatory_checkpoint_test_config() -> Result<ZebradConfig> {
 fn create_cached_database_height<P>(
     network: Network,
     height: Height,
+    debug_skip_parameter_preload: bool,
     test_child_predicate: impl Into<Option<P>>,
 ) -> Result<()>
 where
@@ -887,6 +1008,7 @@ where
     // TODO: add convenience methods?
     config.network.network = network;
     config.state.debug_stop_at_height = Some(height.0);
+    config.consensus.debug_skip_parameter_preload = debug_skip_parameter_preload;
 
     let dir = PathBuf::from("/zebrad-cache");
     let mut child = dir
@@ -914,11 +1036,16 @@ where
 
 fn create_cached_database(network: Network) -> Result<()> {
     let height = network.mandatory_checkpoint_height();
-    create_cached_database_height(network, height, |test_child: &mut TestChild<PathBuf>| {
-        // make sure pre-cached databases finish before the mandatory checkpoint
-        test_child.expect_stdout_line_matches("CommitFinalized request")?;
-        Ok(())
-    })
+    create_cached_database_height(
+        network,
+        height,
+        true,
+        |test_child: &mut TestChild<PathBuf>| {
+            // make sure pre-cached databases finish before the mandatory checkpoint
+            test_child.expect_stdout_line_matches("CommitFinalized request")?;
+            Ok(())
+        },
+    )
 }
 
 fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
@@ -926,6 +1053,7 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
     create_cached_database_height(
         network,
         height.unwrap(),
+        false,
         |test_child: &mut TestChild<PathBuf>| {
             // make sure cached database tests finish after the mandatory checkpoint,
             // using the non-finalized state (the checkpoint_sync config must be false)
@@ -1015,7 +1143,7 @@ async fn metrics_endpoint() -> Result<()> {
     let mut config = default_test_config()?;
     config.metrics.endpoint_addr = Some(endpoint.parse().unwrap());
 
-    let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir = testdir()?.with_config(&mut config)?;
     let child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
@@ -1037,7 +1165,7 @@ async fn metrics_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     output.any_output_line_contains(
-        "metrics snapshot",
+        "# TYPE zebrad_build_info counter",
         &body,
         "metrics exporter response",
         "the metrics response header",
@@ -1071,7 +1199,7 @@ async fn tracing_endpoint() -> Result<()> {
     let mut config = default_test_config()?;
     config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
 
-    let dir = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir = testdir()?.with_config(&mut config)?;
     let child = dir.spawn_child(&["start"])?;
 
     // Run `zebrad` for a few seconds before testing the endpoint
@@ -1163,7 +1291,7 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
     // Write a configuration that has our created network listen_addr
     let mut config = default_test_config()?;
     config.network.listen_addr = listen_addr.parse().unwrap();
-    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(
         "Opened Zcash protocol endpoint at {}",
         listen_addr
@@ -1172,7 +1300,7 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
     // From another folder create a configuration with the same listener.
     // `network.listen_addr` will be the same in the 2 nodes.
     // (But since the config is ephemeral, they will have different state paths.)
-    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir2 = testdir()?.with_config(&mut config)?;
 
     check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
 
@@ -1194,13 +1322,13 @@ fn zebra_metrics_conflict() -> Result<()> {
     // Write a configuration that has our created metrics endpoint_addr
     let mut config = default_test_config()?;
     config.metrics.endpoint_addr = Some(listen_addr.parse().unwrap());
-    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(r"Opened metrics endpoint at {}", listen_addr));
 
     // From another folder create a configuration with the same endpoint.
     // `metrics.endpoint_addr` will be the same in the 2 nodes.
     // But they will have different Zcash listeners (auto port) and states (ephemeral)
-    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir2 = testdir()?.with_config(&mut config)?;
 
     check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
 
@@ -1222,13 +1350,13 @@ fn zebra_tracing_conflict() -> Result<()> {
     // Write a configuration that has our created tracing endpoint_addr
     let mut config = default_test_config()?;
     config.tracing.endpoint_addr = Some(listen_addr.parse().unwrap());
-    let dir1 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(r"Opened tracing endpoint at {}", listen_addr));
 
     // From another folder create a configuration with the same endpoint.
     // `tracing.endpoint_addr` will be the same in the 2 nodes.
     // But they will have different Zcash listeners (auto port) and states (ephemeral)
-    let dir2 = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir2 = testdir()?.with_config(&mut config)?;
 
     check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
 
@@ -1245,7 +1373,7 @@ fn zebra_state_conflict() -> Result<()> {
     // A persistent config has a fixed temp state directory, but asks the OS to
     // automatically choose an unused port
     let mut config = persistent_test_config()?;
-    let dir_conflict = TempDir::new("zebrad_tests")?.with_config(&mut config)?;
+    let dir_conflict = testdir()?.with_config(&mut config)?;
 
     // Windows problems with this match will be worked on at #1654
     // We are matching the whole opened path only for unix by now.

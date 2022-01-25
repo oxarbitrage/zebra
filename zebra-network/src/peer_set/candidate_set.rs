@@ -1,12 +1,16 @@
-use std::{cmp::min, mem, sync::Arc, time::Duration};
+use std::{cmp::min, sync::Arc};
 
+use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::time::{sleep, timeout, Instant, Sleep};
+use tokio::time::{sleep_until, timeout, Instant};
 use tower::{Service, ServiceExt};
 
 use zebra_chain::serialization::DateTime32;
 
-use crate::{constants, types::MetaAddr, AddressBook, BoxError, Request, Response};
+use crate::{
+    constants, meta_addr::MetaAddrChange, peer_set::set::MorePeers, types::MetaAddr, AddressBook,
+    BoxError, Request, Response,
+};
 
 #[cfg(test)]
 mod tests;
@@ -112,9 +116,11 @@ mod tests;
 //   * show that seed peers that transition to other never attempted
 //     states are already in the address book
 pub(crate) struct CandidateSet<S> {
-    pub(super) address_book: Arc<std::sync::Mutex<AddressBook>>,
-    pub(super) peer_service: S,
-    wait_next_handshake: Sleep,
+    // Correctness: the address book must be private,
+    //              so all operations are performed on a blocking thread (see #1976).
+    address_book: Arc<std::sync::Mutex<AddressBook>>,
+    peer_service: S,
+    min_next_handshake: Instant,
     min_next_crawl: Instant,
 }
 
@@ -131,7 +137,7 @@ where
         CandidateSet {
             address_book,
             peer_service,
-            wait_next_handshake: sleep(Duration::from_secs(0)),
+            min_next_handshake: Instant::now(),
             min_next_crawl: Instant::now(),
         }
     }
@@ -139,7 +145,7 @@ where
     /// Update the peer set from the network, using the default fanout limit.
     ///
     /// See [`update_initial`][Self::update_initial] for details.
-    pub async fn update(&mut self) -> Result<(), BoxError> {
+    pub async fn update(&mut self) -> Result<Option<MorePeers>, BoxError> {
         self.update_timeout(None).await
     }
 
@@ -149,6 +155,9 @@ where
     /// - Ask a few live [`Responded`] peers to send us more peers.
     /// - Process all completed peer responses, adding new peers in the
     ///   [`NeverAttemptedGossiped`] state.
+    ///
+    /// Returns `Some(MorePeers)` if the crawl was successful and the crawler
+    /// should ask for more peers. Returns `None` if there are no new peers.
     ///
     /// ## Correctness
     ///
@@ -176,7 +185,10 @@ where
     /// [`NeverAttemptedGossiped`]: crate::PeerAddrState::NeverAttemptedGossiped
     /// [`Failed`]: crate::PeerAddrState::Failed
     /// [`AttemptPending`]: crate::PeerAddrState::AttemptPending
-    pub async fn update_initial(&mut self, fanout_limit: usize) -> Result<(), BoxError> {
+    pub async fn update_initial(
+        &mut self,
+        fanout_limit: usize,
+    ) -> Result<Option<MorePeers>, BoxError> {
         self.update_timeout(Some(fanout_limit)).await
     }
 
@@ -184,7 +196,12 @@ where
     /// `fanout_limit`, and imposing a timeout on the entire fanout.
     ///
     /// See [`update_initial`][Self::update_initial] for details.
-    async fn update_timeout(&mut self, fanout_limit: Option<usize>) -> Result<(), BoxError> {
+    async fn update_timeout(
+        &mut self,
+        fanout_limit: Option<usize>,
+    ) -> Result<Option<MorePeers>, BoxError> {
+        let mut more_peers = None;
+
         // SECURITY
         //
         // Rate limit sending `GetAddr` messages to peers.
@@ -196,49 +213,70 @@ where
             // - we're waiting on a handshake to complete so there are peers, or
             // - another task that handles or adds peers is waiting on this task
             //   to complete.
-            if let Ok(fanout_result) =
-                timeout(constants::REQUEST_TIMEOUT, self.update_fanout(fanout_limit)).await
+            if let Ok(fanout_result) = timeout(
+                constants::PEER_GET_ADDR_TIMEOUT,
+                self.update_fanout(fanout_limit),
+            )
+            .await
             {
-                fanout_result?;
+                more_peers = fanout_result?;
             } else {
                 // update must only return an error for permanent failures
-                info!("timeout waiting for the peer service to become ready");
+                info!("timeout waiting for peer service readiness or peer responses");
             }
 
             self.min_next_crawl = Instant::now() + constants::MIN_PEER_GET_ADDR_INTERVAL;
         }
 
-        Ok(())
+        Ok(more_peers)
     }
 
     /// Update the peer set from the network, limiting the fanout to
     /// `fanout_limit`.
     ///
-    /// See [`update_initial`][Self::update_initial]  for details.
+    /// Opportunistically crawl the network on every update call to ensure
+    /// we're actively fetching peers. Continue independently of whether we
+    /// actually receive any peers, but always ask the network for more.
+    ///
+    /// Because requests are load-balanced across existing peers, we can make
+    /// multiple requests concurrently, which will be randomly assigned to
+    /// existing peers, but we don't make too many because update may be
+    /// called while the peer set is already loaded.
+    ///
+    /// See [`update_initial`][Self::update_initial] for more details.
     ///
     /// # Correctness
     ///
     /// This function does not have a timeout.
     /// Use [`update_timeout`][Self::update_timeout] instead.
-    async fn update_fanout(&mut self, fanout_limit: Option<usize>) -> Result<(), BoxError> {
-        // Opportunistically crawl the network on every update call to ensure
-        // we're actively fetching peers. Continue independently of whether we
-        // actually receive any peers, but always ask the network for more.
-        //
-        // Because requests are load-balanced across existing peers, we can make
-        // multiple requests concurrently, which will be randomly assigned to
-        // existing peers, but we don't make too many because update may be
-        // called while the peer set is already loaded.
-        let mut responses = FuturesUnordered::new();
+    async fn update_fanout(
+        &mut self,
+        fanout_limit: Option<usize>,
+    ) -> Result<Option<MorePeers>, BoxError> {
         let fanout_limit = fanout_limit
             .map(|fanout_limit| min(fanout_limit, constants::GET_ADDR_FANOUT))
             .unwrap_or(constants::GET_ADDR_FANOUT);
         debug!(?fanout_limit, "sending GetPeers requests");
-        // TODO: launch each fanout in its own task (might require tokio 1.6)
-        for _ in 0..fanout_limit {
-            let peer_service = self.peer_service.ready_and().await?;
+
+        let mut responses = FuturesUnordered::new();
+        let mut more_peers = None;
+
+        // Launch requests
+        for attempt in 0..fanout_limit {
+            if attempt > 0 {
+                // Let other tasks run, so we're more likely to choose a different peer.
+                //
+                // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
+                tokio::task::yield_now().await;
+            }
+
+            let peer_service = self.peer_service.ready().await?;
             responses.push(peer_service.call(Request::Peers));
         }
+
+        let mut address_book_updates = FuturesUnordered::new();
+
+        // Process responses
         while let Some(rsp) = responses.next().await {
             match rsp {
                 Ok(Response::Peers(addrs)) => {
@@ -248,7 +286,8 @@ where
                         "got response to GetPeers"
                     );
                     let addrs = validate_addrs(addrs, DateTime32::now());
-                    self.send_addrs(addrs);
+                    address_book_updates.push(self.send_addrs(addrs));
+                    more_peers = Some(MorePeers);
                 }
                 Err(e) => {
                     // since we do a fanout, and new updates are triggered by
@@ -259,20 +298,37 @@ where
             }
         }
 
-        Ok(())
+        // Wait until all the address book updates have finished
+        while let Some(()) = address_book_updates.next().await {}
+
+        Ok(more_peers)
     }
 
     /// Add new `addrs` to the address book.
-    fn send_addrs(&self, addrs: impl IntoIterator<Item = MetaAddr>) {
-        let addrs = addrs.into_iter().map(MetaAddr::new_gossiped_change);
+    async fn send_addrs(&self, addrs: impl IntoIterator<Item = MetaAddr>) {
+        let addrs: Vec<MetaAddrChange> = addrs
+            .into_iter()
+            .map(MetaAddr::new_gossiped_change)
+            .map(|maybe_addr| maybe_addr.expect("Received gossiped peers always have services set"))
+            .collect();
+
+        debug!(count = ?addrs.len(), "sending gossiped addresses to the address book");
+
+        // Don't bother spawning a task if there are no addresses left.
+        if addrs.is_empty() {
+            return;
+        }
 
         // # Correctness
         //
-        // Briefly hold the address book threaded mutex, to extend
-        // the address list.
+        // Spawn address book accesses on a blocking thread,
+        // to avoid deadlocks (see #1976).
         //
         // Extend handles duplicate addresses internally.
-        self.address_book.lock().unwrap().extend(addrs);
+        let address_book = self.address_book.clone();
+        tokio::task::spawn_blocking(move || address_book.lock().unwrap().extend(addrs))
+            .await
+            .expect("panic in new peers address book update task");
     }
 
     /// Returns the next candidate for a connection attempt, if any are available.
@@ -296,43 +352,54 @@ where
     /// new peer connections are initiated at least
     /// [`MIN_PEER_CONNECTION_INTERVAL`][constants::MIN_PEER_CONNECTION_INTERVAL] apart.
     pub async fn next(&mut self) -> Option<MetaAddr> {
-        // # Correctness
-        //
-        // In this critical section, we hold the address mutex, blocking the
-        // current thread, and all async tasks scheduled on that thread.
-        //
-        // To avoid deadlocks, the critical section:
-        // - must not acquire any other locks
-        // - must not await any futures
-        //
-        // To avoid hangs, any computation in the critical section should
-        // be kept to a minimum.
-        let reconnect = {
-            let mut guard = self.address_book.lock().unwrap();
+        // Correctness: To avoid hangs, computation in the critical section should be kept to a minimum.
+        let address_book = self.address_book.clone();
+        let next_peer = move || -> Option<MetaAddr> {
+            let mut guard = address_book.lock().unwrap();
+
+            // Now we have the lock, get the current time
+            let instant_now = std::time::Instant::now();
+            let chrono_now = Utc::now();
+
             // It's okay to return without sleeping here, because we're returning
             // `None`. We only need to sleep before yielding an address.
-            let reconnect = guard.reconnection_peers().next()?;
+            let next_peer = guard.reconnection_peers(instant_now, chrono_now).next()?;
 
-            let reconnect = MetaAddr::new_reconnect(&reconnect.addr);
-            guard.update(reconnect)?
+            // TODO: only mark the peer as AttemptPending when it is actually used (#1976)
+            //
+            // If the future is dropped before `next` returns, the peer will be marked as AttemptPending,
+            // even if its address is not actually used for a connection.
+            //
+            // We could send a reconnect change to the AddressBookUpdater when the peer is actually used,
+            // but channel order is not guaranteed, so we could accidentally re-use the same peer.
+            let next_peer = MetaAddr::new_reconnect(&next_peer.addr);
+            guard.update(next_peer)
         };
 
-        // SECURITY: rate-limit new outbound peer connections
-        (&mut self.wait_next_handshake).await;
-        let mut sleep = sleep(constants::MIN_PEER_CONNECTION_INTERVAL);
-        mem::swap(&mut self.wait_next_handshake, &mut sleep);
+        // Correctness: Spawn address book accesses on a blocking thread, to avoid deadlocks (see #1976).
+        let next_peer = tokio::task::spawn_blocking(next_peer)
+            .await
+            .expect("panic in next peer address book task")?;
 
-        Some(reconnect)
+        // Security: rate-limit new outbound peer connections
+        sleep_until(self.min_next_handshake).await;
+        self.min_next_handshake = Instant::now() + constants::MIN_PEER_CONNECTION_INTERVAL;
+
+        Some(next_peer)
     }
 
     /// Mark `addr` as a failed peer.
-    pub fn report_failed(&mut self, addr: &MetaAddr) {
+    pub async fn report_failed(&mut self, addr: &MetaAddr) {
         let addr = MetaAddr::new_errored(&addr.addr, addr.services);
+
         // # Correctness
         //
-        // Briefly hold the address book threaded mutex, to update the state for
-        // a single address.
-        self.address_book.lock().unwrap().update(addr);
+        // Spawn address book accesses on a blocking thread,
+        // to avoid deadlocks (see #1976).
+        let address_book = self.address_book.clone();
+        tokio::task::spawn_blocking(move || address_book.lock().unwrap().update(addr))
+            .await
+            .expect("panic in peer failure address book update task");
     }
 }
 

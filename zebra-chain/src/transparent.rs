@@ -26,14 +26,14 @@ use proptest_derive::Arbitrary;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 #[cfg(test)]
-mod prop;
+mod tests;
 
 use crate::{
     amount::{Amount, NonNegative},
     block, transaction,
 };
 
-use std::{collections::HashMap, iter};
+use std::{collections::HashMap, fmt, iter};
 
 /// The maturity threshold for transparent coinbase outputs.
 ///
@@ -123,7 +123,53 @@ pub enum Input {
     },
 }
 
+impl fmt::Display for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Input::PrevOut {
+                outpoint,
+                unlock_script,
+                ..
+            } => {
+                let mut fmter = f.debug_struct("transparent::Input::PrevOut");
+
+                fmter.field("unlock_script_len", &unlock_script.as_raw_bytes().len());
+                fmter.field("outpoint", outpoint);
+
+                fmter.finish()
+            }
+            Input::Coinbase { height, data, .. } => {
+                let mut fmter = f.debug_struct("transparent::Input::Coinbase");
+
+                fmter.field("height", height);
+                fmter.field("data_len", &data.0.len());
+
+                fmter.finish()
+            }
+        }
+    }
+}
+
 impl Input {
+    /// Returns the input's sequence number.
+    pub fn sequence(&self) -> u32 {
+        match self {
+            Input::PrevOut { sequence, .. } | Input::Coinbase { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Sets the input's sequence number.
+    ///
+    /// Only for use in tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn set_sequence(&mut self, new_sequence: u32) {
+        match self {
+            Input::PrevOut { sequence, .. } | Input::Coinbase { sequence, .. } => {
+                *sequence = new_sequence
+            }
+        }
+    }
+
     /// If this is a `PrevOut` input, returns this input's outpoint.
     /// Otherwise, returns `None`.
     pub fn outpoint(&self) -> Option<OutPoint> {

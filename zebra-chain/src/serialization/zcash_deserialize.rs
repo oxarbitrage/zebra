@@ -1,9 +1,11 @@
 use std::{
     convert::{TryFrom, TryInto},
     io,
+    net::Ipv6Addr,
+    sync::Arc,
 };
 
-use super::{AtLeastOne, ReadZcashExt, SerializationError, MAX_PROTOCOL_MESSAGE_LEN};
+use super::{AtLeastOne, CompactSizeMessage, SerializationError, MAX_PROTOCOL_MESSAGE_LEN};
 
 /// Consensus-critical serialization for Zcash.
 ///
@@ -20,20 +22,20 @@ pub trait ZcashDeserialize: Sized {
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError>;
 }
 
-/// Deserialize a `Vec`, where the number of items is set by a compactsize
+/// Deserialize a `Vec`, where the number of items is set by a CompactSize
 /// prefix in the data. This is the most common format in Zcash.
 ///
 /// See `zcash_deserialize_external_count` for more details, and usage
 /// information.
 impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for Vec<T> {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len = reader.read_compactsize()?.try_into()?;
-        zcash_deserialize_external_count(len, reader)
+        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        zcash_deserialize_external_count(len.into(), reader)
     }
 }
 
 /// Deserialize an `AtLeastOne` vector, where the number of items is set by a
-/// compactsize prefix in the data. This is the most common format in Zcash.
+/// CompactSize prefix in the data. This is the most common format in Zcash.
 impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T> {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         let v: Vec<T> = (&mut reader).zcash_deserialize_into()?;
@@ -48,16 +50,16 @@ impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T
 /// This allows the optimization without relying on specialization.
 impl ZcashDeserialize for Vec<u8> {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len = reader.read_compactsize()?.try_into()?;
-        zcash_deserialize_bytes_external_count(len, reader)
+        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        zcash_deserialize_bytes_external_count(len.into(), reader)
     }
 }
 
 /// Deserialize a `Vec` containing `external_count` items.
 ///
-/// In Zcash, most arrays are stored as a compactsize, followed by that number
+/// In Zcash, most arrays are stored as a CompactSize, followed by that number
 /// of items of type `T`. But in `Transaction::V5`, some types are serialized as
-/// multiple arrays in different locations, with a single compactsize before the
+/// multiple arrays in different locations, with a single CompactSize before the
 /// first array.
 ///
 /// ## Usage
@@ -65,7 +67,7 @@ impl ZcashDeserialize for Vec<u8> {
 /// Use `zcash_deserialize_external_count` when the array count is determined by
 /// other data, or a consensus rule.
 ///
-/// Use `Vec::zcash_deserialize` for data that contains compactsize count,
+/// Use `Vec::zcash_deserialize` for data that contains CompactSize count,
 /// followed by the data array.
 ///
 /// For example, when a single count applies to multiple arrays:
@@ -128,6 +130,19 @@ impl ZcashDeserialize for String {
     }
 }
 
+// We don't impl ZcashDeserialize for Ipv4Addr or SocketAddrs,
+// because the IPv4 and port formats are different in addr (v1) and addrv2 messages.
+
+/// Read a Bitcoin-encoded IPv6 address.
+impl ZcashDeserialize for Ipv6Addr {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        let mut ipv6_addr = [0u8; 16];
+        reader.read_exact(&mut ipv6_addr)?;
+
+        Ok(Ipv6Addr::from(ipv6_addr))
+    }
+}
+
 /// Helper for deserializing more succinctly via type inference
 pub trait ZcashDeserializeInto {
     /// Deserialize based on type inference
@@ -157,9 +172,18 @@ pub trait TrustedPreallocate {
     fn max_allocation() -> u64;
 }
 
+impl<T> TrustedPreallocate for Arc<T>
+where
+    T: TrustedPreallocate,
+{
+    fn max_allocation() -> u64 {
+        T::max_allocation()
+    }
+}
+
 /// The length of the longest valid `Vec<u8>` that can be received over the network
 ///
-/// It takes 5 bytes to encode a compactsize representing any number netween 2^16 and (2^32 - 1)
+/// It takes 5 bytes to encode a CompactSize representing any number netween 2^16 and (2^32 - 1)
 /// MAX_PROTOCOL_MESSAGE_LEN is ~2^21, so the largest Vec<u8> that can be received from an honest peer is
 /// (MAX_PROTOCOL_MESSAGE_LEN - 5);
 pub(crate) const MAX_U8_ALLOCATION: usize = MAX_PROTOCOL_MESSAGE_LEN - 5;

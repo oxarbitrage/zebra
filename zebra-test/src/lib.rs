@@ -2,13 +2,8 @@
 #![doc(html_favicon_url = "https://www.zfnd.org/images/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://www.zfnd.org/images/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_test")]
-// Standard lints
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
 // Each lazy_static variable uses additional recursion
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::section::PanicMessage;
 use once_cell::sync::Lazy;
@@ -20,15 +15,18 @@ use std::sync::Once;
 
 #[allow(missing_docs)]
 pub mod command;
+pub mod mock_service;
 pub mod net;
+pub mod network_addr;
 pub mod prelude;
+pub mod service_extensions;
 pub mod transcript;
 pub mod vectors;
 pub mod zip0143;
 pub mod zip0243;
 pub mod zip0244;
 
-/// A multi-threaded Tokio runtime that can be shared between tests.
+/// A single-threaded Tokio runtime that can be shared between tests.
 ///
 /// This shared runtime should be used in tests that use shared background tasks. An example is
 /// with shared global `Lazy<BatchVerifier>` types, because they spawn a background task when they
@@ -44,7 +42,7 @@ pub mod zip0244;
 /// for example) and that means that the next test will already start with an incorrect timer
 /// state.
 pub static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("Failed to create Tokio runtime")
@@ -65,7 +63,9 @@ pub fn init() {
                 .unwrap()
                 .add_directive("zebra_consensus=error".parse().unwrap())
                 .add_directive("zebra_network=error".parse().unwrap())
+                .add_directive("zebra_state=error".parse().unwrap())
                 .add_directive("zebrad=error".parse().unwrap())
+                .add_directive("tor_circmgr=error".parse().unwrap())
         });
 
         tracing_subscriber::registry()
@@ -117,6 +117,22 @@ pub fn init() {
             .install()
             .unwrap();
     })
+}
+
+/// Initialize globals for tests that need a separate Tokio runtime instance.
+///
+/// This is generally used in proptests, which don't support the `#[tokio::test]` attribute.
+///
+/// If a runtime needs to be shared between tests, use the [`RUNTIME`] instance instead.
+///
+/// See also the [`init`] function, which is called by this function.
+pub fn init_async() -> tokio::runtime::Runtime {
+    init();
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime")
 }
 
 struct SkipTestReturnedErrPanicMessages;

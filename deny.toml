@@ -1,0 +1,102 @@
+# Note that all fields that take a lint level have these possible values:
+# * deny - An error will be produced and the check will fail
+# * warn - A warning will be produced, but the check will not fail
+# * allow - No warning or error will be produced, though in some cases a note
+# will be
+
+# This section is considered when running `cargo deny check bans`.
+# More documentation about the 'bans' section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "deny"
+# The graph highlighting used when creating dotgraphs for crates
+# with multiple versions
+# * lowest-version - The path to the lowest versioned duplicate is highlighted
+# * simplest-path - The path to the version with the fewest edges is highlighted
+# * all - Both lowest-version and simplest-path are used
+highlight = "all"
+
+# List of crates that are allowed. Use with care!
+allow = [
+    #{ name = "ansi_term", version = "=0.11.0" },
+]
+
+# Certain crates/versions that will be skipped when doing duplicate detection.
+skip = [
+    #{ name = "ansi_term", version = "=0.11.0" },
+]
+# Similarly to `skip` allows you to skip certain crates during duplicate
+# detection. Unlike skip, it also includes the entire tree of transitive
+# dependencies starting at the specified crate, up to a certain depth, which is
+# by default infinite
+skip-tree = [
+    # ticket #2983: criterion dependencies
+    { name = "criterion", version = "=0.3.4" },
+
+    # ticket #3000: tower-fallback dependencies
+    { name = "pin-project", version = "=0.4.28" },
+
+    # ticket #3063: redjubjub dependencies
+    { name = "redjubjub", version = "=0.4.0" },
+
+    # ticket #3315: ordered-map dependencies that should be dev-dependencies
+    { name = "ordered-map", version = "=0.4.2" },
+
+    # ticket #2984: owo-colors dependencies
+    { name = "color-eyre", version = "=0.5.11" },
+
+    # ticket #2998: hdrhistogram dependencies
+    { name = "hdrhistogram", version = "=6.3.4" },
+
+    # ticket #3061: reqwest and minreq dependencies
+    { name = "webpki-roots", version = "=0.18.0" },
+
+    # ticket #2980: inferno and orchard/cryptographic dependencies
+    { name = "orchard", version = "=0.0.0" },
+
+    # upgrade orchard from deprecated `bigint` to `uint`: https://github.com/zcash/orchard/issues/219
+    # alternative: downgrade Zebra to `bigint`
+    { name = "bigint", version = "=4.4.3" },
+
+    # recent major version bumps
+    # we should re-check these dependencies in February 2022
+
+    # wait for lots of crates in the cryptographic ecosystem to upgrade
+    { name = "rand", version = "=0.7.3" },
+    { name = "rustls", version = "=0.19.1" },
+
+    # wait for lots of crates in the tokio ecosystem to upgrade
+    { name = "socket2", version = "=0.3.16" },
+
+    # wait for arti to stabilise
+    { name = "arti-client" },
+]
+
+# This section is considered when running `cargo deny check sources`.
+# More documentation about the 'sources' section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is not
+# in the allow list is encountered
+unknown-registry = "deny"
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "deny"
+# List of URLs for allowed crate registries. Defaults to the crates.io index
+# if not specified. If it is specified but empty, no registries are allowed.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# List of URLs for allowed Git repositories
+allow-git = [
+    # ticket #2982: librustzcash and orchard git versions
+    "https://github.com/str4d/redjubjub",
+
+    # ticket #2523: replace unmaintained multiset
+    "https://github.com/jmitchell/multiset",
+]
+
+[sources.allow-org]
+github = [
+    "ZcashFoundation",
+    "zcash",
+]

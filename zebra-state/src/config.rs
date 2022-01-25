@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::{convert::TryInto, path::PathBuf};
-use tempdir::TempDir;
 use zebra_chain::parameters::Network;
 
 /// Configuration for the state service.
@@ -46,7 +45,9 @@ pub struct Config {
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
-    TempDir::new(prefix)
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
         .expect("temporary directory is created successfully")
         .into_path()
 }
@@ -157,13 +158,12 @@ impl Config {
         }
 
         // Try the hard limit or the minimum, whichever is greater
-        let min_limit = if let Some(hard_limit) =
-            hard_rlimit.map(TryInto::try_into).map(Result::ok).flatten()
-        {
-            std::cmp::max(Config::MIN_OPEN_FILE_LIMIT, hard_limit)
-        } else {
-            Config::MIN_OPEN_FILE_LIMIT
-        };
+        let min_limit =
+            if let Some(hard_limit) = hard_rlimit.map(TryInto::try_into).and_then(Result::ok) {
+                std::cmp::max(Config::MIN_OPEN_FILE_LIMIT, hard_limit)
+            } else {
+                Config::MIN_OPEN_FILE_LIMIT
+            };
         if let Ok(actual_limit) = Config::set_open_file_limit(min_limit, hard_rlimit, old_limit) {
             tracing::warn!(?actual_limit,
                            ?hard_rlimit,

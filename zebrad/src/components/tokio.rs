@@ -46,18 +46,26 @@ pub(crate) trait RuntimeRun {
 impl RuntimeRun for Runtime {
     fn run(&mut self, fut: impl Future<Output = Result<(), Report>>) {
         let result = self.block_on(async move {
-            // If the run task and shutdown are both ready, select! chooses
-            // one of them at random.
+            // Always poll the shutdown future first.
+            //
+            // Otherwise, a busy Zebra instance could starve the shutdown future,
+            // and delay shutting down.
             tokio::select! {
-                result = fut => result,
+                biased;
                 _ = shutdown() => Ok(()),
+                result = fut => result,
             }
         });
 
         match result {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
+            Ok(()) => {
+                info!("shutting down Zebra");
+
+                // Don't wait for the runtime to shut down all the tasks.
+                app_writer().shutdown(Shutdown::Graceful);
+            }
+            Err(error) => {
+                warn!(?error, "shutting down Zebra due to an error");
                 app_writer().shutdown(Shutdown::Forced);
             }
         }

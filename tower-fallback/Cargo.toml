@@ -1,16 +1,16 @@
 [package]
 name = "tower-fallback"
-version = "0.2.11"
+version = "0.2.15"
 authors = ["Zcash Foundation <zebra@zfnd.org>"]
 license = "MIT"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 tower = "0.4"
-futures-core = "0.3.13"
+futures-core = "0.3.19"
 pin-project = "0.4.27"
 tracing = "0.1"
 
 [dev-dependencies]
 zebra-test = { path = "../zebra-test/" }
-tokio = { version = "0.3.6", features = ["full"]}
+tokio = { version = "1.15.0", features = ["full"]}

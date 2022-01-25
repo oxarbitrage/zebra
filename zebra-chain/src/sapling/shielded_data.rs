@@ -4,6 +4,14 @@
 //! The `value_balance` change is handled using the default zero value.
 //! The anchor change is handled using the `AnchorVariant` type trait.
 
+use std::{
+    cmp::{max, Eq, PartialEq},
+    fmt::{self, Debug},
+};
+
+use itertools::Itertools;
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest_derive::Arbitrary;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
@@ -19,11 +27,6 @@ use crate::{
     serialization::{AtLeastOne, TrustedPreallocate},
 };
 
-use std::{
-    cmp::{max, Eq, PartialEq},
-    fmt::Debug,
-};
-
 /// Per-Spend Sapling anchors, used in Transaction V4 and the
 /// `spends_per_anchor` method.
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,6 +38,7 @@ pub struct SharedAnchor {}
 
 /// This field is not present in this transaction version.
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct FieldNotPresent;
 
 impl AnchorVariant for PerSpendAnchor {
@@ -176,11 +180,42 @@ where
     },
 }
 
+impl<AnchorV> fmt::Display for ShieldedData<AnchorV>
+where
+    AnchorV: AnchorVariant + Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fmter = f.debug_struct(
+            format!(
+                "sapling::ShieldedData<{}>",
+                std::any::type_name::<AnchorV>()
+            )
+            .as_str(),
+        );
+
+        fmter.field("spends", &self.transfers.spends().count());
+        fmter.field("outputs", &self.transfers.outputs().count());
+        fmter.field("value_balance", &self.value_balance);
+
+        fmter.finish()
+    }
+}
+
 impl<AnchorV> ShieldedData<AnchorV>
 where
     AnchorV: AnchorVariant + Clone,
     Spend<PerSpendAnchor>: From<(Spend<AnchorV>, AnchorV::Shared)>,
 {
+    /// Iterate over the [`Spend`]s for this transaction, returning deduplicated
+    /// [`tree::Root`]s, regardless of the underlying transaction version.
+    pub fn anchors(&self) -> impl Iterator<Item = tree::Root> + '_ {
+        // TODO: use TransferData::shared_anchor to improve performance for V5 transactions
+        self.spends_per_anchor()
+            .map(|spend| spend.per_spend_anchor)
+            .sorted()
+            .dedup()
+    }
+
     /// Iterate over the [`Spend`]s for this transaction, returning
     /// `Spend<PerSpendAnchor>` regardless of the underlying transaction version.
     ///
@@ -237,7 +272,7 @@ where
     ///
     /// Getting the binding signature validating key from the Spend and Output
     /// description value commitments and the balancing value implicitly checks
-    /// that the balancing value is consistent with the value transfered in the
+    /// that the balancing value is consistent with the value transferred in the
     /// Spend and Output descriptions but also proves that the signer knew the
     /// randomness used for the Spend and Output value commitments, which
     /// prevents replays of Output descriptions.
@@ -254,10 +289,10 @@ where
     /// of the value commitments in the Spend descriptions and Output
     /// descriptions of the transaction, and the balancing value.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingbalance
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingbalance>
     pub fn binding_verification_key(&self) -> redjubjub::VerificationKeyBytes<Binding> {
-        let cv_old: ValueCommitment = self.spends().map(|spend| spend.cv).sum();
-        let cv_new: ValueCommitment = self.outputs().map(|output| output.cv).sum();
+        let cv_old: ValueCommitment = self.spends().map(|spend| spend.cv.into()).sum();
+        let cv_new: ValueCommitment = self.outputs().map(|output| output.cv.into()).sum();
         let cv_balance: ValueCommitment =
             ValueCommitment::new(jubjub::Fr::zero(), self.value_balance);
 

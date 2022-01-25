@@ -22,6 +22,7 @@ use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zebra_chain::{
+    amount::Amount,
     block::{self, Block},
     parameters::Network,
     transparent,
@@ -48,6 +49,7 @@ pub struct BlockVerifier<S, V> {
 
 // TODO: dedupe with crate::error::BlockError
 #[non_exhaustive]
+#[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum VerifyBlockError {
     #[error("unable to verify depth for block {hash} from chain state during block verification")]
@@ -74,6 +76,15 @@ pub enum VerifyBlockError {
     #[error("invalid transaction")]
     Transaction(#[from] TransactionError),
 }
+
+/// The maximum allowed number of legacy signature check operations in a block.
+///
+/// This consensus rule is not documented, so Zebra follows the `zcashd` implementation.
+/// We re-use some `zcashd` C++ script code via `zebra-script` and `zcash_script`.
+///
+/// See:
+/// https://github.com/zcash/zcash/blob/bad7f7eadbbb3466bebe3354266c7f69f607fcfd/src/consensus/consensus.h#L30
+pub const MAX_BLOCK_SIGOPS: u64 = 20_000;
 
 impl<S, V> BlockVerifier<S, V>
 where
@@ -118,13 +129,12 @@ where
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
-        // TODO(jlusby): Error = Report, handle errors from state_service.
         async move {
             let hash = block.hash();
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
-                .ready_and()
+                .ready()
                 .await
                 .map_err(|source| VerifyBlockError::Depth { source, hash })?
                 .call(zs::Request::Depth(hash))
@@ -142,6 +152,9 @@ where
             let height = block
                 .coinbase_height()
                 .ok_or(BlockError::MissingHeight(hash))?;
+
+            // TODO: support block heights up to u32::MAX (#1113)
+            // In practice, these blocks are invalid anyway, because their parent block doesn't exist.
             if height > block::Height::MAX {
                 Err(BlockError::MaxHeight(height, hash, block::Height::MAX))?;
             }
@@ -163,13 +176,23 @@ where
             // Since errors cause an early exit, try to do the
             // quick checks first.
 
-            // Field validity and structure checks
+            // Quick field validity and structure checks
             let now = Utc::now();
             check::time_is_valid_at(&block.header, now, &height, &hash)
                 .map_err(VerifyBlockError::Time)?;
             check::coinbase_is_first(&block)?;
+            let coinbase_tx = block
+                .transactions
+                .get(0)
+                .expect("must have coinbase transaction");
             check::subsidy_is_valid(&block, network)?;
 
+            // Now do the slower checks
+
+            // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
+            tx::check::coinbase_outputs_are_decryptable(coinbase_tx, network, height)?;
+
+            // Send transactions to the transaction verifier to be checked
             let mut async_checks = FuturesUnordered::new();
 
             let known_utxos = Arc::new(transparent::new_ordered_outputs(
@@ -178,35 +201,71 @@ where
             ));
             for transaction in &block.transactions {
                 let rsp = transaction_verifier
-                    .ready_and()
+                    .ready()
                     .await
                     .expect("transaction verifier is always ready")
                     .call(tx::Request::Block {
                         transaction: transaction.clone(),
                         known_utxos: known_utxos.clone(),
                         height,
+                        time: block.header.time,
                     });
                 async_checks.push(rsp);
             }
             tracing::trace!(len = async_checks.len(), "built async tx checks");
 
+            // Get the transaction results back from the transaction verifier.
+
+            // Sum up some block totals from the transaction responses.
+            let mut legacy_sigop_count = 0;
+            let mut block_miner_fees = Ok(Amount::zero());
+
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
-                result
+                let response = result
                     .map_err(Into::into)
                     .map_err(VerifyBlockError::Transaction)?;
+
+                assert!(
+                    matches!(response, tx::Response::Block { .. }),
+                    "unexpected response from transaction verifier: {:?}",
+                    response
+                );
+
+                legacy_sigop_count += response
+                    .legacy_sigop_count()
+                    .expect("block transaction responses must have a legacy sigop count");
+
+                // Coinbase transactions consume the miner fee,
+                // so they don't add any value to the block's total miner fee.
+                if let Some(miner_fee) = response.miner_fee() {
+                    block_miner_fees += miner_fee;
+                }
             }
 
-            // Update the metrics after all the validation is finished
-            tracing::trace!("verified block");
-            metrics::gauge!("zcash.chain.verified.block.height", height.0 as _);
-            metrics::counter!("zcash.chain.verified.block.total", 1);
+            // Check the summed block totals
 
+            if legacy_sigop_count > MAX_BLOCK_SIGOPS {
+                Err(BlockError::TooManyTransparentSignatureOperations {
+                    height,
+                    hash,
+                    legacy_sigop_count,
+                })?;
+            }
+
+            let block_miner_fees =
+                block_miner_fees.map_err(|amount_error| BlockError::SummingMinerFees {
+                    height,
+                    hash,
+                    source: amount_error,
+                })?;
+            check::miner_fees_are_valid(&block, network, block_miner_fees)?;
+
+            // Finally, submit the block for contextual verification.
             let new_outputs = Arc::try_unwrap(known_utxos)
                 .expect("all verification tasks using known_utxos are complete");
 
-            // Finally, submit the block for contextual verification.
             let prepared_block = zs::PreparedBlock {
                 block,
                 hash,
@@ -215,7 +274,7 @@ where
                 transaction_hashes,
             };
             match state_service
-                .ready_and()
+                .ready()
                 .await
                 .map_err(VerifyBlockError::Commit)?
                 .call(zs::Request::CommitBlock(prepared_block))

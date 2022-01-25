@@ -41,8 +41,8 @@ pub fn block_no_transactions() -> Block {
     }
 }
 
-/// Return a new `(chain_verifier, state_service)` using the hard-coded
-/// checkpoint list for `network`.
+/// Return a new chain verifier and state service,
+/// using the hard-coded checkpoint list for `network`.
 async fn verifiers_from_network(
     network: Network,
 ) -> (
@@ -64,8 +64,12 @@ async fn verifiers_from_network(
         + 'static,
 ) {
     let state_service = zs::init_test(network);
-    let (chain_verifier, _transaction_verifier) =
-        crate::chain::init(Config::default(), network, state_service.clone()).await;
+    let (chain_verifier, _transaction_verifier, _groth16_download_handle) =
+        crate::chain::init(Config::default(), network, state_service.clone(), true).await;
+
+    // We can drop the download task handle here, because:
+    // - if the download task fails, the tests will panic, and
+    // - if the download task hangs, the tests will hang.
 
     (chain_verifier, state_service)
 }
@@ -132,10 +136,12 @@ static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
 async fn verify_checkpoint_test() -> Result<(), Report> {
     verify_checkpoint(Config {
         checkpoint_sync: true,
+        debug_skip_parameter_preload: true,
     })
     .await?;
     verify_checkpoint(Config {
         checkpoint_sync: false,
+        debug_skip_parameter_preload: true,
     })
     .await?;
 
@@ -153,8 +159,10 @@ async fn verify_checkpoint(config: Config) -> Result<(), Report> {
 
     // Test that the chain::init function works. Most of the other tests use
     // init_from_verifiers.
-    let (chain_verifier, _transaction_verifier) =
-        super::init(config.clone(), network, zs::init_test(network)).await;
+    //
+    // Download task panics and timeouts are propagated to the tests that use Groth16 verifiers.
+    let (chain_verifier, _transaction_verifier, _groth16_download_handle) =
+        super::init(config.clone(), network, zs::init_test(network), true).await;
 
     // Add a timeout layer
     let chain_verifier =

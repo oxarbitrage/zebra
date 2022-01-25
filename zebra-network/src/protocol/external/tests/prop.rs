@@ -1,12 +1,23 @@
+//! Randomised property tests for Zebra's Zcash network protocol types.
+
+use std::convert::TryInto;
+
 use bytes::BytesMut;
 use proptest::{collection::vec, prelude::*};
 use tokio_util::codec::{Decoder, Encoder};
 
 use zebra_chain::serialization::{
-    SerializationError, ZcashDeserializeInto, ZcashSerialize, MAX_PROTOCOL_MESSAGE_LEN,
+    SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    MAX_PROTOCOL_MESSAGE_LEN,
 };
 
-use super::super::{Codec, InventoryHash, Message};
+use crate::{
+    meta_addr::{tests::check, MetaAddr},
+    protocol::external::{
+        addr::{AddrV1, AddrV2},
+        Codec, InventoryHash, Message,
+    },
+};
 
 /// Maximum number of random input bytes to try to deserialize an [`InventoryHash`] from.
 ///
@@ -88,5 +99,152 @@ proptest! {
 
         prop_assert!(decoded.is_ok());
         prop_assert_eq!(decoded.unwrap(), Some(message));
+    }
+
+    /// Test round-trip AddrV1 serialization for all MetaAddr variants after sanitization
+    #[test]
+    fn addr_v1_sanitized_roundtrip(addr in any::<MetaAddr>()) {
+        zebra_test::init();
+
+        // We require sanitization before serialization,
+        // but we also need the original address for this test
+        let sanitized_addr = addr.sanitize();
+        prop_assume!(sanitized_addr.is_some());
+        let sanitized_addr = sanitized_addr.unwrap();
+
+        // Make sure sanitization avoids leaks on this address, to avoid spurious errors
+        check::sanitize_avoids_leaks(&addr, &sanitized_addr);
+
+        // Check that sanitization doesn't make Zebra's serialization fail.
+        //
+        // If this is a gossiped or DNS seeder address,
+        // we're also checking that malicious peers can't make Zebra's serialization fail.
+        let addr_bytes = AddrV1::from(sanitized_addr).zcash_serialize_to_vec();
+        prop_assert!(
+            addr_bytes.is_ok(),
+            "unexpected serialization error: {:?}, addr: {:?}",
+            addr_bytes,
+            sanitized_addr
+        );
+        let addr_bytes = addr_bytes.unwrap();
+
+        // Assume other implementations deserialize like Zebra
+        let deserialized_addr = AddrV1::zcash_deserialize(addr_bytes.as_slice());
+        prop_assert!(
+            deserialized_addr.is_ok(),
+            "unexpected deserialization error: {:?}, addr: {:?}, bytes: {:?}",
+            deserialized_addr,
+            sanitized_addr,
+            hex::encode(addr_bytes),
+        );
+        let deserialized_addr: MetaAddr = deserialized_addr.unwrap().into();
+
+        // Check that the addrs are equal
+        prop_assert_eq!(
+            sanitized_addr,
+            deserialized_addr,
+            "unexpected round-trip mismatch with bytes: {:?}",
+            hex::encode(addr_bytes),
+        );
+
+        // Check that serialization hasn't de-sanitized anything
+        check::sanitize_avoids_leaks(&addr, &deserialized_addr);
+
+        // Now check that the re-serialized bytes are equal
+        // (`impl PartialEq for MetaAddr` might not match serialization equality)
+        let addr_bytes2 = AddrV1::from(deserialized_addr).zcash_serialize_to_vec();
+        prop_assert!(
+            addr_bytes2.is_ok(),
+            "unexpected serialization error after round-trip: {:?}, original addr: {:?}, bytes: {:?}, deserialized addr: {:?}",
+            addr_bytes2,
+            sanitized_addr,
+            hex::encode(addr_bytes),
+            deserialized_addr,
+        );
+        let addr_bytes2 = addr_bytes2.unwrap();
+
+        prop_assert_eq!(
+            &addr_bytes,
+            &addr_bytes2,
+            "unexpected double-serialization round-trip mismatch with original addr: {:?}, bytes: {:?}, deserialized addr: {:?}, bytes: {:?}",
+            sanitized_addr,
+            hex::encode(&addr_bytes),
+            deserialized_addr,
+            hex::encode(&addr_bytes2),
+        );
+    }
+
+    /// Test round-trip AddrV2 serialization for all MetaAddr variants after sanitization
+    #[test]
+    fn addr_v2_sanitized_roundtrip(addr in any::<MetaAddr>()) {
+        zebra_test::init();
+
+        // We require sanitization before serialization,
+        // but we also need the original address for this test
+        let sanitized_addr = addr.sanitize();
+        prop_assume!(sanitized_addr.is_some());
+        let sanitized_addr = sanitized_addr.unwrap();
+
+        // Make sure sanitization avoids leaks on this address, to avoid spurious errors
+        check::sanitize_avoids_leaks(&addr, &sanitized_addr);
+
+        // Check that sanitization doesn't make Zebra's serialization fail.
+        //
+        // If this is a gossiped or DNS seeder address,
+        // we're also checking that malicious peers can't make Zebra's serialization fail.
+        let addr_bytes = AddrV2::from(sanitized_addr).zcash_serialize_to_vec();
+        prop_assert!(
+            addr_bytes.is_ok(),
+            "unexpected serialization error: {:?}, addr: {:?}",
+            addr_bytes,
+            sanitized_addr
+        );
+        let addr_bytes = addr_bytes.unwrap();
+
+        // Assume other implementations deserialize like Zebra
+        let deserialized_addr = AddrV2::zcash_deserialize(addr_bytes.as_slice());
+        prop_assert!(
+            deserialized_addr.is_ok(),
+            "unexpected deserialization error: {:?}, addr: {:?}, bytes: {:?}",
+            deserialized_addr,
+            sanitized_addr,
+            hex::encode(addr_bytes),
+        );
+        let deserialized_addr: AddrV2 = deserialized_addr.unwrap();
+        let deserialized_addr: MetaAddr = deserialized_addr.try_into().expect("arbitrary MetaAddrs are IPv4 or IPv6");
+
+        // Check that the addrs are equal
+        prop_assert_eq!(
+            sanitized_addr,
+            deserialized_addr,
+            "unexpected round-trip mismatch with bytes: {:?}",
+            hex::encode(addr_bytes),
+        );
+
+        // Check that serialization hasn't de-sanitized anything
+        check::sanitize_avoids_leaks(&addr, &deserialized_addr);
+
+        // Now check that the re-serialized bytes are equal
+        // (`impl PartialEq for MetaAddr` might not match serialization equality)
+        let addr_bytes2 = AddrV2::from(deserialized_addr).zcash_serialize_to_vec();
+        prop_assert!(
+            addr_bytes2.is_ok(),
+            "unexpected serialization error after round-trip: {:?}, original addr: {:?}, bytes: {:?}, deserialized addr: {:?}",
+            addr_bytes2,
+            sanitized_addr,
+            hex::encode(addr_bytes),
+            deserialized_addr,
+        );
+        let addr_bytes2 = addr_bytes2.unwrap();
+
+        prop_assert_eq!(
+            &addr_bytes,
+            &addr_bytes2,
+            "unexpected double-serialization round-trip mismatch with original addr: {:?}, bytes: {:?}, deserialized addr: {:?}, bytes: {:?}",
+            sanitized_addr,
+            hex::encode(&addr_bytes),
+            deserialized_addr,
+            hex::encode(&addr_bytes2),
+        );
     }
 }

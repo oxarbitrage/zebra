@@ -1,6 +1,11 @@
-use std::io;
+use std::{convert::TryInto, io, net::Ipv6Addr};
 
-use super::{AtLeastOne, WriteZcashExt};
+use super::{AtLeastOne, CompactSizeMessage};
+
+/// The maximum length of a Zcash message, in bytes.
+///
+/// This value is used to calculate safe preallocation limits for some types
+pub const MAX_PROTOCOL_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 
 /// Consensus-critical serialization for Zcash.
 ///
@@ -27,20 +32,56 @@ pub trait ZcashSerialize: Sized {
         self.zcash_serialize(&mut data)?;
         Ok(data)
     }
+
+    /// Get the size of `self` by using a fake writer.
+    fn zcash_serialized_size(&self) -> Result<usize, io::Error> {
+        let mut writer = FakeWriter(0);
+        self.zcash_serialize(&mut writer)
+            .expect("writer should never fail");
+        Ok(writer.0)
+    }
 }
 
-/// Serialize a `Vec` as a compactsize number of items, then the items. This is
+/// A fake writer helper used to get object lengths without allocating RAM.
+pub struct FakeWriter(pub usize);
+
+impl std::io::Write for FakeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize a `Vec` as a CompactSize number of items, then the items. This is
 /// the most common format in Zcash.
 ///
 /// See `zcash_serialize_external_count` for more details, and usage information.
 impl<T: ZcashSerialize> ZcashSerialize for Vec<T> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_compactsize(self.len() as u64)?;
+        let len: CompactSizeMessage = self
+            .len()
+            .try_into()
+            .expect("len fits in MAX_PROTOCOL_MESSAGE_LEN");
+        len.zcash_serialize(&mut writer)?;
+
         zcash_serialize_external_count(self, writer)
     }
 }
 
-/// Serialize a byte vector as a compactsize number of items, then the items.
+/// Serialize an `AtLeastOne` vector as a CompactSize number of items, then the
+/// items. This is the most common format in Zcash.
+impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        self.as_vec().zcash_serialize(&mut writer)
+    }
+}
+
+/// Serialize a byte vector as a CompactSize number of items, then the items.
 ///
 /// # Correctness
 ///
@@ -52,24 +93,28 @@ impl<T: ZcashSerialize> ZcashSerialize for Vec<T> {
 // we specifically want to serialize `Vec`s here, rather than generic slices
 #[allow(clippy::ptr_arg)]
 pub fn zcash_serialize_bytes<W: io::Write>(vec: &Vec<u8>, mut writer: W) -> Result<(), io::Error> {
-    writer.write_compactsize(vec.len() as u64)?;
+    let len: CompactSizeMessage = vec
+        .len()
+        .try_into()
+        .expect("len fits in MAX_PROTOCOL_MESSAGE_LEN");
+    len.zcash_serialize(&mut writer)?;
+
     zcash_serialize_bytes_external_count(vec, writer)
 }
 
-/// Serialize an `AtLeastOne` vector as a compactsize number of items, then the
-/// items. This is the most common format in Zcash.
-impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.as_vec().zcash_serialize(&mut writer)
-    }
+/// Serialize an empty list of items, by writing a zero CompactSize length.
+/// (And no items.)
+pub fn zcash_serialize_empty_list<W: io::Write>(writer: W) -> Result<(), io::Error> {
+    let len: CompactSizeMessage = 0.try_into().expect("zero fits in MAX_PROTOCOL_MESSAGE_LEN");
+    len.zcash_serialize(writer)
 }
 
 /// Serialize a typed `Vec` **without** writing the number of items as a
-/// compactsize.
+/// CompactSize.
 ///
-/// In Zcash, most arrays are stored as a compactsize, followed by that number
+/// In Zcash, most arrays are stored as a CompactSize, followed by that number
 /// of items of type `T`. But in `Transaction::V5`, some types are serialized as
-/// multiple arrays in different locations, with a single compactsize before the
+/// multiple arrays in different locations, with a single CompactSize before the
 /// first array.
 ///
 /// ## Usage
@@ -77,7 +122,7 @@ impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
 /// Use `zcash_serialize_external_count` when the array count is determined by
 /// other data, or a consensus rule.
 ///
-/// Use `Vec::zcash_serialize` for data that contains compactsize count,
+/// Use `Vec::zcash_serialize` for data that contains CompactSize count,
 /// followed by the data array.
 ///
 /// For example, when a single count applies to multiple arrays:
@@ -102,7 +147,7 @@ pub fn zcash_serialize_external_count<W: io::Write, T: ZcashSerialize>(
 }
 
 /// Serialize a raw byte `Vec` **without** writing the number of items as a
-/// compactsize.
+/// CompactSize.
 ///
 /// This is a convenience alias for `writer.write_all(&vec)`.
 //
@@ -130,7 +175,12 @@ impl ZcashSerialize for String {
     }
 }
 
-/// The maximum length of a Zcash message, in bytes.
-///
-/// This value is used to calculate safe preallocation limits for some types
-pub const MAX_PROTOCOL_MESSAGE_LEN: usize = 2 * 1024 * 1024;
+// We don't impl ZcashSerialize for Ipv4Addr or SocketAddrs,
+// because the IPv4 and port formats are different in addr (v1) and addrv2 messages.
+
+/// Write a Bitcoin-encoded IPv6 address.
+impl ZcashSerialize for Ipv6Addr {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+        writer.write_all(&self.octets())
+    }
+}

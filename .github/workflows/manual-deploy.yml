@@ -17,10 +17,10 @@ jobs:
     name: Deploy one zebrad node
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2.3.4
+    - uses: actions/checkout@v2.4.0
       with:
         persist-credentials: false
-        
+
     - name: Set project and image names
       run: |
         BRANCH_NAME=$(expr $GITHUB_REF : '.*/\(.*\)') && \

@@ -1,10 +1,10 @@
 use std::{convert::TryInto, env, sync::Arc};
 
-use futures::{stream::FuturesUnordered, FutureExt};
+use futures::stream::FuturesUnordered;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zebra_chain::{
-    block::{self, Block},
+    block::{self, Block, CountedHeader},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
@@ -37,7 +37,7 @@ async fn populated_state(
     let mut responses = FuturesUnordered::new();
 
     for request in requests {
-        let rsp = state.ready_and().await.unwrap().call(request);
+        let rsp = state.ready().await.unwrap().call(request);
         responses.push(rsp);
     }
 
@@ -52,14 +52,64 @@ async fn populated_state(
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
 ) -> Result<()> {
-    let blocks = zebra_test::vectors::MAINNET_BLOCKS
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::MAINNET_BLOCKS
         .range(0..=LAST_BLOCK_HEIGHT)
-        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into::<Arc<Block>>().unwrap());
+        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+
+    let block_hashes: Vec<block::Hash> = blocks.iter().map(|block| block.hash()).collect();
+    let block_headers: Vec<CountedHeader> = blocks
+        .iter()
+        .map(|block| CountedHeader {
+            header: block.header,
+            transaction_count: block
+                .transactions
+                .len()
+                .try_into()
+                .expect("test block transaction counts are valid"),
+        })
+        .collect();
 
     for (ind, block) in blocks.into_iter().enumerate() {
         let mut transcript = vec![];
         let height = block.coinbase_height().unwrap();
         let hash = block.hash();
+
+        transcript.push((
+            Request::Depth(block.hash()),
+            Ok(Response::Depth(Some(LAST_BLOCK_HEIGHT - height.0))),
+        ));
+
+        // these requests don't have any arguments, so we just do them once
+        if ind == LAST_BLOCK_HEIGHT as usize {
+            transcript.push((Request::Tip, Ok(Response::Tip(Some((height, hash))))));
+
+            let locator_hashes = vec![
+                block_hashes[LAST_BLOCK_HEIGHT as usize],
+                block_hashes[(LAST_BLOCK_HEIGHT - 1) as usize],
+                block_hashes[(LAST_BLOCK_HEIGHT - 2) as usize],
+                block_hashes[(LAST_BLOCK_HEIGHT - 4) as usize],
+                block_hashes[(LAST_BLOCK_HEIGHT - 8) as usize],
+                block_hashes[0],
+            ];
+
+            transcript.push((
+                Request::BlockLocator,
+                Ok(Response::BlockLocator(locator_hashes)),
+            ));
+        }
+
+        // Spec: transactions in the genesis block are ignored.
+        if height.0 != 0 {
+            for transaction in &block.transactions {
+                let transaction_hash = transaction.hash();
+
+                transcript.push((
+                    Request::Transaction(transaction_hash),
+                    Ok(Response::Transaction(Some(transaction.clone()))),
+                ));
+            }
+        }
 
         transcript.push((
             Request::Block(hash.into()),
@@ -71,25 +121,10 @@ async fn test_populated_state_responds_correctly(
             Ok(Response::Block(Some(block.clone()))),
         ));
 
-        transcript.push((
-            Request::Depth(block.hash()),
-            Ok(Response::Depth(Some(LAST_BLOCK_HEIGHT - height.0))),
-        ));
-
-        if ind == LAST_BLOCK_HEIGHT as usize {
-            transcript.push((Request::Tip, Ok(Response::Tip(Some((height, hash))))));
-        }
-
-        // Consensus-critical bug in zcashd: transactions in the genesis block
-        // are ignored.
+        // Spec: transactions in the genesis block are ignored.
         if height.0 != 0 {
             for transaction in &block.transactions {
                 let transaction_hash = transaction.hash();
-
-                transcript.push((
-                    Request::Transaction(transaction_hash),
-                    Ok(Response::Transaction(Some(transaction.clone()))),
-                ));
 
                 let from_coinbase = transaction.has_valid_coinbase_transaction_inputs();
                 for (index, output) in transaction.outputs().iter().cloned().enumerate() {
@@ -107,6 +142,76 @@ async fn test_populated_state_responds_correctly(
                 }
             }
         }
+
+        let mut append_locator_transcript = |split_ind| {
+            let block_hashes = block_hashes.clone();
+            let (known_hashes, next_hashes) = block_hashes.split_at(split_ind);
+
+            let block_headers = block_headers.clone();
+            let (_, next_headers) = block_headers.split_at(split_ind);
+
+            // no stop
+            transcript.push((
+                Request::FindBlockHashes {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: None,
+                },
+                Ok(Response::BlockHashes(next_hashes.to_vec())),
+            ));
+
+            transcript.push((
+                Request::FindBlockHeaders {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: None,
+                },
+                Ok(Response::BlockHeaders(next_headers.to_vec())),
+            ));
+
+            // stop at the next block
+            transcript.push((
+                Request::FindBlockHashes {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: next_hashes.get(0).cloned(),
+                },
+                Ok(Response::BlockHashes(
+                    next_hashes.get(0).iter().cloned().cloned().collect(),
+                )),
+            ));
+
+            transcript.push((
+                Request::FindBlockHeaders {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: next_hashes.get(0).cloned(),
+                },
+                Ok(Response::BlockHeaders(
+                    next_headers.get(0).iter().cloned().cloned().collect(),
+                )),
+            ));
+
+            // stop at a block that isn't actually in the chain
+            // tests bug #2789
+            transcript.push((
+                Request::FindBlockHashes {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: Some(block::Hash([0xff; 32])),
+                },
+                Ok(Response::BlockHashes(next_hashes.to_vec())),
+            ));
+
+            transcript.push((
+                Request::FindBlockHeaders {
+                    known_blocks: known_hashes.iter().rev().cloned().collect(),
+                    stop: Some(block::Hash([0xff; 32])),
+                },
+                Ok(Response::BlockHeaders(next_headers.to_vec())),
+            ));
+        };
+
+        // split before the current block, and locate the current block
+        append_locator_transcript(ind);
+
+        // split after the current block, and locate the next block
+        append_locator_transcript(ind + 1);
 
         let transcript = Transcript::from(transcript);
         transcript.check(&mut state).await?;
@@ -157,6 +262,20 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
             Ok(Response::Block(None)),
         ),
         // No check for AwaitUTXO because it will wait if the UTXO isn't present
+        (
+            Request::FindBlockHashes {
+                known_blocks: vec![block.hash()],
+                stop: None,
+            },
+            Ok(Response::BlockHashes(Vec::new())),
+        ),
+        (
+            Request::FindBlockHeaders {
+                known_blocks: vec![block.hash()],
+                stop: None,
+            },
+            Ok(Response::BlockHeaders(Vec::new())),
+        ),
     ]
     .into_iter();
     let transcript = Transcript::from(iter);
@@ -300,14 +419,7 @@ proptest! {
         let (mut state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), network);
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
-        prop_assert_eq!(
-            chain_tip_change
-                .tip_change()
-                .now_or_never()
-                .transpose()
-                .expect("watch sender is not dropped"),
-            None
-        );
+        prop_assert_eq!(chain_tip_change.last_tip_change(), None);
 
         for block in finalized_blocks {
             let expected_block = block.clone();
@@ -323,14 +435,7 @@ proptest! {
             state_service.queue_and_commit_finalized(block);
 
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
-            prop_assert_eq!(
-                chain_tip_change
-                    .tip_change()
-                    .now_or_never()
-                    .transpose()
-                    .expect("watch sender is not dropped"),
-                Some(expected_action)
-            );
+            prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
         }
 
         for block in non_finalized_blocks {
@@ -346,14 +451,7 @@ proptest! {
             state_service.queue_and_commit_non_finalized(block);
 
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
-            prop_assert_eq!(
-                chain_tip_change
-                    .tip_change()
-                    .now_or_never()
-                    .transpose()
-                    .expect("watch sender is not dropped"),
-                Some(expected_action)
-            );
+            prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
         }
     }
 

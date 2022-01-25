@@ -1,46 +1,50 @@
-use super::*;
-use color_eyre::Report;
-use std::collections::HashSet;
-use storage::tests::unmined_transactions_in_blocks;
+use std::pin::Pin;
+
 use tower::ServiceExt;
 
-#[tokio::test]
-async fn mempool_service_basic() -> Result<(), Report> {
-    // Using the mainnet for now
-    let network = Network::Mainnet;
+use super::{storage::Storage, ActiveState, InboundTxDownloads, Mempool, Request};
+use crate::components::sync::{RecentSyncLengths, SyncStatus};
 
-    // get the genesis block transactions from the Zcash blockchain.
-    let genesis_transactions = unmined_transactions_in_blocks(0, network);
-    // Start the mempool service
-    let mut service = Mempool::new(network);
-    // Insert the genesis block coinbase transaction into the mempool storage.
-    service.storage.insert(genesis_transactions.1[0].clone())?;
+mod prop;
+mod vector;
 
-    // Test `Request::TransactionIds`
-    let response = service
-        .clone()
-        .oneshot(Request::TransactionIds)
-        .await
-        .unwrap();
-    let transaction_ids = match response {
-        Response::TransactionIds(ids) => ids,
-        _ => unreachable!("will never happen in this test"),
-    };
+impl Mempool {
+    /// Get the storage field of the mempool for testing purposes.
+    pub fn storage(&mut self) -> &mut Storage {
+        match &mut self.active_state {
+            ActiveState::Disabled => panic!("mempool must be enabled"),
+            ActiveState::Enabled { storage, .. } => storage,
+        }
+    }
 
-    // Test `Request::TransactionsById`
-    let hash_set = transaction_ids.iter().copied().collect::<HashSet<_>>();
-    let response = service
-        .oneshot(Request::TransactionsById(hash_set))
-        .await
-        .unwrap();
-    let transactions = match response {
-        Response::Transactions(transactions) => transactions,
-        _ => unreachable!("will never happen in this test"),
-    };
+    /// Get the transaction downloader of the mempool for testing purposes.
+    pub fn tx_downloads(&self) -> &Pin<Box<InboundTxDownloads>> {
+        match &self.active_state {
+            ActiveState::Disabled => panic!("mempool must be enabled"),
+            ActiveState::Enabled { tx_downloads, .. } => tx_downloads,
+        }
+    }
 
-    // Make sure the transaction from the blockchain test vector is the same as the
-    // response of `Request::TransactionsById`
-    assert_eq!(genesis_transactions.1[0], transactions[0]);
+    /// Enable the mempool by pretending the synchronization is close to the tip.
+    pub async fn enable(&mut self, recent_syncs: &mut RecentSyncLengths) {
+        // Pretend we're close to tip
+        SyncStatus::sync_close_to_tip(recent_syncs);
+        // Make a dummy request to poll the mempool and make it enable itself
+        self.dummy_call().await;
+    }
 
-    Ok(())
+    /// Disable the mempool by pretending the synchronization is far from the tip.
+    pub async fn disable(&mut self, recent_syncs: &mut RecentSyncLengths) {
+        // Pretend we're far from the tip
+        SyncStatus::sync_far_from_tip(recent_syncs);
+        // Make a dummy request to poll the mempool and make it disable itself
+        self.dummy_call().await;
+    }
+
+    /// Perform a dummy service call so that `poll_ready` is called.
+    pub async fn dummy_call(&mut self) {
+        self.oneshot(Request::CheckForVerifiedTransactions)
+            .await
+            .expect("unexpected failure when checking for verified transactions");
+    }
 }

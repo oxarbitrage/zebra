@@ -1,10 +1,6 @@
 //! Tests for block verification
 
-use crate::{parameters::SLOW_START_INTERVAL, script};
-
-use super::*;
-
-use std::sync::Arc;
+use std::{convert::TryFrom, sync::Arc};
 
 use chrono::Utc;
 use color_eyre::eyre::{eyre, Report};
@@ -12,15 +8,26 @@ use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
-    block::{self, Block, Height},
+    amount::{Amount, MAX_MONEY},
+    block::{
+        self,
+        tests::generate::{large_multi_transaction_block, large_single_transaction_block},
+        Block, Height,
+    },
     parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    transaction::{arbitrary::transaction_to_fake_v5, Transaction},
+    transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
     work::difficulty::{ExpandedDifficulty, INVALID_COMPACT_DIFFICULTY},
 };
+use zebra_script::CachedFfiTransaction;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
-use crate::transaction;
+use crate::{
+    parameters::{SLOW_START_INTERVAL, SLOW_START_SHIFT},
+    script, transaction,
+};
+
+use super::*;
 
 static VALID_BLOCK_TRANSCRIPT: Lazy<
     Vec<(Arc<Block>, Result<block::Hash, ExpectedTranscriptError>)>,
@@ -190,7 +197,6 @@ fn difficulty_is_valid_for_network(network: Network) -> Result<(), Report> {
 #[test]
 fn difficulty_validation_failure() -> Result<(), Report> {
     zebra_test::init();
-    use crate::error::*;
 
     // Get a block in the mainnet, and mangle its difficulty field
     let block =
@@ -300,8 +306,6 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
 #[test]
 fn coinbase_validation_failure() -> Result<(), Report> {
     zebra_test::init();
-    use crate::error::*;
-
     let network = Network::Mainnet;
 
     // Get a block in the mainnet that is inside the founders reward period,
@@ -373,9 +377,6 @@ fn coinbase_validation_failure() -> Result<(), Report> {
 #[test]
 fn founders_reward_validation_failure() -> Result<(), Report> {
     zebra_test::init();
-    use crate::error::*;
-    use zebra_chain::transaction::Transaction;
-
     let network = Network::Mainnet;
 
     // Get a block in the mainnet that is inside the founders reward period.
@@ -387,12 +388,16 @@ fn founders_reward_validation_failure() -> Result<(), Report> {
     let tx = block
         .transactions
         .get(0)
-        .map(|transaction| Transaction::V3 {
-            inputs: transaction.inputs().to_vec(),
-            outputs: vec![transaction.outputs()[0].clone()],
-            lock_time: transaction.lock_time(),
-            expiry_height: transaction.expiry_height().unwrap(),
-            joinsplit_data: None,
+        .map(|transaction| {
+            let mut output = transaction.outputs()[0].clone();
+            output.value = Amount::try_from(i32::MAX).unwrap();
+            Transaction::V3 {
+                inputs: transaction.inputs().to_vec(),
+                outputs: vec![output],
+                lock_time: transaction.lock_time().unwrap_or_else(LockTime::unlocked),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+            }
         })
         .unwrap();
 
@@ -404,10 +409,140 @@ fn founders_reward_validation_failure() -> Result<(), Report> {
     };
 
     // Validate it
-    let result = check::subsidy_is_valid(&block, network).unwrap_err();
-    let expected = BlockError::Transaction(TransactionError::Subsidy(
+    let result = check::subsidy_is_valid(&block, network);
+    let expected = Err(BlockError::Transaction(TransactionError::Subsidy(
         SubsidyError::FoundersRewardNotFound,
-    ));
+    )));
+
+    assert_eq!(expected, result);
+
+    Ok(())
+}
+
+#[test]
+fn funding_stream_validation() -> Result<(), Report> {
+    zebra_test::init();
+
+    funding_stream_validation_for_network(Network::Mainnet)?;
+    funding_stream_validation_for_network(Network::Testnet)?;
+
+    Ok(())
+}
+
+fn funding_stream_validation_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (&height, block) in block_iter {
+        if Height(height) > SLOW_START_SHIFT {
+            let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+
+            // Validate
+            let result = check::subsidy_is_valid(&block, network);
+            assert!(result.is_ok());
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn funding_stream_validation_failure() -> Result<(), Report> {
+    zebra_test::init();
+    let network = Network::Mainnet;
+
+    // Get a block in the mainnet that is inside the funding stream period.
+    let block =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+            .expect("block should deserialize");
+
+    // Build the new transaction with modified coinbase outputs
+    let tx = block
+        .transactions
+        .get(0)
+        .map(|transaction| {
+            let mut output = transaction.outputs()[0].clone();
+            output.value = Amount::try_from(i32::MAX).unwrap();
+            Transaction::V4 {
+                inputs: transaction.inputs().to_vec(),
+                outputs: vec![output],
+                lock_time: transaction.lock_time().unwrap_or_else(LockTime::unlocked),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            }
+        })
+        .unwrap();
+
+    // Build new block
+    let transactions: Vec<Arc<zebra_chain::transaction::Transaction>> = vec![Arc::new(tx)];
+    let block = Block {
+        header: block.header,
+        transactions,
+    };
+
+    // Validate it
+    let result = check::subsidy_is_valid(&block, network);
+    let expected = Err(BlockError::Transaction(TransactionError::Subsidy(
+        SubsidyError::FundingStreamNotFound,
+    )));
+    assert_eq!(expected, result);
+
+    Ok(())
+}
+
+#[test]
+fn miner_fees_validation_success() -> Result<(), Report> {
+    zebra_test::init();
+
+    miner_fees_validation_for_network(Network::Mainnet)?;
+    miner_fees_validation_for_network(Network::Testnet)?;
+
+    Ok(())
+}
+
+fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (&height, block) in block_iter {
+        if Height(height) > SLOW_START_SHIFT {
+            let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+
+            // fake the miner fee to a big amount
+            let miner_fees = Amount::try_from(MAX_MONEY / 2).unwrap();
+
+            // Validate
+            let result = check::miner_fees_are_valid(&block, network, miner_fees);
+            assert!(result.is_ok());
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn miner_fees_validation_failure() -> Result<(), Report> {
+    zebra_test::init();
+    let network = Network::Mainnet;
+
+    let block =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
+            .expect("block should deserialize");
+
+    // fake the miner fee to a small amount
+    let miner_fees = Amount::zero();
+
+    // Validate
+    let result = check::miner_fees_are_valid(&block, network, miner_fees);
+
+    let expected = Err(BlockError::Transaction(TransactionError::Subsidy(
+        SubsidyError::InvalidMinerFees,
+    )));
     assert_eq!(expected, result);
 
     Ok(())
@@ -526,6 +661,98 @@ fn merkle_root_fake_v5_for_network(network: Network) -> Result<(), Report> {
 
         check::merkle_root_validity(network, &block, &transaction_hashes)
             .expect("merkle root should be valid for this block");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn legacy_sigops_count_for_large_generated_blocks() {
+    zebra_test::init();
+
+    // We can't test sigops using the transaction verifier, because it looks up UTXOs.
+
+    let block = large_single_transaction_block();
+    let mut legacy_sigop_count = 0;
+    for transaction in block.transactions {
+        let cached_ffi_transaction = Arc::new(CachedFfiTransaction::new(transaction.clone()));
+        let tx_sigop_count = cached_ffi_transaction.legacy_sigop_count();
+        assert_eq!(tx_sigop_count, Ok(0));
+        legacy_sigop_count += tx_sigop_count.expect("unexpected invalid sigop count");
+    }
+    // We know this block has no sigops.
+    assert_eq!(legacy_sigop_count, 0);
+
+    let block = large_multi_transaction_block();
+    let mut legacy_sigop_count = 0;
+    for transaction in block.transactions {
+        let cached_ffi_transaction = Arc::new(CachedFfiTransaction::new(transaction.clone()));
+        let tx_sigop_count = cached_ffi_transaction.legacy_sigop_count();
+        assert_eq!(tx_sigop_count, Ok(1));
+        legacy_sigop_count += tx_sigop_count.expect("unexpected invalid sigop count");
+    }
+    // Test that large blocks can actually fail the sigops check.
+    assert!(legacy_sigop_count > MAX_BLOCK_SIGOPS);
+}
+
+#[test]
+fn legacy_sigops_count_for_historic_blocks() {
+    zebra_test::init();
+
+    // We can't test sigops using the transaction verifier, because it looks up UTXOs.
+
+    for block in zebra_test::vectors::BLOCKS.iter() {
+        let mut legacy_sigop_count = 0;
+
+        let block: Block = block
+            .zcash_deserialize_into()
+            .expect("block test vector is valid");
+        for transaction in block.transactions {
+            let cached_ffi_transaction = Arc::new(CachedFfiTransaction::new(transaction.clone()));
+            legacy_sigop_count += cached_ffi_transaction
+                .legacy_sigop_count()
+                .expect("unexpected invalid sigop count");
+        }
+        // Test that historic blocks pass the sigops check.
+        assert!(legacy_sigop_count <= MAX_BLOCK_SIGOPS);
+    }
+}
+
+#[test]
+fn transaction_expiration_height_validation() -> Result<(), Report> {
+    zebra_test::init();
+
+    transaction_expiration_height_for_network(Network::Mainnet)?;
+    transaction_expiration_height_for_network(Network::Testnet)?;
+
+    Ok(())
+}
+
+fn transaction_expiration_height_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    for (&height, block) in block_iter {
+        let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+
+        for (n, transaction) in block.transactions.iter().enumerate() {
+            if n == 0 {
+                // coinbase
+                let result = transaction::check::coinbase_expiry_height(
+                    &Height(height),
+                    transaction,
+                    network,
+                );
+                assert!(result.is_ok());
+            } else {
+                // non coinbase
+                let result =
+                    transaction::check::non_coinbase_expiry_height(&Height(height), transaction);
+                assert!(result.is_ok());
+            }
+        }
     }
 
     Ok(())

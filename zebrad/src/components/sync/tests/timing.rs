@@ -1,12 +1,16 @@
+use std::{
+    convert::TryInto,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+};
+
 use futures::future;
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
-use tokio::{
-    runtime::Runtime,
-    time::{timeout, Duration},
-};
+use tokio::time::{timeout, Duration};
+
+use zebra_chain::parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING};
+use zebra_network::constants::{DEFAULT_CRAWL_NEW_PEER_INTERVAL, HANDSHAKE_TIMEOUT};
 
 use super::super::*;
 use crate::config::ZebradConfig;
@@ -61,16 +65,35 @@ fn ensure_timeouts_consistent() {
 
     // This constraint makes genesis retries more likely to succeed
     assert!(
-        GENESIS_TIMEOUT_RETRY.as_secs() > zebra_network::constants::HANDSHAKE_TIMEOUT.as_secs()
+        GENESIS_TIMEOUT_RETRY.as_secs() > HANDSHAKE_TIMEOUT.as_secs()
             && GENESIS_TIMEOUT_RETRY.as_secs() < BLOCK_DOWNLOAD_TIMEOUT.as_secs(),
         "Genesis retries should wait for new peers, but they shouldn't wait too long"
+    );
+
+    assert!(
+        SYNC_RESTART_DELAY.as_secs()
+            < POST_BLOSSOM_POW_TARGET_SPACING
+                .try_into()
+                .expect("not negative"),
+        "a syncer tip crawl should complete before most new blocks"
+    );
+
+    // The default peer crawler interval should be at least
+    // `HANDSHAKE_TIMEOUT` lower than all other crawler intervals.
+    //
+    // See `DEFAULT_CRAWL_NEW_PEER_INTERVAL` for details.
+    assert!(
+        DEFAULT_CRAWL_NEW_PEER_INTERVAL.as_secs() + HANDSHAKE_TIMEOUT.as_secs()
+            < SYNC_RESTART_DELAY.as_secs(),
+        "an address crawl and peer connections should complete before most syncer tips crawls"
     );
 }
 
 /// Test that calls to [`ChainSync::request_genesis`] are rate limited.
 #[test]
 fn request_genesis_is_rate_limited() {
-    zebra_test::init();
+    let runtime = zebra_test::init_async();
+    let _guard = runtime.enter();
 
     // The number of calls to `request_genesis()` we are going to be testing for
     const RETRIES_TO_RUN: u8 = 3;
@@ -80,9 +103,6 @@ fn request_genesis_is_rate_limited() {
     let peer_requests_counter_in_service = Arc::clone(&peer_requests_counter);
     let state_requests_counter = Arc::new(AtomicU8::new(0));
     let state_requests_counter_in_service = Arc::clone(&state_requests_counter);
-
-    let runtime = Runtime::new().expect("Failed to create Tokio runtime");
-    let _guard = runtime.enter();
 
     // create a fake peer service that respond with `Error` to `BlocksByHash` or
     // panic in any other type of request.
@@ -112,6 +132,9 @@ fn request_genesis_is_rate_limited() {
         }
     });
 
+    // create an empty latest chain tip
+    let (_sender, latest_chain_tip, _change) = zs::ChainTipSender::new(None, Network::Mainnet);
+
     // create a verifier service that will always panic as it will never be called
     let verifier_service =
         tower::service_fn(
@@ -122,8 +145,9 @@ fn request_genesis_is_rate_limited() {
     let (mut chain_sync, _) = ChainSync::new(
         &ZebradConfig::default(),
         peer_service,
-        state_service,
         verifier_service,
+        state_service,
+        latest_chain_tip,
     );
 
     // run `request_genesis()` with a timeout of 13 seconds

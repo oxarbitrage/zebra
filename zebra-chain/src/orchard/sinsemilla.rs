@@ -164,7 +164,8 @@ pub fn sinsemilla_hash(D: &[u8], M: &BitVec<Lsb0, u8>) -> Option<pallas::Base> {
 /// Sinsemilla commit
 ///
 /// We construct Sinsemilla commitments by hashing to a point with Sinsemilla
-/// hash, and adding a randomized point on the Pallas curve.
+/// hash, and adding a randomized point on the Pallas curve (with complete
+/// addition, vs incomplete addition as used in [`sinsemilla_hash_to_point`]).
 ///
 /// SinsemillaCommit_r(D, M) := SinsemillaHashToPoint(D || "-M", M) + [r]GroupHash^P(D || "-r", "")
 ///
@@ -175,10 +176,8 @@ pub fn sinsemilla_commit(
     D: &[u8],
     M: &BitVec<Lsb0, u8>,
 ) -> Option<pallas::Point> {
-    incomplete_addition(
-        sinsemilla_hash_to_point(&[D, b"-M"].concat(), M),
-        Some(pallas_group_hash(&[D, b"-r"].concat(), b"") * r),
-    )
+    sinsemilla_hash_to_point(&[D, b"-M"].concat(), M)
+        .map(|point| point + pallas_group_hash(&[D, b"-r"].concat(), b"") * r)
 }
 
 /// SinsemillaShortCommit_r(D, M) := Extract⊥ P(SinsemillaCommit_r(D, M))
@@ -203,10 +202,11 @@ mod tests {
     use super::*;
     use crate::orchard::tests::vectors;
 
+    #[cfg(test)]
     fn x_from_str(s: &str) -> pallas::Base {
         use group::ff::PrimeField;
 
-        pallas::Base::from_str(s).unwrap()
+        pallas::Base::from_str_vartime(s).unwrap()
     }
 
     #[test]

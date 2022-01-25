@@ -7,16 +7,20 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer};
 
-use zebra_chain::{parameters::Network, serialization::canonical_socket_addr};
+use zebra_chain::parameters::Network;
 
-use crate::BoxError;
+use crate::{constants, protocol::external::canonical_socket_addr, BoxError};
+
+#[cfg(test)]
+mod tests;
 
 /// The number of times Zebra will retry each initial peer's DNS resolution,
 /// before checking if any other initial peers have returned addresses.
-const MAX_SINGLE_PEER_RETRIES: usize = 2;
+const MAX_SINGLE_PEER_RETRIES: usize = 1;
 
 /// Configuration for networking code.
 #[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// The address on which this node should listen for connections.
     ///
@@ -52,6 +56,8 @@ pub struct Config {
 
     /// The initial target size for the peer set.
     ///
+    /// Also used to limit the number of inbound and outbound connections made by Zebra.
+    ///
     /// If you have a slow network connection, and Zebra is having trouble
     /// syncing, try reducing the peer set size. You can also reduce the peer
     /// set size to reduce Zebra's bandwidth usage.
@@ -64,10 +70,50 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
+    //
+    // Note: Durations become a TOML table, so they must be the final item in the config
+    //       We'll replace them with a more user-friendly format in #2847
     pub crawl_new_peer_interval: Duration,
 }
 
 impl Config {
+    /// The maximum number of outbound connections that Zebra will open at the same time.
+    /// When this limit is reached, Zebra stops opening outbound connections.
+    ///
+    /// # Security
+    ///
+    /// This is larger than the inbound connection limit,
+    /// so Zebra is more likely to be connected to peers that it has selected.
+    pub fn peerset_outbound_connection_limit(&self) -> usize {
+        let inbound_limit = self.peerset_inbound_connection_limit();
+
+        inbound_limit + inbound_limit / constants::OUTBOUND_PEER_BIAS_DENOMINATOR
+    }
+
+    /// The maximum number of inbound connections that Zebra will accept at the same time.
+    /// When this limit is reached, Zebra drops new inbound connections without handshaking on them.
+    pub fn peerset_inbound_connection_limit(&self) -> usize {
+        self.peerset_initial_target_size
+    }
+
+    /// The maximum number of inbound and outbound connections that Zebra will have at the same time.
+    pub fn peerset_total_connection_limit(&self) -> usize {
+        self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+    }
+
+    /// Returns the initial seed peer hostnames for the configured network.
+    pub fn initial_peer_hostnames(&self) -> &HashSet<String> {
+        match self.network {
+            Network::Mainnet => &self.initial_mainnet_peers,
+            Network::Testnet => &self.initial_testnet_peers,
+        }
+    }
+
+    /// Resolve initial seed peer IP addresses, based on the configured network.
+    pub async fn initial_peers(&self) -> HashSet<SocketAddr> {
+        Config::resolve_peers(self.initial_peer_hostnames()).await
+    }
+
     /// Concurrently resolves `peers` into zero or more IP addresses, with a
     /// timeout of a few seconds on each DNS request.
     ///
@@ -111,14 +157,6 @@ impl Config {
         }
     }
 
-    /// Get the initial seed peers based on the configured network.
-    pub async fn initial_peers(&self) -> HashSet<SocketAddr> {
-        match self.network {
-            Network::Mainnet => Config::resolve_peers(&self.initial_mainnet_peers).await,
-            Network::Testnet => Config::resolve_peers(&self.initial_testnet_peers).await,
-        }
-    }
-
     /// Resolves `host` into zero or more IP addresses, retrying up to
     /// `max_retries` times.
     ///
@@ -144,13 +182,37 @@ impl Config {
         let fut = tokio::time::timeout(crate::constants::DNS_LOOKUP_TIMEOUT, fut);
 
         match fut.await {
-            Ok(Ok(ips)) => Ok(ips.map(canonical_socket_addr).collect()),
+            Ok(Ok(ip_addrs)) => {
+                let ip_addrs: Vec<SocketAddr> = ip_addrs.map(canonical_socket_addr).collect();
+
+                // if we're logging at debug level,
+                // the full list of IP addresses will be shown in the log message
+                let debug_span = debug_span!("", remote_ip_addrs = ?ip_addrs);
+                let _span_guard = debug_span.enter();
+                info!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
+
+                for ip in &ip_addrs {
+                    // Count each initial peer, recording the seed config and resolved IP address.
+                    //
+                    // If an IP is returned by multiple seeds,
+                    // each duplicate adds 1 to the initial peer count.
+                    // (But we only make one initial connection attempt to each IP.)
+                    metrics::counter!(
+                        "zcash.net.peers.initial",
+                        1,
+                        "seed" => host.to_string(),
+                        "remote_ip" => ip.to_string()
+                    );
+                }
+
+                Ok(ip_addrs.into_iter().collect())
+            }
             Ok(Err(e)) => {
-                tracing::info!(?host, ?e, "DNS error resolving peer IP address");
+                tracing::info!(?host, ?e, "DNS error resolving peer IP addresses");
                 Err(e.into())
             }
             Err(e) => {
-                tracing::info!(?host, ?e, "DNS timeout resolving peer IP address");
+                tracing::info!(?host, ?e, "DNS timeout resolving peer IP addresses");
                 Err(e.into())
             }
         }
@@ -185,7 +247,7 @@ impl Default for Config {
             network: Network::Mainnet,
             initial_mainnet_peers: mainnet_peers,
             initial_testnet_peers: testnet_peers,
-            crawl_new_peer_interval: Duration::from_secs(60),
+            crawl_new_peer_interval: constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
             // The default peerset target size should be large enough to ensure
             // nodes have a reliable set of peers. But it should also be limited
@@ -237,6 +299,7 @@ impl<'de> Deserialize<'de> for Config {
         }
 
         let config = DConfig::deserialize(deserializer)?;
+
         // TODO: perform listener DNS lookups asynchronously with a timeout (#1631)
         let listen_addr = match config.listen_addr.parse::<SocketAddr>() {
             Ok(socket) => Ok(socket),
@@ -259,6 +322,3 @@ impl<'de> Deserialize<'de> for Config {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;

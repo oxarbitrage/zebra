@@ -25,7 +25,7 @@ use super::{commitment, keys, note};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    pub cv: commitment::NotSmallOrderValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(with = "serde_helpers::Fq")]
     pub cm_u: jubjub::Fq,
@@ -56,7 +56,7 @@ pub struct OutputInTransactionV4(pub Output);
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputPrefixInTransactionV5 {
     /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    pub cv: commitment::NotSmallOrderValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(with = "serde_helpers::Fq")]
     pub cm_u: jubjub::Fq,
@@ -105,28 +105,6 @@ impl Output {
 
         (prefix, self.zkproof)
     }
-
-    /// Encodes the primary inputs for the proof statement as 5 Bls12_381 base
-    /// field elements, to match bellman::groth16::verify_proof.
-    ///
-    /// NB: jubjub::Fq is a type alias for bls12_381::Scalar.
-    ///
-    /// https://zips.z.cash/protocol/protocol.pdf#cctsaplingoutput
-    pub fn primary_inputs(&self) -> Vec<jubjub::Fq> {
-        let mut inputs = vec![];
-
-        let cv_affine = jubjub::AffinePoint::from_bytes(self.cv.into()).unwrap();
-        inputs.push(cv_affine.get_u());
-        inputs.push(cv_affine.get_v());
-
-        let epk_affine = jubjub::AffinePoint::from_bytes(self.ephemeral_key.into()).unwrap();
-        inputs.push(epk_affine.get_u());
-        inputs.push(epk_affine.get_v());
-
-        inputs.push(self.cm_u);
-
-        inputs
-    }
 }
 
 impl OutputInTransactionV4 {
@@ -157,7 +135,7 @@ impl ZcashSerialize for OutputInTransactionV4 {
 impl ZcashDeserialize for OutputInTransactionV4 {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         Ok(OutputInTransactionV4(Output {
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: commitment::NotSmallOrderValueCommitment::zcash_deserialize(&mut reader)?,
             cm_u: jubjub::Fq::zcash_deserialize(&mut reader)?,
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             enc_ciphertext: note::EncryptedNote::zcash_deserialize(&mut reader)?,
@@ -187,7 +165,7 @@ impl ZcashSerialize for OutputPrefixInTransactionV5 {
 impl ZcashDeserialize for OutputPrefixInTransactionV5 {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         Ok(OutputPrefixInTransactionV5 {
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: commitment::NotSmallOrderValueCommitment::zcash_deserialize(&mut reader)?,
             cm_u: jubjub::Fq::zcash_deserialize(&mut reader)?,
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             enc_ciphertext: note::EncryptedNote::zcash_deserialize(&mut reader)?,
@@ -217,7 +195,15 @@ impl TrustedPreallocate for OutputInTransactionV4 {
     fn max_allocation() -> u64 {
         // Since a serialized Vec<Output> uses at least one byte for its length,
         // the max allocation can never exceed (MAX_BLOCK_BYTES - 1) / OUTPUT_SIZE
-        (MAX_BLOCK_BYTES - 1) / OUTPUT_SIZE
+        const MAX: u64 = (MAX_BLOCK_BYTES - 1) / OUTPUT_SIZE;
+        // > [NU5 onward] nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16.
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        // This acts as nOutputsSapling and is therefore subject to the rule.
+        // The maximum value is actually smaller due to the block size limit,
+        // but we ensure the 2^16 limit with a static assertion.
+        // (The check is not required pre-NU5, but it doesn't cause problems.)
+        static_assertions::const_assert!(MAX < (1 << 16));
+        MAX
     }
 }
 

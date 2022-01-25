@@ -11,11 +11,6 @@
 #![doc(html_favicon_url = "https://www.zfnd.org/images/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://www.zfnd.org/images/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_state")]
-// Standard lints
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -35,9 +30,15 @@ pub use constants::MAX_BLOCK_REORG_HEIGHT;
 pub use error::{BoxError, CloneError, CommitBlockError, ValidateContextError};
 pub use request::{FinalizedBlock, HashOrHeight, PreparedBlock, Request};
 pub use response::Response;
-pub use service::{chain_tip::LatestChainTip, init};
+pub use service::{
+    chain_tip::{ChainTipChange, LatestChainTip, TipAction},
+    init,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use service::init_test;
+pub use service::{
+    chain_tip::{ChainTipBlock, ChainTipSender},
+    init_test,
+};
 
 pub(crate) use request::ContextuallyValidBlock;

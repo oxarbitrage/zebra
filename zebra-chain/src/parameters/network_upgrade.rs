@@ -10,11 +10,15 @@ use std::ops::Bound::*;
 
 use chrono::{DateTime, Duration, Utc};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest_derive::Arbitrary;
+
 /// A Zcash network upgrade.
 ///
 /// Network upgrades can change the Zcash network protocol or consensus rules in
 /// incompatible ways.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NetworkUpgrade {
     /// The Zcash protocol for a Genesis block.
     ///
@@ -85,7 +89,7 @@ pub(crate) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
     (block::Height(584_000), Blossom),
     (block::Height(903_800), Heartwood),
     (block::Height(1_028_500), Canopy),
-    // TODO: Add Nu5 testnet activation height
+    (block::Height(1_599_200), Nu5),
 ];
 
 #[cfg(test_fake_activation_heights)]
@@ -127,14 +131,14 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Blossom, ConsensusBranchId(0x2bb40e60)),
     (Heartwood, ConsensusBranchId(0xf5b9230b)),
     (Canopy, ConsensusBranchId(0xe9ff75a6)),
-    (Nu5, ConsensusBranchId(0xf919a198)),
+    (Nu5, ConsensusBranchId(0x37519621)),
 ];
 
 /// The target block spacing before Blossom.
 const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 
 /// The target block spacing after Blossom activation.
-const POST_BLOSSOM_POW_TARGET_SPACING: i64 = 75;
+pub const POST_BLOSSOM_POW_TARGET_SPACING: i64 = 75;
 
 /// The averaging window for difficulty threshold arithmetic mean calculations.
 ///

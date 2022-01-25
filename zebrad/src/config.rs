@@ -12,6 +12,8 @@ use zebra_consensus::Config as ConsensusSection;
 use zebra_network::Config as NetworkSection;
 use zebra_state::Config as StateSection;
 
+use crate::components::{mempool::Config as MempoolSection, sync};
+
 /// Configuration for `zebrad`.
 ///
 /// The `zebrad` config is a TOML-encoded version of this structure. The meaning
@@ -37,6 +39,9 @@ pub struct ZebradConfig {
 
     /// Sync configuration
     pub sync: SyncSection,
+
+    /// Mempool configuration
+    pub mempool: MempoolSection,
 }
 
 /// Tracing configuration section.
@@ -133,6 +138,9 @@ pub struct MetricsSection {
     pub endpoint_addr: Option<SocketAddr>,
 }
 
+// we like our default configs to be explicit
+#[allow(unknown_lints)]
+#[allow(clippy::derivable_impls)]
 impl Default for MetricsSection {
     fn default() -> Self {
         Self {
@@ -173,7 +181,7 @@ impl Default for SyncSection {
     fn default() -> Self {
         Self {
             max_concurrent_block_requests: 50,
-            lookahead_limit: 2_000,
+            lookahead_limit: sync::DEFAULT_LOOKAHEAD_LIMIT,
         }
     }
 }

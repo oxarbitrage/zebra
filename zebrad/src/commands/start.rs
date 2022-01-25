@@ -1,46 +1,80 @@
 //! `start` subcommand - entry point for starting a zebra node
 //!
-//!  ## Application Structure
+//! ## Application Structure
 //!
-//!  A zebra node consists of the following services and tasks:
+//! A zebra node consists of the following services and tasks:
 //!
-//!  * Network Service
-//!    * primary interface to the node
-//!    * handles all external network requests for the Zcash protocol
-//!      * via zebra_network::Message and zebra_network::Response
-//!    * provides an interface to the rest of the network for other services and
-//!      tasks running within this node
-//!      * via zebra_network::Request
+//! Peers:
+//!  * Peer Connection Pool Service
+//!    * primary external interface for outbound requests from this node to remote peers
+//!    * accepts requests from services and tasks in this node, and sends them to remote peers
+//!  * Peer Discovery Service
+//!    * maintains a list of peer addresses, and connection priority metadata
+//!    * discovers new peer addresses from existing peer connections
+//!    * initiates new outbound peer connections in response to demand from tasks within this node
+//!
+//! Blocks & Mempool Transactions:
 //!  * Consensus Service
 //!    * handles all validation logic for the node
-//!    * verifies blocks using zebra-chain and zebra-script, then stores verified
-//!      blocks in zebra-state
+//!    * verifies blocks using zebra-chain, then stores verified blocks in zebra-state
+//!    * verifies mempool and block transactions using zebra-chain and zebra-script,
+//!      and returns verified mempool transactions for mempool storage
+//!  * Groth16 Parameters Download Task
+//!    * downloads the Sprout and Sapling Groth16 circuit parameter files
+//!    * finishes when the download is complete and the download file hashes have been checked
+//!  * Inbound Service
+//!    * primary external interface for inbound peer requests to this node
+//!    * handles requests from peers for network data, chain data, and mempool transactions
+//!    * spawns download and verify tasks for each gossiped block
+//!    * sends gossiped transactions to the mempool service
+//!
+//! Blocks:
 //!  * Sync Task
 //!    * runs in the background and continuously queries the network for
 //!      new blocks to be verified and added to the local state
-//!  * Inbound Service
-//!    * handles requests from peers for network data and chain data
-//!    * performs transaction and block diffusion
-//!    * downloads and verifies gossiped blocks and transactions
+//!    * spawns download and verify tasks for each crawled block
+//!  * State Service
+//!    * contextually verifies blocks
+//!    * handles in-memory storage of multiple non-finalized chains
+//!    * handles permanent storage of the best finalized chain
+//!  * Block Gossip Task
+//!    * runs in the background and continuously queries the state for
+//!      newly committed blocks to be gossiped to peers
+//!
+//! Mempool Transactions:
+//!  * Mempool Service
+//!    * activates when the syncer is near the chain tip
+//!    * spawns download and verify tasks for each crawled or gossiped transaction
+//!    * handles in-memory storage of unmined transactions
+//!  * Queue Checker Task
+//!    * runs in the background, polling the mempool to store newly verified transactions
+//!  * Transaction Gossip Task
+//!    * runs in the background and gossips newly added mempool transactions
+//!      to peers
 
 use abscissa_core::{config, Command, FrameworkError, Options, Runnable};
 use color_eyre::eyre::{eyre, Report};
-use futures::{select, FutureExt};
-use tokio::sync::oneshot;
-use tower::builder::ServiceBuilder;
+use futures::FutureExt;
+use tokio::{pin, select, sync::oneshot};
+use tower::{builder::ServiceBuilder, util::BoxService};
 
-use crate::components::{tokio::RuntimeRun, Inbound};
-use crate::config::ZebradConfig;
 use crate::{
-    components::{mempool, tokio::TokioComponent, ChainSync},
+    components::{
+        inbound::InboundSetupData,
+        mempool::{self, Mempool},
+        sync,
+        tokio::{RuntimeRun, TokioComponent},
+        ChainSync, Inbound,
+    },
+    config::ZebradConfig,
     prelude::*,
 };
 
 /// `start` subcommand
 #[derive(Command, Debug, Options)]
 pub struct StartCmd {
-    /// Filter strings
-    #[options(free)]
+    /// Filter strings which override the config file and defaults
+    #[options(free, help = "tracing filters which override the zebrad.toml config")]
     filters: Vec<String>,
 }
 
@@ -50,22 +84,9 @@ impl StartCmd {
         info!(?config);
 
         info!("initializing node state");
-        // TODO: use ChainTipChange to get tip changes (#2374, #2710, #2711, #2712, #2713, #2714)
-        let (state_service, latest_chain_tip, _chain_tip_change) =
+        let (state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(config.state.clone(), config.network.network);
         let state = ServiceBuilder::new().buffer(20).service(state_service);
-
-        info!("initializing verifiers");
-        // TODO: use the transaction verifier to verify mempool transactions (#2637, #2606)
-        let (chain_verifier, tx_verifier) = zebra_consensus::chain::init(
-            config.consensus.clone(),
-            config.network.network,
-            state.clone(),
-        )
-        .await;
-
-        info!("initializing mempool");
-        let mempool = mempool::Mempool::new(config.network.network);
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
@@ -75,31 +96,158 @@ impl StartCmd {
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(20)
-            .service(Inbound::new(
-                setup_rx,
-                state.clone(),
-                chain_verifier.clone(),
-                tx_verifier.clone(),
-                mempool,
-            ));
+            .service(Inbound::new(setup_rx));
 
         let (peer_set, address_book) =
-            zebra_network::init(config.network.clone(), inbound, latest_chain_tip).await;
-        setup_tx
-            .send((peer_set.clone(), address_book))
-            .map_err(|_| eyre!("could not send setup data to inbound service"))?;
+            zebra_network::init(config.network.clone(), inbound, latest_chain_tip.clone()).await;
+
+        info!("initializing verifiers");
+        let (chain_verifier, tx_verifier, mut groth16_download_handle) =
+            zebra_consensus::chain::init(
+                config.consensus.clone(),
+                config.network.network,
+                state.clone(),
+                config.consensus.debug_skip_parameter_preload,
+            )
+            .await;
 
         info!("initializing syncer");
-        // TODO: use sync_status to activate the mempool (#2592)
-        let (syncer, sync_status) =
-            ChainSync::new(&config, peer_set.clone(), state, chain_verifier);
+        let (syncer, sync_status) = ChainSync::new(
+            &config,
+            peer_set.clone(),
+            chain_verifier.clone(),
+            state.clone(),
+            latest_chain_tip.clone(),
+        );
 
-        select! {
-            result = syncer.sync().fuse() => result,
-            _ = mempool::Crawler::spawn(peer_set, sync_status).fuse() => {
-                unreachable!("The mempool crawler only stops if it panics");
+        info!("initializing mempool");
+        let (mempool, mempool_transaction_receiver) = Mempool::new(
+            &config.mempool,
+            peer_set.clone(),
+            state.clone(),
+            tx_verifier,
+            sync_status.clone(),
+            latest_chain_tip.clone(),
+            chain_tip_change.clone(),
+        );
+        let mempool = BoxService::new(mempool);
+        let mempool = ServiceBuilder::new().buffer(20).service(mempool);
+
+        let setup_data = InboundSetupData {
+            address_book,
+            block_download_peer_set: peer_set.clone(),
+            block_verifier: chain_verifier,
+            mempool: mempool.clone(),
+            state,
+            latest_chain_tip,
+        };
+        setup_tx
+            .send(setup_data)
+            .map_err(|_| eyre!("could not send setup data to inbound service"))?;
+
+        let syncer_task_handle = tokio::spawn(syncer.sync());
+
+        let mut block_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
+            sync_status.clone(),
+            chain_tip_change.clone(),
+            peer_set.clone(),
+        ));
+
+        let mempool_crawler_task_handle = mempool::Crawler::spawn(
+            &config.mempool,
+            peer_set.clone(),
+            mempool.clone(),
+            sync_status,
+            chain_tip_change,
+        );
+
+        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool);
+
+        let tx_gossip_task_handle = tokio::spawn(mempool::gossip_mempool_transaction_id(
+            mempool_transaction_receiver,
+            peer_set,
+        ));
+
+        info!("spawned initial Zebra tasks");
+
+        // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
+
+        // ongoing tasks
+        pin!(syncer_task_handle);
+        pin!(mempool_crawler_task_handle);
+        pin!(mempool_queue_checker_task_handle);
+        pin!(tx_gossip_task_handle);
+
+        // startup tasks
+        let groth16_download_handle_fused = (&mut groth16_download_handle).fuse();
+        pin!(groth16_download_handle_fused);
+
+        // Wait for tasks to finish
+        let exit_status = loop {
+            let mut exit_when_task_finishes = true;
+
+            let result = select! {
+                sync_result = &mut syncer_task_handle => sync_result
+                    .expect("unexpected panic in the syncer task")
+                    .map(|_| info!("syncer task exited")),
+
+                block_gossip_result = &mut block_gossip_task_handle => block_gossip_result
+                    .expect("unexpected panic in the chain tip block gossip task")
+                    .map(|_| info!("chain tip block gossip task exited"))
+                    .map_err(|e| eyre!(e)),
+
+                mempool_crawl_result = &mut mempool_crawler_task_handle => mempool_crawl_result
+                    .expect("unexpected panic in the mempool crawler")
+                    .map(|_| info!("mempool crawler task exited"))
+                    .map_err(|e| eyre!(e)),
+
+                mempool_queue_result = &mut mempool_queue_checker_task_handle => mempool_queue_result
+                    .expect("unexpected panic in the mempool queue checker")
+                    .map(|_| info!("mempool queue checker task exited"))
+                    .map_err(|e| eyre!(e)),
+
+                tx_gossip_result = &mut tx_gossip_task_handle => tx_gossip_result
+                    .expect("unexpected panic in the transaction gossip task")
+                    .map(|_| info!("transaction gossip task exited"))
+                    .map_err(|e| eyre!(e)),
+
+                // Unlike other tasks, we expect the download task to finish while Zebra is running.
+                groth16_download_result = &mut groth16_download_handle_fused => {
+                    groth16_download_result
+                        .unwrap_or_else(|_| panic!(
+                            "unexpected panic in the Groth16 pre-download and check task. {}",
+                            zebra_consensus::groth16::Groth16Parameters::failure_hint())
+                        );
+
+                    exit_when_task_finishes = false;
+                    Ok(())
+                }
+            };
+
+            // Stop Zebra if a task finished and returned an error,
+            // or if an ongoing task exited.
+            if let Err(err) = result {
+                break Err(err);
             }
-        }
+
+            if exit_when_task_finishes {
+                break Ok(());
+            }
+        };
+
+        info!("exiting Zebra because an ongoing task exited: stopping other tasks");
+
+        // ongoing tasks
+        syncer_task_handle.abort();
+        block_gossip_task_handle.abort();
+        mempool_crawler_task_handle.abort();
+        mempool_queue_checker_task_handle.abort();
+        tx_gossip_task_handle.abort();
+
+        // startup tasks
+        groth16_download_handle.abort();
+
+        exit_status
     }
 }
 
@@ -117,6 +265,8 @@ impl Runnable for StartCmd {
 
         rt.expect("runtime should not already be taken")
             .run(self.start());
+
+        info!("stopping zebrad");
     }
 }
 

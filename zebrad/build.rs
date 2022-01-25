@@ -1,3 +1,8 @@
+//! Build script for zebrad.
+//!
+//! Turns Zebra version information into build-time environmental variables,
+//! so that it can be compiled into `zebrad`, and used in diagnostics.
+
 use vergen::{vergen, Config, SemverKind, ShaKind};
 
 /// Disable vergen env vars that could cause spurious reproducible build
@@ -38,7 +43,7 @@ fn main() {
     *config.cargo_mut().features_mut() = false;
 
     // Disable git if we're building with an invalid `zebra/.git`
-    match vergen(config) {
+    match vergen(config.clone()) {
         Ok(_) => {}
         Err(e) => {
             eprintln!(

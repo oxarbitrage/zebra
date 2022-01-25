@@ -1,79 +1,38 @@
-use super::*;
+use std::ops::RangeBounds;
 
 use zebra_chain::{
-    block::Block, parameters::Network, serialization::ZcashDeserializeInto, transaction::UnminedTx,
+    amount::Amount,
+    block::Block,
+    parameters::Network,
+    serialization::ZcashDeserializeInto,
+    transaction::{UnminedTx, VerifiedUnminedTx},
 };
 
-use color_eyre::eyre::Result;
-
-#[test]
-fn mempool_storage_basic() -> Result<()> {
-    zebra_test::init();
-
-    mempool_storage_basic_for_network(Network::Mainnet)?;
-    mempool_storage_basic_for_network(Network::Testnet)?;
-
-    Ok(())
-}
-
-fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
-    // Create an empty storage
-    let mut storage: Storage = Default::default();
-
-    // Get transactions from the first 10 blocks of the Zcash blockchain
-    let (total_transactions, unmined_transactions) = unmined_transactions_in_blocks(10, network);
-
-    // Insert them all to the storage
-    for unmined_transaction in unmined_transactions.clone() {
-        storage.insert(unmined_transaction)?;
-    }
-
-    // Only MEMPOOL_SIZE should land in verified
-    assert_eq!(storage.verified.len(), MEMPOOL_SIZE);
-
-    // The rest of the transactions will be in rejected
-    assert_eq!(storage.rejected.len(), total_transactions - MEMPOOL_SIZE);
-
-    // Make sure the last MEMPOOL_SIZE transactions we sent are in the verified
-    for tx in unmined_transactions.iter().rev().take(MEMPOOL_SIZE) {
-        assert!(storage.clone().contains(&tx.id));
-    }
-
-    // Anything greater should not be in the verified
-    for tx in unmined_transactions
-        .iter()
-        .take(unmined_transactions.len() - MEMPOOL_SIZE)
-    {
-        assert!(!storage.clone().contains(&tx.id));
-    }
-
-    Ok(())
-}
+mod prop;
+mod vectors;
 
 pub fn unmined_transactions_in_blocks(
-    last_block_height: u32,
+    block_height_range: impl RangeBounds<u32>,
     network: Network,
-) -> (usize, Vec<UnminedTx>) {
-    let mut transactions = vec![];
-    let mut total = 0;
-
-    let block_iter = match network {
+) -> impl DoubleEndedIterator<Item = VerifiedUnminedTx> {
+    let blocks = match network {
         Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
         Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
     };
 
-    for (&height, block) in block_iter {
-        if height <= last_block_height {
-            let block = block
+    // Deserialize the blocks that are selected based on the specified `block_height_range`.
+    let selected_blocks = blocks
+        .filter(move |(&height, _)| block_height_range.contains(&height))
+        .map(|(_, block)| {
+            block
                 .zcash_deserialize_into::<Block>()
-                .expect("block is structurally valid");
+                .expect("block test vector is structurally valid")
+        });
 
-            for transaction in block.transactions.iter() {
-                transactions.push(UnminedTx::from(transaction));
-                total += 1;
-            }
-        }
-    }
-
-    (total, transactions)
+    // Extract the transactions from the blocks and wrap each one as an unmined transaction.
+    // Use a fake zero miner fee, because we don't have the UTXOs to calculate the correct fee.
+    selected_blocks
+        .flat_map(|block| block.transactions)
+        .map(UnminedTx::from)
+        .map(|transaction| VerifiedUnminedTx::new(transaction, Amount::zero()))
 }

@@ -1,32 +1,51 @@
-use std::io::{self, BufReader};
+//! Downloading, checking, and loading Groth16 Sapling and Sprout parameters.
+
+use std::path::{Path, PathBuf};
 
 use bellman::groth16;
 use bls12_381::Bls12;
+use zcash_proofs::SaplingParameterPaths;
 
-use super::HashReader;
+use crate::BoxError;
 
-const SAPLING_SPEND_HASH: &str = "8270785a1a0d0bc77196f000ee6d221c9c9894f55307bd9357c3f0105d31ca63991ab91324160d8f53e2bbd3c2633a6eb8bdf5205d822e7f3f73edac51b2b70c";
-const SAPLING_OUTPUT_HASH: &str = "657e3d38dbb5cb5e7dd2970e8b03d69b4787dd907285b5a7f0790dcc8072f60bf593b32cc2d1c030e00ff5ae64bf84c5c3beb84ddc841d48264b4a171744d028";
+/// The timeout for each parameter file download, in seconds.
+///
+/// Zebra assumes that it's running on at least a 10 Mbps connection.
+/// So the parameter files should download in about 15 minutes using `zebrad download`.
+/// But `zebrad start` downloads blocks at the same time, so we allow some extra time.
+pub const PARAMETER_DOWNLOAD_TIMEOUT: u64 = 60 * 60;
+
+/// The maximum number of times to retry download parameters.
+///
+/// Zebra will retry to download Sprout of Sapling parameters only if they
+/// failed for whatever reason.
+pub const PARAMETER_DOWNLOAD_MAX_RETRIES: usize = 3;
 
 lazy_static::lazy_static! {
-    pub static ref PARAMS: Groth16Params = Groth16Params::new();
+    /// Groth16 Zero-Knowledge Proof parameters for the Sapling and Sprout circuits.
+    ///
+    /// When this static is accessed:
+    /// - the parameters are downloaded if needed, then cached to a shared directory,
+    /// - the file hashes are checked, for both newly downloaded and previously cached files,
+    /// - the parameters are loaded into Zebra.
+    ///
+    /// # Panics
+    ///
+    /// If the downloaded or pre-existing parameter files are invalid.
+    pub static ref GROTH16_PARAMETERS: Groth16Parameters = Groth16Parameters::new();
 }
 
-#[non_exhaustive]
-pub struct Groth16Params {
-    pub sapling: SaplingParams,
+/// Groth16 Zero-Knowledge Proof parameters for the Sapling and Sprout circuits.
+pub struct Groth16Parameters {
+    /// The Sapling circuit Groth16 parameters.
+    pub sapling: SaplingParameters,
+
+    /// The Sprout circuit Groth16 spend parameter.
+    pub sprout: SproutParameters,
 }
 
-impl Groth16Params {
-    fn new() -> Self {
-        Self {
-            sapling: SaplingParams::new(),
-        }
-    }
-}
-
-#[non_exhaustive]
-pub struct SaplingParams {
+/// Groth16 Zero-Knowledge Proof spend and output parameters for the Sapling circuit.
+pub struct SaplingParameters {
     pub spend: groth16::Parameters<Bls12>,
     pub spend_prepared_verifying_key: groth16::PreparedVerifyingKey<Bls12>,
 
@@ -34,49 +53,165 @@ pub struct SaplingParams {
     pub output_prepared_verifying_key: groth16::PreparedVerifyingKey<Bls12>,
 }
 
-impl SaplingParams {
-    fn new() -> Self {
-        let (spend, output) = wagyu_zcash_parameters::load_sapling_parameters();
-        let spend_fs = BufReader::with_capacity(1024 * 1024, &spend[..]);
-        let output_fs = BufReader::with_capacity(1024 * 1024, &output[..]);
+/// Groth16 Zero-Knowledge Proof spend parameters for the Sprout circuit.
+///
+/// New Sprout outputs were disabled by the Canopy network upgrade.
+pub struct SproutParameters {
+    pub joinsplit_prepared_verifying_key: groth16::PreparedVerifyingKey<Bls12>,
+}
 
-        Self::read(spend_fs, output_fs)
-            .expect("reading parameters from wagyu zcash parameter's vec will always succeed")
+impl Groth16Parameters {
+    /// Download if needed, cache, check, and load the Sprout and Sapling Groth16 parameters.
+    ///
+    /// # Panics
+    ///
+    /// If the parameters were downloaded to the wrong path.
+    /// After `PARAMETER_DOWNLOAD_MAX_RETRIES` failed download attempts.
+    /// If the downloaded or pre-existing parameter files are invalid.
+    fn new() -> Groth16Parameters {
+        let params_directory = Groth16Parameters::directory();
+        let sapling_spend_path = params_directory.join(zcash_proofs::SAPLING_SPEND_NAME);
+        let sapling_output_path = params_directory.join(zcash_proofs::SAPLING_OUTPUT_NAME);
+        let sprout_path = params_directory.join(zcash_proofs::SPROUT_NAME);
+
+        Groth16Parameters::retry_download_sapling_parameters(
+            &sapling_spend_path,
+            &sapling_output_path,
+        );
+        Groth16Parameters::retry_download_sprout_parameters(&sprout_path);
+
+        // TODO: if loading fails, log a message including `failure_hint`
+        tracing::info!("checking and loading Zcash Sapling and Sprout parameters");
+        let parameters = zcash_proofs::load_parameters(
+            &sapling_spend_path,
+            &sapling_output_path,
+            Some(&sprout_path),
+        );
+
+        let sapling = SaplingParameters {
+            spend: parameters.spend_params,
+            spend_prepared_verifying_key: parameters.spend_vk,
+            output: parameters.output_params,
+            output_prepared_verifying_key: parameters.output_vk,
+        };
+
+        let sprout = SproutParameters {
+            joinsplit_prepared_verifying_key: parameters
+                .sprout_vk
+                .expect("unreachable code: sprout loader panics on failure"),
+        };
+
+        Groth16Parameters { sapling, sprout }
     }
 
-    fn read<R: io::Read>(spend_fs: R, output_fs: R) -> Result<Self, io::Error> {
-        let mut spend_fs = HashReader::new(spend_fs);
-        let mut output_fs = HashReader::new(output_fs);
+    /// Returns the path to the Groth16 parameters directory.
+    pub fn directory() -> PathBuf {
+        zcash_proofs::default_params_folder().expect("unable to find user home directory")
+    }
 
-        // Deserialize params
-        let spend = groth16::Parameters::<Bls12>::read(&mut spend_fs, false)?;
-        let output = groth16::Parameters::<Bls12>::read(&mut output_fs, false)?;
+    /// Returns a hint that helps users recover from parameter download failures.
+    pub fn failure_hint() -> String {
+        format!(
+            "Hint: try deleting {:?}, then running 'zebrad download' to re-download the parameters",
+            Groth16Parameters::directory(),
+        )
+    }
 
-        // There is extra stuff (the transcript) at the end of the parameter file which is
-        // used to verify the parameter validity, but we're not interested in that. We do
-        // want to read it, though, so that the BLAKE2b computed afterward is consistent
-        // with `b2sum` on the files.
-        let mut sink = io::sink();
-        io::copy(&mut spend_fs, &mut sink)?;
-        io::copy(&mut output_fs, &mut sink)?;
+    /// Download Sapling parameters and retry [`PARAMETER_DOWNLOAD_MAX_RETRIES`] if it fails.
+    ///
+    /// # Panics
+    ///
+    /// If the parameters were downloaded to the wrong path.
+    /// After `PARAMETER_DOWNLOAD_MAX_RETRIES` failed download attempts.
+    fn retry_download_sapling_parameters(sapling_spend_path: &Path, sapling_output_path: &Path) {
+        // TODO: instead of the path check, add a zcash_proofs argument to skip hashing existing files
+        //       (we check them on load anyway)
+        if !sapling_spend_path.exists() || !sapling_output_path.exists() {
+            tracing::info!("downloading Zcash Sapling parameters");
 
-        if spend_fs.into_hash() != SAPLING_SPEND_HASH {
-            panic!("Sapling spend parameter is not correct.");
+            let mut retries = 0;
+            while let Err(error) = Groth16Parameters::download_sapling_parameters_once(
+                sapling_spend_path,
+                sapling_output_path,
+            ) {
+                retries += 1;
+                if retries >= PARAMETER_DOWNLOAD_MAX_RETRIES {
+                    panic!(
+                        "error downloading Sapling parameter files after {} retries. {:?} {}",
+                        PARAMETER_DOWNLOAD_MAX_RETRIES,
+                        error,
+                        Groth16Parameters::failure_hint(),
+                    );
+                } else {
+                    tracing::info!(
+                        ?error,
+                        "error downloading Zcash Sapling parameters, retrying"
+                    );
+                }
+            }
         }
+    }
 
-        if output_fs.into_hash() != SAPLING_OUTPUT_HASH {
-            panic!("Sapling output parameter is not correct.");
+    /// Try to download the Sapling parameters once, and return the result.
+    ///
+    /// # Panics
+    ///
+    /// If the parameters were downloaded to different paths to `sapling_spend_path`
+    /// or `sapling_output_path`.
+    fn download_sapling_parameters_once(
+        sapling_spend_path: &Path,
+        sapling_output_path: &Path,
+    ) -> Result<SaplingParameterPaths, BoxError> {
+        let new_sapling_paths =
+            zcash_proofs::download_sapling_parameters(Some(PARAMETER_DOWNLOAD_TIMEOUT))?;
+
+        assert_eq!(sapling_spend_path, new_sapling_paths.spend);
+        assert_eq!(sapling_output_path, new_sapling_paths.output);
+
+        Ok(new_sapling_paths)
+    }
+
+    /// Download Sprout parameters and retry [`PARAMETER_DOWNLOAD_MAX_RETRIES`] if it fails.
+    ///
+    /// # Panics
+    ///
+    /// If the parameters were downloaded to the wrong path.
+    /// After `PARAMETER_DOWNLOAD_MAX_RETRIES` failed download attempts.
+    fn retry_download_sprout_parameters(sprout_path: &Path) {
+        if !sprout_path.exists() {
+            tracing::info!("downloading Zcash Sprout parameters");
+
+            let mut retries = 0;
+            while let Err(error) = Groth16Parameters::download_sprout_parameters_once(sprout_path) {
+                retries += 1;
+                if retries >= PARAMETER_DOWNLOAD_MAX_RETRIES {
+                    panic!(
+                        "error downloading Sprout parameter files after {} retries. {:?} {}",
+                        PARAMETER_DOWNLOAD_MAX_RETRIES,
+                        error,
+                        Groth16Parameters::failure_hint(),
+                    );
+                } else {
+                    tracing::info!(
+                        ?error,
+                        "error downloading Zcash Sprout parameters, retrying"
+                    );
+                }
+            }
         }
+    }
 
-        // Prepare verifying keys
-        let spend_prepared_verifying_key = groth16::prepare_verifying_key(&spend.vk);
-        let output_prepared_verifying_key = groth16::prepare_verifying_key(&output.vk);
+    /// Try to download the Sprout parameters once, and return the result.
+    ///
+    /// # Panics
+    ///
+    /// If the parameters were downloaded to a different path to `sprout_path`.
+    fn download_sprout_parameters_once(sprout_path: &Path) -> Result<PathBuf, BoxError> {
+        let new_sprout_path =
+            zcash_proofs::download_sprout_parameters(Some(PARAMETER_DOWNLOAD_TIMEOUT))?;
 
-        Ok(Self {
-            spend,
-            spend_prepared_verifying_key,
-            output,
-            output_prepared_verifying_key,
-        })
+        assert_eq!(sprout_path, new_sprout_path);
+
+        Ok(new_sprout_path)
     }
 }

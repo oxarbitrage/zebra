@@ -1,4 +1,5 @@
 use std::{
+    convert::TryInto,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -202,6 +203,20 @@ impl StateService {
         self.queued_blocks.prune_by_height(finalized_tip_height);
 
         let tip_block = self.mem.best_tip_block().map(ChainTipBlock::from);
+
+        // update metrics using the best non-finalized tip
+        if let Some(tip_block) = tip_block.as_ref() {
+            metrics::gauge!(
+                "state.full_verifier.committed.block.height",
+                tip_block.height.0 as _
+            );
+
+            // This height gauge is updated for both fully verified and checkpoint blocks.
+            // These updates can't conflict, because the state makes sure that blocks
+            // are committed in order.
+            metrics::gauge!("zcash.chain.verified.block.height", tip_block.height.0 as _);
+        }
+
         self.chain_tip_sender.set_best_non_finalized_tip(tip_block);
 
         tracing::trace!("finished processing queued block");
@@ -210,6 +225,7 @@ impl StateService {
 
     /// Run contextual validation on the prepared block and add it to the
     /// non-finalized state if it is contextually valid.
+    #[tracing::instrument(level = "debug", skip(self, prepared))]
     fn validate_and_commit(&mut self, prepared: PreparedBlock) -> Result<(), CommitBlockError> {
         self.check_contextual_validity(&prepared)?;
         let parent_hash = prepared.block.header.previous_block_hash;
@@ -230,6 +246,7 @@ impl StateService {
 
     /// Attempt to validate and commit all queued blocks whose parents have
     /// recently arrived starting from `new_parent`, in breadth-first ordering.
+    #[tracing::instrument(level = "debug", skip(self, new_parent))]
     fn process_queued(&mut self, new_parent: block::Hash) {
         let mut new_parents: Vec<(block::Hash, Result<(), CloneError>)> =
             vec![(new_parent, Ok(()))];
@@ -259,6 +276,11 @@ impl StateService {
                 } else {
                     tracing::trace!(?child_hash, "validating queued child");
                     result = self.validate_and_commit(child).map_err(CloneError::from);
+                    if result.is_ok() {
+                        // Update the metrics if semantic and contextual validation passes
+                        metrics::counter!("state.full_verifier.committed.block.count", 1);
+                        metrics::counter!("zcash.chain.verified.block.total", 1);
+                    }
                 }
 
                 let _ = rsp_tx.send(result.clone().map(|()| child_hash).map_err(BoxError::from));
@@ -411,7 +433,8 @@ impl StateService {
     ///   * adding the `stop` hash to the list, if it is in the best chain, or
     ///   * adding `max_len` hashes to the list.
     ///
-    /// Returns an empty list if the state is empty.
+    /// Returns an empty list if the state is empty,
+    /// or if the `intersection` is the best chain tip.
     pub fn collect_best_chain_hashes(
         &self,
         intersection: Option<block::Hash>,
@@ -424,6 +447,11 @@ impl StateService {
         let chain_tip_height = if let Some((height, _)) = self.best_tip() {
             height
         } else {
+            tracing::debug!(
+                response_len = ?0,
+                "responding to peer GetBlocks or GetHeaders with empty state",
+            );
+
             return Vec::new();
         };
 
@@ -437,10 +465,15 @@ impl StateService {
                 .expect("the Find response height does not exceed Height::MAX")
         } else {
             // start at genesis, and return max_len hashes
-            block::Height((max_len - 1) as _)
+            let max_height = block::Height(
+                max_len
+                    .try_into()
+                    .expect("max_len does not exceed Height::MAX"),
+            );
+            (max_height - 1).expect("max_len is at least 1")
         };
 
-        let stop_height = stop.map(|hash| self.best_height_by_hash(hash)).flatten();
+        let stop_height = stop.and_then(|hash| self.best_height_by_hash(hash));
 
         // Compute the final height, making sure it is:
         //   * at or below our chain tip, and
@@ -469,7 +502,7 @@ impl StateService {
             .collect();
         res.reverse();
 
-        tracing::info!(
+        tracing::debug!(
             ?final_height,
             response_len = ?res.len(),
             ?chain_tip_height,
@@ -489,11 +522,12 @@ impl StateService {
                 .unwrap_or(true),
             "the list must not contain the intersection hash"
         );
-        assert!(
-            stop.map(|hash| !res[..(res.len() - 1)].contains(&hash))
-                .unwrap_or(true),
-            "if the stop hash is in the list, it must be the final hash"
-        );
+        if let (Some(stop), Some((_, res_except_last))) = (stop, res.split_last()) {
+            assert!(
+                !res_except_last.contains(&stop),
+                "if the stop hash is in the list, it must be the final hash"
+            );
+        }
 
         res
     }
@@ -758,7 +792,11 @@ impl Service<Request> for StateService {
                             .best_block(hash.into())
                             .expect("block for found hash is in the best chain");
                         block::CountedHeader {
-                            transaction_count: block.transactions.len(),
+                            transaction_count: block
+                                .transactions
+                                .len()
+                                .try_into()
+                                .expect("transaction count has already been validated"),
                             header: block.header,
                         }
                     })

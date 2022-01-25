@@ -1,9 +1,3 @@
-// Standard lints
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
-
 use tower::{Service, ServiceExt};
 use zebra_test::transcript::ExpectedTranscriptError;
 use zebra_test::transcript::Transcript;
@@ -23,11 +17,11 @@ async fn transcript_returns_responses_and_ends() {
 
     for (req, rsp) in TRANSCRIPT_DATA.iter() {
         assert_eq!(
-            svc.ready_and().await.unwrap().call(req).await.unwrap(),
+            svc.ready().await.unwrap().call(req).await.unwrap(),
             *rsp.as_ref().unwrap()
         );
     }
-    assert!(svc.ready_and().await.unwrap().call("end").await.is_err());
+    assert!(svc.ready().await.unwrap().call("end").await.is_err());
 }
 
 #[tokio::test]
@@ -37,10 +31,10 @@ async fn transcript_errors_wrong_request() {
     let mut svc = Transcript::from(TRANSCRIPT_DATA.iter().cloned());
 
     assert_eq!(
-        svc.ready_and().await.unwrap().call("req1").await.unwrap(),
+        svc.ready().await.unwrap().call("req1").await.unwrap(),
         "rsp1",
     );
-    assert!(svc.ready_and().await.unwrap().call("bad").await.is_err());
+    assert!(svc.ready().await.unwrap().call("bad").await.is_err());
 }
 
 #[tokio::test]

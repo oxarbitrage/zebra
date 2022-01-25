@@ -447,10 +447,10 @@ Construct a new chain starting with `block`.
 
 ### The `QueuedBlocks` type
 
-The queued blocks type represents the non-finalized blocks that were commited
+The queued blocks type represents the non-finalized blocks that were committed
 before their parent blocks were. It is responsible for tracking which blocks
-are queued by their parent so they can be commited immediately after the
-parent is commited. It also tracks blocks by their height so they can be
+are queued by their parent so they can be committed immediately after the
+parent is committed. It also tracks blocks by their height so they can be
 discarded if they ever end up below the reorg limit.
 
 `NonFinalizedState` is defined by the following structure and API:
@@ -529,7 +529,7 @@ The state service uses the following entry points:
 
 ## Committing non-finalized blocks
 
-New `non-finalized` blocks are commited as follows:
+New `non-finalized` blocks are committed as follows:
 
 ### `pub(super) fn queue_and_commit_non_finalized_blocks(&mut self, new: Arc<Block>) -> tokio::sync::oneshot::Receiver<block::Hash>`
 
@@ -559,7 +559,7 @@ New `non-finalized` blocks are commited as follows:
 5. Else iteratively attempt to process queued blocks by their parent hash
    starting with `block.header.previous_block_hash`
 
-6. While there are recently commited parent hashes to process
+6. While there are recently committed parent hashes to process
     - Dequeue all blocks waiting on `parent` with `let queued_children =
       self.queued_blocks.dequeue_children(parent);`
     - for each queued `block`
@@ -574,8 +574,8 @@ New `non-finalized` blocks are commited as follows:
       - Else add the new block to an existing non-finalized chain or new fork
         with `self.mem.commit_block(block);`
       - Send `Ok(hash)` over the associated channel to indicate the block
-        was successfully commited
-      - Add `block.hash` to the set of recently commited parent hashes to
+        was successfully committed
+      - Add `block.hash` to the set of recently committed parent hashes to
         process
 
 7. While the length of the non-finalized portion of the best chain is greater
@@ -600,29 +600,56 @@ order on byte strings is the numeric ordering).
 
 We use the following rocksdb column families:
 
-| Column Family         | Keys                  | Values                               | Updates |
-|-----------------------|-----------------------|--------------------------------------|---------|
-| `hash_by_height`      | `BE32(height)`        | `block::Hash`                        | Never   |
-| `height_by_hash`      | `block::Hash`         | `BE32(height)`                       | Never   |
-| `block_by_height`     | `BE32(height)`        | `Block`                              | Never   |
-| `tx_by_hash`          | `transaction::Hash`   | `(BE32(height) \|\| BE32(tx_index))` | Never   |
-| `utxo_by_outpoint`    | `OutPoint`            | `transparent::Output`                | Delete  |
-| `sprout_nullifiers`   | `sprout::Nullifier`   | `()`                                 | Never   |
-| `sapling_nullifiers`  | `sapling::Nullifier`  | `()`                                 | Never   |
-| `orchard_nullifiers`  | `orchard::Nullifier`  | `()`                                 | Never   |
-| `sprout_anchors`      | `sprout::tree::Root`  | `()`                                 | Never   |
-| `sprout_incremental`  | `BE32(height)` *?*    | `sprout::tree::NoteCommitmentTree`   | Delete  |
-| `sapling_anchors`     | `sapling::tree::Root` | `()`                                 | Never   |
-| `sapling_incremental` | `BE32(height)` *?*    | `sapling::tree::NoteCommitmentTree`  | Delete  |
-| `orchard_anchors`     | `orchard::tree::Root` | `()`                                 | Never   |
-| `orchard_incremental` | `BE32(height)` *?*    | `orchard::tree::NoteCommitmentTree`  | Delete  |
-| `history_incremental` | `BE32(height)`        | `zcash_history::Entry`         | Delete  |
-| `tip_chain_value_pool`| `BE32(height)`        | `ValueBalance<NonNegative>`          | Delete  |
+| Column Family                  | Keys                   | Values                              | Updates |
+| ------------------------------ | ---------------------- | ----------------------------------- | ------- |
+| `hash_by_height`               | `block::Height`        | `block::Hash`                       | Never   |
+| `height_tx_count_by_hash`      | `block::Hash`          | `BlockTransactionCount`             | Never   |
+| `block_header_by_height`       | `block::Height`        | `block::Header`                     | Never   |
+| `tx_by_location`               | `TransactionLocation`  | `Transaction`                       | Never   |
+| `hash_by_tx`                   | `TransactionLocation`  | `transaction::Hash`                 | Never   |
+| `tx_by_hash`                   | `transaction::Hash`    | `TransactionLocation`               | Never   |
+| `utxo_by_outpoint`             | `OutLocation`          | `transparent::Output`               | Delete  |
+| `balance_by_transparent_addr`  | `transparent::Address` | `Amount \|\| FirstOutLocation`      | Update  |
+| `utxo_by_transparent_addr_loc` | `FirstOutLocation`     | `AtLeastOne<OutLocation>`           | Up/Del  |
+| `tx_by_transparent_addr_loc`   | `FirstOutLocation`     | `AtLeastOne<TransactionLocation>`   | Append  |
+| `sprout_nullifiers`            | `sprout::Nullifier`    | `()`                                | Never   |
+| `sprout_anchors`               | `sprout::tree::Root`   | `sprout::tree::NoteCommitmentTree`  | Never   |
+| `sprout_note_commitment_tree`  | `block::Height`        | `sprout::tree::NoteCommitmentTree`  | Delete  |
+| `sapling_nullifiers`           | `sapling::Nullifier`   | `()`                                | Never   |
+| `sapling_anchors`              | `sapling::tree::Root`  | `()`                                | Never   |
+| `sapling_note_commitment_tree` | `block::Height`        | `sapling::tree::NoteCommitmentTree` | Delete  |
+| `orchard_nullifiers`           | `orchard::Nullifier`   | `()`                                | Never   |
+| `orchard_anchors`              | `orchard::tree::Root`  | `()`                                | Never   |
+| `orchard_note_commitment_tree` | `block::Height`        | `orchard::tree::NoteCommitmentTree` | Delete  |
+| `history_tree`                 | `block::Height`        | `NonEmptyHistoryTree`               | Delete  |
+| `tip_chain_value_pool`         | `()`                   | `ValueBalance`                      | Update  |
 
 Zcash structures are encoded using `ZcashSerialize`/`ZcashDeserialize`.
 Other structures are encoded using `IntoDisk`/`FromDisk`.
 
-**Note:** We do not store the cumulative work for the finalized chain, because the finalized work is equal for all non-finalized chains. So the additional non-finalized work can be used to calculate the relative chain order, and choose the best chain.
+Block and Transaction Data:
+- `Height`: 24 bits, big-endian, unsigned (allows for ~30 years worth of blocks)
+- `TransactionIndex`: 16 bits, big-endian, unsigned (max ~23,000 transactions in the 2 MB block limit)
+- `TransactionCount`: same as `TransactionIndex`
+- `TransactionLocation`: `Height \|\| TransactionIndex`
+- `HeightTransactionCount`: `Height \|\| TransactionCount`
+- `TransparentOutputIndex`: 24 bits, big-endian, unsigned (max ~223,000 transfers in the 2 MB block limit)
+- transparent and shielded input indexes, and shielded output indexes: 16 bits, big-endian, unsigned (max ~49,000 transfers in the 2 MB block limit)
+- `OutLocation`: `TransactionLocation \|\| TransparentOutputIndex`
+- `FirstOutLocation`: the first `OutLocation` used by a `transparent::Address`.
+  Always has the same value for each address, even if the first output is spent.
+- `Utxo`: `Output`, derives extra fields from the `OutLocation` key
+- `AtLeastOne<T>`: `[T; AtLeastOne::len()]` (for known-size `T`)
+
+We use big-endian encoding for keys, to allow database index prefix searches.
+
+Amounts:
+- `Amount`: 64 bits, little-endian, signed
+- `ValueBalance`: `[Amount; 4]`
+
+Derived Formats:
+- `*::NoteCommitmentTree`: `bincode` using `serde`
+- `NonEmptyHistoryTree`: `bincode` using `serde`, using `zcash_history`'s `serde` implementation
 
 ### Implementing consensus rules using rocksdb
 [rocksdb-consensus-rules]: #rocksdb-consensus-rules
@@ -632,6 +659,10 @@ Each column family handles updates differently, based on its specific consensus 
 - Delete: Keys can be deleted, but values are never updated. The value for each key is inserted once.
   - TODO: should we prevent re-inserts of keys that have been deleted?
 - Update: Keys are never deleted, but values can be updated.
+- Append: Keys are never deleted, existing values are never updated,
+  but sets of values can be extended with more entries.
+- Up/Del: Keys can be deleted, existing entries can be removed,
+  sets of values can be extended with more entries.
 
 Currently, there are no column families that both delete and update keys.
 
@@ -656,16 +687,30 @@ So they should not be used for consensus-critical checks.
 
 ### Notes on rocksdb column families
 
-- The `hash_by_height` and `height_by_hash` column families provide a bijection between
+- The `hash_by_height` and `height_tx_count_by_hash` column families provide a bijection between
   block heights and block hashes.  (Since the rocksdb state only stores finalized
   state, they are actually a bijection).
 
-- The `block_by_height` column family provides a bijection between block
-  heights and block data. There is no corresponding `height_by_block` column
-  family: instead, hash the block, and use `height_by_hash`. (Since the
-  rocksdb state only stores finalized state, they are actually a bijection).
+- Similarly, the `tx_by_hash` and `hash_by_tx` column families provide a bijection between
+  transaction locations and transaction hashes.
 
-- Blocks are stored by height, not by hash.  This has the downside that looking
+- The `block_header_by_height` column family provides a bijection between block
+  heights and block header data. There is no corresponding `height_by_block` column
+  family: instead, hash the block, and use the hash from `height_tx_count_by_hash`. (Since the
+  rocksdb state only stores finalized state, they are actually a bijection).
+  Similarly, there are no column families that go from transaction data
+  to transaction locations: hash the transaction and use `tx_by_hash`.
+
+- Block headers and transactions are stored separately in the database,
+  so that individual transactions can be accessed efficiently.
+  Blocks can be re-created on request using the following process:
+  - Look up `height` and `tx_count` in `height_tx_count_by_hash`
+  - Get the block header for `height` from `block_header_by_height`
+  - Use [`prefix_iterator`](https://docs.rs/rocksdb/0.17.0/rocksdb/struct.DBWithThreadMode.html#method.prefix_iterator)
+    or [`multi_get`](https://github.com/facebook/rocksdb/wiki/MultiGet-Performance)
+    to get each transaction from `0..tx_count` from `tx_by_location`
+
+- Block headers are stored by height, not by hash.  This has the downside that looking
   up a block by hash requires an extra level of indirection.  The upside is
   that blocks with adjacent heights are adjacent in the database, and many
   common access patterns, such as helping a client sync the chain or doing
@@ -673,23 +718,67 @@ So they should not be used for consensus-critical checks.
   the fact that we commit blocks in order means we're writing only to the end
   of the rocksdb column family, which may help save space.
 
-- Transaction references are stored as a `(height, index)` pair referencing the
+- Similarly, transaction data is stored in chain order in `tx_by_location`,
+  and chain order within each vector in `tx_by_transparent_address`.
+
+- `TransactionLocation`s are stored as a `(height, index)` pair referencing the
   height of the transaction's parent block and the transaction's index in that
   block.  This would more traditionally be a `(hash, index)` pair, but because
   we store blocks by height, storing the height saves one level of indirection.
+  Transaction hashes can be looked up using `hash_by_tx`.
 
-- Each incremental tree consists of nodes for a small number of peaks.
-  Peaks are written once, then deleted when they are no longer required.
-  New incremental tree nodes can be added each time the finalized tip changes,
-  and unused nodes can be deleted.
-  We only keep the nodes needed for the incremental tree for the finalized tip.
-  TODO: update this description based on the incremental merkle tree code
+- Similarly, UTXOs are stored in `utxo_by_outpoint` by `OutLocation`,
+  rather than `OutPoint`. `OutPoint`s can be looked up using `tx_by_hash`,
+  and reconstructed using `hash_by_tx`.
 
-- The history tree indexes its peaks using blocks since the last network upgrade.
-  But we map those peak indexes to heights, to make testing and debugging easier.
+- The `Utxo` type can be constructed from the `Output` data,
+  `height: TransactionLocation.height`, and
+  `is_coinbase: OutLocation.output_index == 1`.
+
+- `balance_by_transparent_addr` is the sum of all `utxo_by_transparent_addr_loc`s
+  that are still in `utxo_by_outpoint`. It is cached to improve performance for
+  addresses with large UTXO sets. It also stores the `FirstOutLocation` for each
+  address, which allows for efficient lookups.
+
+- `utxo_by_transparent_addr_loc` stores unspent transparent output locations by address.
+  UTXO locations are appended by each block. If an address lookup discovers a UTXO
+  has been spent in `utxo_by_outpoint`, that UTXO location can be deleted from
+  `utxo_by_transparent_addr_loc`. (We don't do these deletions every time a block is
+  committed, because that requires an expensive full index search.)
+  This list includes the `FirstOutLocation`, if it has not been spent.
+  (This duplicate data is small, and helps simplify the code.)
+
+- `tx_by_transparent_addr_loc` stores transaction locations by address.
+  This list includes transactions containing spent UTXOs.
+  It also includes the `TransactionLocation` from the `FirstOutLocation`.
+  (This duplicate data is small, and helps simplify the code.)
+
+- Each `*_note_commitment_tree` stores the note commitment tree state
+  at the tip of the finalized state, for the specific pool. There is always
+  a single entry for those; they are indexed by height just to make testing
+  and debugging easier (so for each block committed, the old tree is
+  deleted and a new one is inserted by its new height). Each tree is stored
+  as a "Merkle tree frontier" which is basically a (logarithmic) subset of
+  the Merkle tree nodes as required to insert new items.
+
+- `history_tree` stores the ZIP-221 history tree state at the tip of the finalized
+  state. There is always a single entry for it; it is indexed by height just
+  to make testing and debugging easier. The tree is stored as the set of "peaks"
+  of the "Merkle mountain range" tree structure, which is what is required to
+  insert new items.
+
+- Each `*_anchors` stores the anchor (the root of a Merkle tree) of the note commitment
+  tree of a certain block. We only use the keys since we just need the set of anchors,
+  regardless of where they come from. The exception is `sprout_anchors` which also maps
+  the anchor to the matching note commitment tree. This is required to support interstitial
+  treestates, which are unique to Sprout.
 
 - The value pools are only stored for the finalized tip.
-  We index it by height to make testing and debugging easier.
+
+- We do not store the cumulative work for the finalized chain,
+  because the finalized work is equal for all non-finalized chains.
+  So the additional non-finalized work can be used to calculate the relative chain order,
+  and choose the best chain.
 
 ## Committing finalized blocks
 
@@ -714,40 +803,17 @@ zebra-state service's responsibility) to commit finalized blocks in order.
 The genesis block does not have a parent block. For genesis blocks,
 check that `block`'s parent hash is `null` (all zeroes) and its height is `0`.
 
-2. Insert:
-    - `(hash, height)` into `height_by_hash`;
-    - `(height, hash)` into `hash_by_height`;
-    - `(height, block)` into `block_by_height`.
+2. Insert the block and transaction data into the relevant column families.
 
 3. If the block is a genesis block, skip any transaction updates.
 
     (Due to a [bug in zcashd](https://github.com/ZcashFoundation/zebra/issues/559),
     genesis block anchors and transactions are ignored during validation.)
 
-4.  Update the `sprout_anchors` and `sapling_anchors` trees with the Sprout and
-    Sapling anchors.
+4.  Update the block anchors, history tree, and chain value pools.
 
-5. Iterate over the enumerated transactions in the block. For each transaction:
-
-   1. Insert `(transaction_hash, BE32(block_height) || BE32(tx_index))` to
-   `tx_by_hash`;
-
-   2. For each `TransparentInput::PrevOut { outpoint, .. }` in the
-   transaction's `inputs()`, remove `outpoint` from `utxo_by_output`.
-
-   3. For each `output` in the transaction's `outputs()`, construct the
-   `outpoint` that identifies it, and insert `(outpoint, output)` into
-   `utxo_by_output`.
-
-   4. For each [`JoinSplit`] description in the transaction,
-   insert `(nullifiers[0],())` and `(nullifiers[1],())` into
-   `sprout_nullifiers`.
-
-   5. For each [`Spend`] description in the transaction, insert
-   `(nullifier,())` into `sapling_nullifiers`.
-
-   6. For each [`Action`] description in the transaction, insert
-   `(nullifier,())` into `orchard_nullifiers`.
+5. Iterate over the enumerated transactions in the block. For each transaction,
+   update the relevant column families.
 
 **Note**: The Sprout and Sapling anchors are the roots of the Sprout and
 Sapling note commitment trees that have already been calculated for the last

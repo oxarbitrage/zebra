@@ -1,8 +1,9 @@
 //! A Tokio codec mapping byte streams to Bitcoin message streams.
 
-use std::fmt;
 use std::{
     cmp::min,
+    convert::TryInto,
+    fmt,
     io::{Cursor, Read, Write},
 };
 
@@ -15,8 +16,9 @@ use zebra_chain::{
     block::{self, Block},
     parameters::Network,
     serialization::{
-        sha256d, zcash_deserialize_bytes_external_count, ReadZcashExt, SerializationError as Error,
-        WriteZcashExt, ZcashDeserialize, ZcashSerialize, MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_bytes_external_count, FakeWriter, ReadZcashExt,
+        SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -24,6 +26,7 @@ use zebra_chain::{
 use crate::constants;
 
 use super::{
+    addr::{AddrInVersion, AddrV1, AddrV2},
     message::{Message, RejectReason},
     types::*,
 };
@@ -181,21 +184,8 @@ impl Codec {
     /// for large data structures like lists, blocks, and transactions.
     /// See #1774.
     fn body_length(&self, msg: &Message) -> usize {
-        struct FakeWriter(usize);
-
-        impl std::io::Write for FakeWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0 += buf.len();
-
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut writer = FakeWriter(0);
+
         self.write_body(msg, &mut writer)
             .expect("writer should never fail");
         writer.0
@@ -224,13 +214,8 @@ impl Codec {
                 // serialization can not error.
                 writer.write_i64::<LittleEndian>(timestamp.timestamp())?;
 
-                let (recv_services, recv_addr) = address_recv;
-                writer.write_u64::<LittleEndian>(recv_services.bits())?;
-                writer.write_socket_addr(*recv_addr)?;
-
-                let (from_services, from_addr) = address_from;
-                writer.write_u64::<LittleEndian>(from_services.bits())?;
-                writer.write_socket_addr(*from_addr)?;
+                address_recv.zcash_serialize(&mut writer)?;
+                address_from.zcash_serialize(&mut writer)?;
 
                 writer.write_u64::<LittleEndian>(nonce.0)?;
                 user_agent.zcash_serialize(&mut writer)?;
@@ -257,7 +242,17 @@ impl Codec {
                     writer.write_all(data)?;
                 }
             }
-            Message::Addr(addrs) => addrs.zcash_serialize(&mut writer)?,
+            Message::Addr(addrs) => {
+                assert!(
+                    addrs.len() <= constants::MAX_ADDRS_IN_MESSAGE,
+                    "unexpectedly large Addr message: greater than MAX_ADDRS_IN_MESSAGE addresses"
+                );
+
+                // Regardless of the way we received the address,
+                // Zebra always sends `addr` messages
+                let v1_addrs: Vec<AddrV1> = addrs.iter().map(|addr| AddrV1::from(*addr)).collect();
+                v1_addrs.zcash_serialize(&mut writer)?
+            }
             Message::GetAddr => { /* Empty payload -- no-op */ }
             Message::Block(block) => block.zcash_serialize(&mut writer)?,
             Message::GetBlocks { known_blocks, stop } => {
@@ -419,6 +414,7 @@ impl Decoder for Codec {
                     b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
                     b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
                     b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
+                    b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                     b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
                     b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
                     b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
@@ -432,7 +428,19 @@ impl Decoder for Codec {
                     b"filterload\0\0" => self.read_filterload(&mut body_reader, body_len),
                     b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
                     b"filterclear\0" => self.read_filterclear(&mut body_reader),
-                    _ => return Err(Parse("unknown command")),
+                    _ => {
+                        let command_string = String::from_utf8_lossy(&command);
+
+                        // # Security
+                        //
+                        // Zcash connections are not authenticated, so malicious nodes can
+                        // send fake messages, with connected peers' IP addresses in the IP header.
+                        //
+                        // Since we can't verify their source, Zebra needs to ignore unexpected messages,
+                        // because closing the connection could cause a denial of service or eclipse attack.
+                        debug!(?command, %command_string, "unknown message command from peer");
+                        return Ok(None);
+                    }
                 }
                 // We need Ok(Some(msg)) to signal that we're done decoding.
                 // This is also convenient for tracing the parse result.
@@ -467,14 +475,8 @@ impl Codec {
                 .ok_or(Error::Parse(
                     "version timestamp is out of range for DateTime",
                 ))?,
-            address_recv: (
-                PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?),
-                reader.read_socket_addr()?,
-            ),
-            address_from: (
-                PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?),
-                reader.read_socket_addr()?,
-            ),
+            address_recv: AddrInVersion::zcash_deserialize(&mut reader)?,
+            address_from: AddrInVersion::zcash_deserialize(&mut reader)?,
             nonce: Nonce(reader.read_u64::<LittleEndian>()?),
             user_agent: String::zcash_deserialize(&mut reader)?,
             start_height: block::Height(reader.read_u32::<LittleEndian>()?),
@@ -526,8 +528,41 @@ impl Codec {
         })
     }
 
-    fn read_addr<R: Read>(&self, reader: R) -> Result<Message, Error> {
-        Ok(Message::Addr(Vec::zcash_deserialize(reader)?))
+    /// Deserialize an `addr` (v1) message into a list of `MetaAddr`s.
+    pub(super) fn read_addr<R: Read>(&self, reader: R) -> Result<Message, Error> {
+        let addrs: Vec<AddrV1> = reader.zcash_deserialize_into()?;
+
+        if addrs.len() > constants::MAX_ADDRS_IN_MESSAGE {
+            return Err(Error::Parse(
+                "more than MAX_ADDRS_IN_MESSAGE in addr message",
+            ));
+        }
+
+        // Convert the received address format to Zebra's internal `MetaAddr`.
+        let addrs = addrs.into_iter().map(Into::into).collect();
+        Ok(Message::Addr(addrs))
+    }
+
+    /// Deserialize an `addrv2` message into a list of `MetaAddr`s.
+    ///
+    /// Currently, Zebra parses received `addrv2`s, ignoring some address types.
+    /// Zebra never sends `addrv2` messages.
+    pub(super) fn read_addrv2<R: Read>(&self, reader: R) -> Result<Message, Error> {
+        let addrs: Vec<AddrV2> = reader.zcash_deserialize_into()?;
+
+        if addrs.len() > constants::MAX_ADDRS_IN_MESSAGE {
+            return Err(Error::Parse(
+                "more than MAX_ADDRS_IN_MESSAGE in addrv2 message",
+            ));
+        }
+
+        // Convert the received address format to Zebra's internal `MetaAddr`,
+        // ignoring unsupported network IDs.
+        let addrs = addrs
+            .into_iter()
+            .filter_map(|addr| addr.try_into().ok())
+            .collect();
+        Ok(Message::Addr(addrs))
     }
 
     fn read_getaddr<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
@@ -643,7 +678,6 @@ mod tests {
     use futures::prelude::*;
     use lazy_static::lazy_static;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use tokio::runtime::Runtime;
 
     lazy_static! {
         static ref VERSION_TEST_VECTOR: Message = {
@@ -653,13 +687,13 @@ mod tests {
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
                 services,
                 timestamp,
-                address_recv: (
-                    services,
+                address_recv: AddrInVersion::new(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+                    services,
                 ),
-                address_from: (
-                    services,
+                address_from: AddrInVersion::new(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+                    services,
                 ),
                 nonce: Nonce(0x9082_4908_8927_9238),
                 user_agent: "Zebra".to_owned(),
@@ -672,8 +706,7 @@ mod tests {
     /// Check that the version test vector serializes and deserializes correctly
     #[test]
     fn version_message_round_trip() {
-        zebra_test::init();
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = &*VERSION_TEST_VECTOR;
 
@@ -726,8 +759,7 @@ mod tests {
 
     /// Deserialize a `Version` message containing `time`, and return the result.
     fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
-        zebra_test::init();
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = &*VERSION_TEST_VECTOR;
 
@@ -768,9 +800,7 @@ mod tests {
 
     #[test]
     fn filterload_message_round_trip() {
-        zebra_test::init();
-
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = Message::FilterLoad {
             filter: Filter(vec![0; 35999]),
@@ -804,9 +834,7 @@ mod tests {
 
     #[test]
     fn reject_message_no_extra_data_round_trip() {
-        zebra_test::init();
-
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = Message::Reject {
             message: "experimental".to_string(),
@@ -840,9 +868,7 @@ mod tests {
 
     #[test]
     fn reject_message_extra_data_round_trip() {
-        zebra_test::init();
-
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = Message::Reject {
             message: "block".to_string(),
@@ -876,9 +902,7 @@ mod tests {
 
     #[test]
     fn filterload_message_too_large_round_trip() {
-        zebra_test::init();
-
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         let v = Message::FilterLoad {
             filter: Filter(vec![0; 40000]),
@@ -912,9 +936,7 @@ mod tests {
     fn max_msg_size_round_trip() {
         use zebra_chain::serialization::ZcashDeserializeInto;
 
-        zebra_test::init();
-
-        let rt = Runtime::new().unwrap();
+        let rt = zebra_test::init_async();
 
         // make tests with a Tx message
         let tx: Transaction = zebra_test::vectors::DUMMY_TX1

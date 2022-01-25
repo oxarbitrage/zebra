@@ -1,19 +1,18 @@
 //! Zebrad Abscissa Application
 
-use crate::{commands::ZebradCmd, components::tracing::Tracing, config::ZebradConfig};
+use std::{io::Write, process};
+
 use abscissa_core::{
-    application::{self, AppCell},
-    config,
-    config::Configurable,
-    terminal::component::Terminal,
-    terminal::ColorChoice,
+    application::{self, fatal_error, AppCell},
+    config::{self, Configurable},
+    terminal::{component::Terminal, stderr, stdout, ColorChoice},
     Application, Component, EntryPoint, FrameworkError, Shutdown, StandardPaths, Version,
 };
-use application::fatal_error;
-use std::process;
 
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::constants::{DATABASE_FORMAT_VERSION, LOCK_FILE_ERROR};
+
+use crate::{commands::ZebradCmd, components::tracing::Tracing, config::ZebradConfig};
 
 /// Application state
 pub static APPLICATION: AppCell<ZebradApp> = AppCell::new();
@@ -125,6 +124,8 @@ impl ZebradApp {
 ///
 /// By default no configuration is loaded, and the framework state is
 /// initialized to a default, empty state (no components, threads, etc).
+#[allow(unknown_lints)]
+#[allow(clippy::derivable_impls)]
 impl Default for ZebradApp {
     fn default() -> Self {
         Self {
@@ -285,15 +286,22 @@ impl Application for ZebradApp {
                     true
                 }
                 color_eyre::ErrorKind::Recoverable(error) => {
-                    // type checks should be faster than string conversions
+                    // Type checks should be faster than string conversions.
+                    //
+                    // Don't ask users to create bug reports for timeouts and peer errors.
                     if error.is::<tower::timeout::error::Elapsed>()
                         || error.is::<tokio::time::error::Elapsed>()
+                        || error.is::<zebra_network::PeerError>()
+                        || error.is::<zebra_network::SharedPeerError>()
+                        || error.is::<zebra_network::HandshakeError>()
                     {
                         return false;
                     }
 
                     let error_str = error.to_string();
-                    !error_str.contains("timed out") && !error_str.contains("duplicate hash")
+                    !error_str.contains("timed out")
+                        && !error_str.contains("duplicate hash")
+                        && !error_str.contains("No space left on device")
                 }
             });
 
@@ -305,14 +313,11 @@ impl Application for ZebradApp {
         // The Sentry default config pulls in the DSN from the `SENTRY_DSN`
         // environment variable.
         #[cfg(feature = "enable-sentry")]
-        let guard = sentry::init(
-            sentry::ClientOptions {
-                debug: true,
-                release: Some(app_version().to_string().into()),
-                ..Default::default()
-            }
-            .add_integration(sentry_tracing::TracingIntegration::default()),
-        );
+        let guard = sentry::init(sentry::ClientOptions {
+            debug: true,
+            release: Some(app_version().to_string().into()),
+            ..Default::default()
+        });
 
         std::panic::set_hook(Box::new(move |panic_info| {
             let panic_report = panic_hook.panic_report(panic_info);
@@ -409,6 +414,15 @@ impl Application for ZebradApp {
     }
 
     fn shutdown(&mut self, shutdown: Shutdown) -> ! {
+        // Some OSes require a flush to send all output to the terminal.
+        // zebrad's logging uses Abscissa, so we flush its streams.
+        //
+        // TODO:
+        // - if this doesn't work, send an empty line as well
+        // - move this code to the tracing component's `before_shutdown()`
+        let _ = stdout().lock().flush();
+        let _ = stderr().lock().flush();
+
         if let Err(e) = self.state().components.shutdown(self, shutdown) {
             fatal_error(self, &e)
         }

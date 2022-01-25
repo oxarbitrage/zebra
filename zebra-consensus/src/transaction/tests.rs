@@ -1,13 +1,21 @@
-use std::{collections::HashMap, convert::TryFrom, convert::TryInto, sync::Arc};
+use std::{
+    cmp::max,
+    collections::HashMap,
+    convert::{TryFrom, TryInto},
+    sync::Arc,
+};
 
+use halo2::{arithmetic::FieldExt, pasta::pallas};
 use tower::{service_fn, ServiceExt};
 
 use zebra_chain::{
     amount::{Amount, NonNegative},
-    block, orchard,
+    block::{self, Block, Height},
+    orchard::AuthorizedAction,
     parameters::{Network, NetworkUpgrade},
     primitives::{ed25519, x25519, Groth16Proof},
-    serialization::ZcashDeserialize,
+    sapling,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto},
     sprout,
     transaction::{
         arbitrary::{
@@ -22,6 +30,9 @@ use super::{check, Request, Verifier};
 
 use crate::{error::TransactionError, script};
 use color_eyre::eyre::Report;
+
+#[cfg(test)]
+mod prop;
 
 #[test]
 fn v5_fake_transactions() -> Result<(), Report> {
@@ -42,18 +53,6 @@ fn v5_fake_transactions() -> Result<(), Report> {
 
             // make sure there are no joinsplits nor spends in coinbase
             check::coinbase_tx_no_prevout_joinsplit_spend(&transaction)?;
-
-            // validate the sapling shielded data
-            if transaction.version() == 5 {
-                for spend in transaction.sapling_spends_per_anchor() {
-                    check::spend_cv_rk_not_small_order(&spend)?;
-                }
-                for output in transaction.sapling_outputs() {
-                    check::output_cv_epk_not_small_order(output)?;
-                }
-            } else {
-                panic!("we should have no tx other than 5");
-            }
         }
     }
 
@@ -90,7 +89,7 @@ fn fake_v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
     // If we add ENABLE_SPENDS flag it will pass the inputs check but fails with the outputs
     // TODO: Avoid new calls to `insert_fake_orchard_shielded_data` for each check #2409.
     let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
-    shielded_data.flags = orchard::Flags::ENABLE_SPENDS;
+    shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS;
 
     assert_eq!(
         check::has_inputs_and_outputs(&transaction),
@@ -99,7 +98,7 @@ fn fake_v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 
     // If we add ENABLE_OUTPUTS flag it will pass the outputs check but fails with the inputs
     let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
-    shielded_data.flags = orchard::Flags::ENABLE_OUTPUTS;
+    shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
 
     assert_eq!(
         check::has_inputs_and_outputs(&transaction),
@@ -108,9 +107,54 @@ fn fake_v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 
     // Finally make it valid by adding both required flags
     let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
-    shielded_data.flags = orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS;
+    shielded_data.flags =
+        zebra_chain::orchard::Flags::ENABLE_SPENDS | zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
 
     assert!(check::has_inputs_and_outputs(&transaction).is_ok());
+}
+
+#[test]
+fn fake_v5_transaction_with_orchard_actions_has_flags() {
+    // Find a transaction with no inputs or outputs to use as base
+    let mut transaction = fake_v5_transactions_for_network(
+        Network::Mainnet,
+        zebra_test::vectors::MAINNET_BLOCKS.iter(),
+    )
+    .rev()
+    .find(|transaction| {
+        transaction.inputs().is_empty()
+            && transaction.outputs().is_empty()
+            && transaction.sapling_spends_per_anchor().next().is_none()
+            && transaction.sapling_outputs().next().is_none()
+            && transaction.joinsplit_count() == 0
+    })
+    .expect("At least one fake V5 transaction with no inputs and no outputs");
+
+    // Insert fake Orchard shielded data to the transaction, which has at least one action (this is
+    // guaranteed structurally by `orchard::ShieldedData`)
+    insert_fake_orchard_shielded_data(&mut transaction);
+
+    // The check will fail if the transaction has no flags
+    assert_eq!(
+        check::has_enough_orchard_flags(&transaction),
+        Err(TransactionError::NotEnoughFlags)
+    );
+
+    // If we add ENABLE_SPENDS flag it will pass.
+    let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+    shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS;
+    assert!(check::has_enough_orchard_flags(&transaction).is_ok());
+
+    // If we add ENABLE_OUTPUTS flag instead, it will pass.
+    let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+    shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
+    assert!(check::has_enough_orchard_flags(&transaction).is_ok());
+
+    // If we add BOTH ENABLE_SPENDS and ENABLE_OUTPUTS flags it will pass.
+    let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+    shielded_data.flags =
+        zebra_chain::orchard::Flags::ENABLE_SPENDS | zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
+    assert!(check::has_enough_orchard_flags(&transaction).is_ok());
 }
 
 #[test]
@@ -185,7 +229,7 @@ fn v5_coinbase_transaction_with_enable_spends_flag_fails_validation() {
 
     let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
 
-    shielded_data.flags = orchard::Flags::ENABLE_SPENDS;
+    shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS;
 
     assert_eq!(
         check::coinbase_tx_no_prevout_joinsplit_spend(&transaction),
@@ -220,6 +264,7 @@ async fn v5_transaction_is_rejected_before_nu5_activation() {
                 height: canopy
                     .activation_height(network)
                     .expect("Canopy activation height is specified"),
+                time: chrono::MAX_DATETIME,
             })
             .await;
 
@@ -234,40 +279,58 @@ async fn v5_transaction_is_rejected_before_nu5_activation() {
 }
 
 #[tokio::test]
-// TODO: Remove `should_panic` once the NU5 activation heights for testnet and mainnet have been
+// TODO: Remove `should_panic` once the NU5 activation height for mainnet has been
 // defined.
 #[should_panic]
-async fn v5_transaction_is_accepted_after_nu5_activation() {
+async fn v5_transaction_is_accepted_after_nu5_activation_mainnet() {
+    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Mainnet).await
+}
+
+#[tokio::test]
+async fn v5_transaction_is_accepted_after_nu5_activation_testnet() {
+    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Testnet).await
+}
+
+async fn v5_transaction_is_accepted_after_nu5_activation_for_network(network: Network) {
     let nu5 = NetworkUpgrade::Nu5;
-    let networks = vec![
-        (Network::Mainnet, zebra_test::vectors::MAINNET_BLOCKS.iter()),
-        (Network::Testnet, zebra_test::vectors::TESTNET_BLOCKS.iter()),
-    ];
+    let nu5_activation_height = nu5
+        .activation_height(network)
+        .expect("NU5 activation height is specified");
 
-    for (network, blocks) in networks {
-        let state_service = service_fn(|_| async { unreachable!("Service should not be called") });
-        let script_verifier = script::Verifier::new(state_service);
-        let verifier = Verifier::new(network, script_verifier);
+    let blocks = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
 
-        let transaction = fake_v5_transactions_for_network(network, blocks)
-            .rev()
-            .next()
-            .expect("At least one fake V5 transaction in the test vectors");
+    let state_service = service_fn(|_| async { unreachable!("Service should not be called") });
+    let script_verifier = script::Verifier::new(state_service);
+    let verifier = Verifier::new(network, script_verifier);
 
-        let expected_hash = transaction.unmined_id();
+    let transaction = fake_v5_transactions_for_network(network, blocks)
+        .rev()
+        .next()
+        .expect("At least one fake V5 transaction in the test vectors");
 
-        let result = verifier
-            .oneshot(Request::Block {
-                transaction: Arc::new(transaction),
-                known_utxos: Arc::new(HashMap::new()),
-                height: nu5
-                    .activation_height(network)
-                    .expect("NU5 activation height is specified"),
-            })
-            .await;
+    let expected_hash = transaction.unmined_id();
 
-        assert_eq!(result, Ok(expected_hash));
-    }
+    let fake_block_height = max(
+        nu5_activation_height,
+        transaction.expiry_height().unwrap_or(nu5_activation_height),
+    );
+
+    let result = verifier
+        .oneshot(Request::Block {
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(HashMap::new()),
+            height: fake_block_height,
+            time: chrono::MAX_DATETIME,
+        })
+        .await;
+
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        expected_hash
+    );
 }
 
 /// Test if V4 transaction with transparent funds is accepted.
@@ -286,7 +349,7 @@ async fn v4_transaction_with_transparent_transfer_is_accepted() {
         (transaction_block_height - 1).expect("fake source fund block height is too small");
 
     // Create a fake transparent transfer that should succeed
-    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true);
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true, 0);
 
     // Create a V4 transaction
     let transaction = Transaction::V4 {
@@ -310,10 +373,14 @@ async fn v4_transaction_with_transparent_transfer_is_accepted() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(known_utxos),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
-    assert_eq!(result, Ok(transaction_hash));
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        transaction_hash
+    );
 }
 
 /// Test if V4 coinbase transaction is accepted.
@@ -353,10 +420,14 @@ async fn v4_coinbase_transaction_is_accepted() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(HashMap::new()),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
-    assert_eq!(result, Ok(transaction_hash));
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        transaction_hash
+    );
 }
 
 /// Test if V4 transaction with transparent funds is rejected if the source script prevents it.
@@ -378,7 +449,7 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
         (transaction_block_height - 1).expect("fake source fund block height is too small");
 
     // Create a fake transparent transfer that should not succeed
-    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, false);
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, false, 0);
 
     // Create a V4 transaction
     let transaction = Transaction::V4 {
@@ -400,6 +471,7 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(known_utxos),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
@@ -412,11 +484,198 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     );
 }
 
+/// Test if V4 transaction with an internal double spend of transparent funds is rejected.
+#[tokio::test]
+async fn v4_transaction_with_conflicting_transparent_spend_is_rejected() {
+    let network = Network::Mainnet;
+
+    let canopy_activation_height = NetworkUpgrade::Canopy
+        .activation_height(network)
+        .expect("Canopy activation height is specified");
+
+    let transaction_block_height =
+        (canopy_activation_height + 10).expect("transaction block height is too large");
+
+    let fake_source_fund_height =
+        (transaction_block_height - 1).expect("fake source fund block height is too small");
+
+    // Create a fake transparent transfer that should succeed
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true, 0);
+
+    // Create a V4 transaction
+    let transaction = Transaction::V4 {
+        inputs: vec![input.clone(), input.clone()],
+        outputs: vec![output],
+        lock_time: LockTime::Height(block::Height(0)),
+        expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    };
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let script_verifier = script::Verifier::new(state_service);
+    let verifier = Verifier::new(network, script_verifier);
+
+    let result = verifier
+        .oneshot(Request::Block {
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(known_utxos),
+            height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
+        })
+        .await;
+
+    let expected_outpoint = input.outpoint().expect("Input should have an outpoint");
+
+    assert_eq!(
+        result,
+        Err(TransactionError::DuplicateTransparentSpend(
+            expected_outpoint
+        ))
+    );
+}
+
+/// Test if V4 transaction with a joinsplit that has duplicate nullifiers is rejected.
+#[test]
+fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+        let network_upgrade = NetworkUpgrade::Canopy;
+
+        let canopy_activation_height = NetworkUpgrade::Canopy
+            .activation_height(network)
+            .expect("Canopy activation height is specified");
+
+        let transaction_block_height =
+            (canopy_activation_height + 10).expect("transaction block height is too large");
+
+        // Create a fake Sprout join split
+        let (mut joinsplit_data, signing_key) = mock_sprout_join_split_data();
+
+        // Make both nullifiers the same inside the joinsplit transaction
+        let duplicate_nullifier = joinsplit_data.first.nullifiers[0];
+        joinsplit_data.first.nullifiers[1] = duplicate_nullifier;
+
+        // Create a V4 transaction
+        let mut transaction = Transaction::V4 {
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
+            joinsplit_data: Some(joinsplit_data),
+            sapling_shielded_data: None,
+        };
+
+        // Sign the transaction
+        let sighash = transaction.sighash(network_upgrade, HashType::ALL, None);
+
+        match &mut transaction {
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()),
+            _ => unreachable!("Mock transaction was created incorrectly"),
+        }
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let script_verifier = script::Verifier::new(state_service);
+        let verifier = Verifier::new(network, script_verifier);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(HashMap::new()),
+                height: transaction_block_height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::DuplicateSproutNullifier(
+                duplicate_nullifier
+            ))
+        );
+    });
+}
+
+/// Test if V4 transaction with duplicate nullifiers across joinsplits is rejected.
+#[test]
+fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejected() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+        let network_upgrade = NetworkUpgrade::Canopy;
+
+        let canopy_activation_height = NetworkUpgrade::Canopy
+            .activation_height(network)
+            .expect("Canopy activation height is specified");
+
+        let transaction_block_height =
+            (canopy_activation_height + 10).expect("transaction block height is too large");
+
+        // Create a fake Sprout join split
+        let (mut joinsplit_data, signing_key) = mock_sprout_join_split_data();
+
+        // Duplicate a nullifier from the created joinsplit
+        let duplicate_nullifier = joinsplit_data.first.nullifiers[1];
+
+        // Add a new joinsplit with the duplicate nullifier
+        let mut new_joinsplit = joinsplit_data.first.clone();
+        new_joinsplit.nullifiers[0] = duplicate_nullifier;
+        new_joinsplit.nullifiers[1] = sprout::note::Nullifier([2u8; 32]);
+
+        joinsplit_data.rest.push(new_joinsplit);
+
+        // Create a V4 transaction
+        let mut transaction = Transaction::V4 {
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
+            joinsplit_data: Some(joinsplit_data),
+            sapling_shielded_data: None,
+        };
+
+        // Sign the transaction
+        let sighash = transaction.sighash(network_upgrade, HashType::ALL, None);
+
+        match &mut transaction {
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()),
+            _ => unreachable!("Mock transaction was created incorrectly"),
+        }
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let script_verifier = script::Verifier::new(state_service);
+        let verifier = Verifier::new(network, script_verifier);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(HashMap::new()),
+                height: transaction_block_height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::DuplicateSproutNullifier(
+                duplicate_nullifier
+            ))
+        );
+    });
+}
+
 /// Test if V5 transaction with transparent funds is accepted.
 #[tokio::test]
-// TODO: Remove `should_panic` once the NU5 activation heights for testnet and mainnet have been
-// defined.
-#[should_panic]
 async fn v5_transaction_with_transparent_transfer_is_accepted() {
     let network = Network::Testnet;
     let network_upgrade = NetworkUpgrade::Nu5;
@@ -432,7 +691,7 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
         (transaction_block_height - 1).expect("fake source fund block height is too small");
 
     // Create a fake transparent transfer that should succeed
-    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true);
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true, 0);
 
     // Create a V5 transaction
     let transaction = Transaction::V5 {
@@ -457,17 +716,18 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(known_utxos),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
-    assert_eq!(result, Ok(transaction_hash));
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        transaction_hash
+    );
 }
 
 /// Test if V5 coinbase transaction is accepted.
 #[tokio::test]
-// TODO: Remove `should_panic` once the NU5 activation heights for testnet and mainnet have been
-// defined.
-#[should_panic]
 async fn v5_coinbase_transaction_is_accepted() {
     let network = Network::Testnet;
     let network_upgrade = NetworkUpgrade::Nu5;
@@ -506,10 +766,14 @@ async fn v5_coinbase_transaction_is_accepted() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(known_utxos),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
-    assert_eq!(result, Ok(transaction_hash));
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        transaction_hash
+    );
 }
 
 /// Test if V5 transaction with transparent funds is rejected if the source script prevents it.
@@ -517,9 +781,6 @@ async fn v5_coinbase_transaction_is_accepted() {
 /// This test simulates the case where the script verifier rejects the transaction because the
 /// script prevents spending the source UTXO.
 #[tokio::test]
-// TODO: Remove `should_panic` once the NU5 activation heights for testnet and mainnet have been
-// defined.
-#[should_panic]
 async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     let network = Network::Testnet;
     let network_upgrade = NetworkUpgrade::Nu5;
@@ -535,7 +796,7 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
         (transaction_block_height - 1).expect("fake source fund block height is too small");
 
     // Create a fake transparent transfer that should not succeed
-    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, false);
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, false, 0);
 
     // Create a V5 transaction
     let transaction = Transaction::V5 {
@@ -558,13 +819,69 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
             transaction: Arc::new(transaction),
             known_utxos: Arc::new(known_utxos),
             height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
         })
         .await;
 
     assert_eq!(
         result,
         Err(TransactionError::InternalDowncastError(
-            "downcast to redjubjub::Error failed, original error: ScriptInvalid".to_string()
+            "downcast to known transaction error type failed, original error: ScriptInvalid"
+                .to_string()
+        ))
+    );
+}
+
+/// Test if V5 transaction with an internal double spend of transparent funds is rejected.
+#[tokio::test]
+async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
+    let network = Network::Mainnet;
+    let network_upgrade = NetworkUpgrade::Nu5;
+
+    let canopy_activation_height = NetworkUpgrade::Canopy
+        .activation_height(network)
+        .expect("Canopy activation height is specified");
+
+    let transaction_block_height =
+        (canopy_activation_height + 10).expect("transaction block height is too large");
+
+    let fake_source_fund_height =
+        (transaction_block_height - 1).expect("fake source fund block height is too small");
+
+    // Create a fake transparent transfer that should succeed
+    let (input, output, known_utxos) = mock_transparent_transfer(fake_source_fund_height, true, 0);
+
+    // Create a V4 transaction
+    let transaction = Transaction::V5 {
+        inputs: vec![input.clone(), input.clone()],
+        outputs: vec![output],
+        lock_time: LockTime::Height(block::Height(0)),
+        expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        network_upgrade,
+    };
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let script_verifier = script::Verifier::new(state_service);
+    let verifier = Verifier::new(network, script_verifier);
+
+    let result = verifier
+        .oneshot(Request::Block {
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(known_utxos),
+            height: transaction_block_height,
+            time: chrono::MAX_DATETIME,
+        })
+        .await;
+
+    let expected_outpoint = input.outpoint().expect("Input should have an outpoint");
+
+    assert_eq!(
+        result,
+        Err(TransactionError::DuplicateTransparentSpend(
+            expected_outpoint
         ))
     );
 }
@@ -578,118 +895,110 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
     zebra_test::init();
     zebra_test::RUNTIME.block_on(async {
         let network = Network::Mainnet;
-        let network_upgrade = NetworkUpgrade::Canopy;
 
-        let canopy_activation_height = network_upgrade
-            .activation_height(network)
-            .expect("Canopy activation height is not set");
-
-        let transaction_block_height =
-            (canopy_activation_height + 10).expect("Canopy activation height is too large");
-
-        // Initialize the verifier
-        let state_service =
-            service_fn(|_| async { unreachable!("State service should not be called") });
-        let script_verifier = script::Verifier::new(state_service);
-        let verifier = Verifier::new(network, script_verifier);
-
-        // Create a fake Sprout join split
-        let (joinsplit_data, signing_key) = mock_sprout_join_split_data();
-
-        let mut transaction = Transaction::V4 {
-            inputs: vec![],
-            outputs: vec![],
-            lock_time: LockTime::Height(block::Height(0)),
-            expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
-            sapling_shielded_data: None,
-        };
-
-        // Sign the transaction
-        let sighash = transaction.sighash(network_upgrade, HashType::ALL, None);
-
-        match &mut transaction {
-            Transaction::V4 {
-                joinsplit_data: Some(joinsplit_data),
-                ..
-            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()),
-            _ => unreachable!("Mock transaction was created incorrectly"),
-        }
+        let (height, transaction) = test_transactions(network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.has_valid_coinbase_transaction_inputs()
+                    && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| transaction.sprout_groth16_joinsplits().next().is_some())
+            .expect("No transaction found with Groth16 JoinSplits");
 
         let expected_hash = transaction.unmined_id();
 
-        // Test the transaction verifier
-        let result = verifier
-            .clone()
-            .oneshot(Request::Block {
-                transaction: Arc::new(transaction),
-                known_utxos: Arc::new(HashMap::new()),
-                height: transaction_block_height,
-            })
-            .await;
-
-        assert_eq!(result, Ok(expected_hash));
-    });
-}
-
-/// Test if an unsigned V4 transaction with a dummy [`sprout::JoinSplit`] is rejected.
-///
-/// This test verifies if the transaction verifier correctly rejects the transaction because of the
-/// invalid signature.
-#[test]
-fn v4_with_unsigned_sprout_transfer_is_rejected() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
-        let network = Network::Mainnet;
-        let network_upgrade = NetworkUpgrade::Canopy;
-
-        let canopy_activation_height = network_upgrade
-            .activation_height(network)
-            .expect("Canopy activation height is not set");
-
-        let transaction_block_height =
-            (canopy_activation_height + 10).expect("Canopy activation height is too large");
-
         // Initialize the verifier
         let state_service =
             service_fn(|_| async { unreachable!("State service should not be called") });
         let script_verifier = script::Verifier::new(state_service);
         let verifier = Verifier::new(network, script_verifier);
 
-        // Create a fake Sprout join split
-        let (joinsplit_data, _) = mock_sprout_join_split_data();
-
-        let transaction = Transaction::V4 {
-            inputs: vec![],
-            outputs: vec![],
-            lock_time: LockTime::Height(block::Height(0)),
-            expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
-            sapling_shielded_data: None,
-        };
-
         // Test the transaction verifier
         let result = verifier
             .clone()
             .oneshot(Request::Block {
-                transaction: Arc::new(transaction),
+                transaction,
                 known_utxos: Arc::new(HashMap::new()),
-                height: transaction_block_height,
+                height,
+                time: chrono::MAX_DATETIME,
             })
             .await;
 
         assert_eq!(
-            result,
-            Err(
-                // TODO: Fix error downcast
-                // Err(TransactionError::Ed25519(ed25519::Error::InvalidSignature))
-                TransactionError::InternalDowncastError(
-                    "downcast to known transaction error type failed, original error: InvalidSignature"
-                        .to_string(),
-                )
-            )
+            result.expect("unexpected error response").tx_id(),
+            expected_hash
         );
     });
+}
+
+/// Test if an V4 transaction with a modified [`sprout::JoinSplit`] is rejected.
+///
+/// This test verifies if the transaction verifier correctly rejects the transaction because of the
+/// invalid JoinSplit.
+#[test]
+fn v4_with_modified_joinsplit_is_rejected() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        v4_with_joinsplit_is_rejected_for_modification(
+            JoinSplitModification::CorruptSignature,
+            // TODO: Fix error downcast
+            // Err(TransactionError::Ed25519(ed25519::Error::InvalidSignature))
+            TransactionError::InternalDowncastError(
+                "downcast to known transaction error type failed, original error: InvalidSignature"
+                    .to_string(),
+            ),
+        )
+        .await;
+        v4_with_joinsplit_is_rejected_for_modification(
+            JoinSplitModification::CorruptProof,
+            TransactionError::Groth16("proof verification failed".to_string()),
+        )
+        .await;
+        v4_with_joinsplit_is_rejected_for_modification(
+            JoinSplitModification::ZeroProof,
+            TransactionError::MalformedGroth16("invalid G1".to_string()),
+        )
+        .await;
+    });
+}
+
+async fn v4_with_joinsplit_is_rejected_for_modification(
+    modification: JoinSplitModification,
+    expected_error: TransactionError,
+) {
+    let network = Network::Mainnet;
+
+    let (height, mut transaction) = test_transactions(network)
+        .rev()
+        .filter(|(_, transaction)| {
+            !transaction.has_valid_coinbase_transaction_inputs() && transaction.inputs().is_empty()
+        })
+        .find(|(_, transaction)| transaction.sprout_groth16_joinsplits().next().is_some())
+        .expect("No transaction found with Groth16 JoinSplits");
+
+    modify_joinsplit(
+        Arc::get_mut(&mut transaction).expect("Transaction only has one active reference"),
+        modification,
+    );
+
+    // Initialize the verifier
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let script_verifier = script::Verifier::new(state_service);
+    let verifier = Verifier::new(network, script_verifier);
+
+    // Test the transaction verifier
+    let result = verifier
+        .clone()
+        .oneshot(Request::Block {
+            transaction,
+            known_utxos: Arc::new(HashMap::new()),
+            height,
+            time: chrono::MAX_DATETIME,
+        })
+        .await;
+
+    assert_eq!(result, Err(expected_error));
 }
 
 /// Test if a V4 transaction with Sapling spends is accepted by the verifier.
@@ -723,10 +1032,61 @@ fn v4_with_sapling_spends() {
                 transaction,
                 known_utxos: Arc::new(HashMap::new()),
                 height,
+                time: chrono::MAX_DATETIME,
             })
             .await;
 
-        assert_eq!(result, Ok(expected_hash));
+        assert_eq!(
+            result.expect("unexpected error response").tx_id(),
+            expected_hash
+        );
+    });
+}
+
+/// Test if a V4 transaction with a duplicate Sapling spend is rejected by the verifier.
+#[test]
+fn v4_with_duplicate_sapling_spends() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.has_valid_coinbase_transaction_inputs()
+                    && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| transaction.sapling_spends_per_anchor().next().is_some())
+            .expect("No transaction found with Sapling spends");
+
+        // Duplicate one of the spends
+        let duplicate_nullifier = duplicate_sapling_spend(
+            Arc::get_mut(&mut transaction).expect("Transaction only has one active reference"),
+        );
+
+        // Initialize the verifier
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let script_verifier = script::Verifier::new(state_service);
+        let verifier = Verifier::new(network, script_verifier);
+
+        // Test the transaction verifier
+        let result = verifier
+            .clone()
+            .oneshot(Request::Block {
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::DuplicateSaplingNullifier(
+                duplicate_nullifier
+            ))
+        );
     });
 }
 
@@ -764,10 +1124,14 @@ fn v4_with_sapling_outputs_and_no_spends() {
                 transaction,
                 known_utxos: Arc::new(HashMap::new()),
                 height,
+                time: chrono::MAX_DATETIME,
             })
             .await;
 
-        assert_eq!(result, Ok(expected_hash));
+        assert_eq!(
+            result.expect("unexpected error response").tx_id(),
+            expected_hash
+        );
     });
 }
 
@@ -808,10 +1172,128 @@ fn v5_with_sapling_spends() {
                 transaction: Arc::new(transaction),
                 known_utxos: Arc::new(HashMap::new()),
                 height,
+                time: chrono::MAX_DATETIME,
             })
             .await;
 
-        assert_eq!(result, Ok(expected_hash));
+        assert_eq!(
+            result.expect("unexpected error response").tx_id(),
+            expected_hash
+        );
+    });
+}
+
+/// Test if a V5 transaction with a duplicate Sapling spend is rejected by the verifier.
+#[test]
+fn v5_with_duplicate_sapling_spends() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let mut transaction =
+            fake_v5_transactions_for_network(network, zebra_test::vectors::MAINNET_BLOCKS.iter())
+                .rev()
+                .filter(|transaction| {
+                    !transaction.has_valid_coinbase_transaction_inputs()
+                        && transaction.inputs().is_empty()
+                })
+                .find(|transaction| transaction.sapling_spends_per_anchor().next().is_some())
+                .expect("No transaction found with Sapling spends");
+
+        let height = transaction
+            .expiry_height()
+            .expect("Transaction is missing expiry height");
+
+        // Duplicate one of the spends
+        let duplicate_nullifier = duplicate_sapling_spend(&mut transaction);
+
+        // Initialize the verifier
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let script_verifier = script::Verifier::new(state_service);
+        let verifier = Verifier::new(network, script_verifier);
+
+        // Test the transaction verifier
+        let result = verifier
+            .clone()
+            .oneshot(Request::Block {
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(HashMap::new()),
+                height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::DuplicateSaplingNullifier(
+                duplicate_nullifier
+            ))
+        );
+    });
+}
+
+/// Test if a V5 transaction with a duplicate Orchard action is rejected by the verifier.
+#[test]
+fn v5_with_duplicate_orchard_action() {
+    zebra_test::init();
+    zebra_test::RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        // Find a transaction with no inputs or outputs to use as base
+        let mut transaction =
+            fake_v5_transactions_for_network(network, zebra_test::vectors::MAINNET_BLOCKS.iter())
+                .rev()
+                .find(|transaction| {
+                    transaction.inputs().is_empty()
+                        && transaction.outputs().is_empty()
+                        && transaction.sapling_spends_per_anchor().next().is_none()
+                        && transaction.sapling_outputs().next().is_none()
+                        && transaction.joinsplit_count() == 0
+                })
+                .expect("At least one fake V5 transaction with no inputs and no outputs");
+
+        let height = transaction
+            .expiry_height()
+            .expect("Transaction is missing expiry height");
+
+        // Insert fake Orchard shielded data to the transaction, which has at least one action (this is
+        // guaranteed structurally by `orchard::ShieldedData`)
+        let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+
+        // Enable spends
+        shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS
+            | zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
+
+        // Duplicate the first action
+        let duplicate_action = shielded_data.actions.first().clone();
+        let duplicate_nullifier = duplicate_action.action.nullifier;
+
+        shielded_data.actions.push(duplicate_action);
+
+        // Initialize the verifier
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let script_verifier = script::Verifier::new(state_service);
+        let verifier = Verifier::new(network, script_verifier);
+
+        // Test the transaction verifier
+        let result = verifier
+            .clone()
+            .oneshot(Request::Block {
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(HashMap::new()),
+                height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::DuplicateOrchardNullifier(
+                duplicate_nullifier
+            ))
+        );
     });
 }
 
@@ -839,6 +1321,7 @@ fn v5_with_sapling_spends() {
 fn mock_transparent_transfer(
     previous_utxo_height: block::Height,
     script_should_succeed: bool,
+    outpoint_index: u32,
 ) -> (
     transparent::Input,
     transparent::Output,
@@ -852,7 +1335,7 @@ fn mock_transparent_transfer(
     // Mock an unspent transaction output
     let previous_outpoint = transparent::OutPoint {
         hash: Hash([1u8; 32]),
-        index: 0,
+        index: outpoint_index,
     };
 
     let lock_script = if script_should_succeed {
@@ -932,11 +1415,12 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
         .try_into()
         .expect("Invalid JoinSplit transparent input");
     let anchor = sprout::tree::Root::default();
-    let nullifier = sprout::note::Nullifier([0u8; 32]);
+    let first_nullifier = sprout::note::Nullifier([0u8; 32]);
+    let second_nullifier = sprout::note::Nullifier([1u8; 32]);
     let commitment = sprout::commitment::NoteCommitment::from([0u8; 32]);
     let ephemeral_key =
         x25519::PublicKey::from(&x25519::EphemeralSecret::new(rand07::thread_rng()));
-    let random_seed = [0u8; 32];
+    let random_seed = sprout::RandomSeed::from([0u8; 32]);
     let mac = sprout::note::Mac::zcash_deserialize(&[0u8; 32][..])
         .expect("Failure to deserialize dummy MAC");
     let zkproof = Groth16Proof([0u8; 192]);
@@ -947,7 +1431,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
         vpub_old: zero_amount,
         vpub_new: zero_amount,
         anchor,
-        nullifiers: [nullifier; 2],
+        nullifiers: [first_nullifier, second_nullifier],
         commitments: [commitment; 2],
         ephemeral_key,
         random_seed,
@@ -969,6 +1453,109 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     };
 
     (joinsplit_data, signing_key)
+}
+
+/// A type of JoinSplit modification to test.
+#[derive(Clone, Copy)]
+enum JoinSplitModification {
+    // Corrupt a signature, making it invalid.
+    CorruptSignature,
+    // Corrupt a proof, making it invalid, but still well-formed.
+    CorruptProof,
+    // Make a proof all-zeroes, making it malformed.
+    ZeroProof,
+}
+
+/// Modify a JoinSplit in the transaction following the given modification type.
+fn modify_joinsplit(transaction: &mut Transaction, modification: JoinSplitModification) {
+    match transaction {
+        Transaction::V4 {
+            joinsplit_data: Some(ref mut joinsplit_data),
+            ..
+        } => modify_joinsplit_data(joinsplit_data, modification),
+        _ => unreachable!("Transaction has no JoinSplit shielded data"),
+    }
+}
+
+/// Modify a [`JoinSplitData`] following the given modification type.
+fn modify_joinsplit_data(
+    joinsplit_data: &mut JoinSplitData<Groth16Proof>,
+    modification: JoinSplitModification,
+) {
+    match modification {
+        JoinSplitModification::CorruptSignature => {
+            let mut sig_bytes: [u8; 64] = joinsplit_data.sig.into();
+            // Flip a bit from an arbitrary byte of the signature.
+            sig_bytes[10] ^= 0x01;
+            joinsplit_data.sig = sig_bytes.into();
+        }
+        JoinSplitModification::CorruptProof => {
+            let joinsplit = joinsplit_data
+                .joinsplits_mut()
+                .next()
+                .expect("must have a JoinSplit");
+            {
+                // A proof is composed of three field elements, the first and last having 48 bytes.
+                // (The middle one has 96 bytes.) To corrupt the proof without making it malformed,
+                // simply swap those first and last elements.
+                let (first, rest) = joinsplit.zkproof.0.split_at_mut(48);
+                first.swap_with_slice(&mut rest[96..144]);
+            }
+        }
+        JoinSplitModification::ZeroProof => {
+            let joinsplit = joinsplit_data
+                .joinsplits_mut()
+                .next()
+                .expect("must have a JoinSplit");
+            joinsplit.zkproof.0 = [0; 192];
+        }
+    }
+}
+
+/// Duplicate a Sapling spend inside a `transaction`.
+///
+/// Returns the nullifier of the duplicate spend.
+///
+/// # Panics
+///
+/// Will panic if the `transaction` does not have Sapling spends.
+fn duplicate_sapling_spend(transaction: &mut Transaction) -> sapling::Nullifier {
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(ref mut shielded_data),
+            ..
+        } => duplicate_sapling_spend_in_shielded_data(shielded_data),
+        Transaction::V5 {
+            sapling_shielded_data: Some(ref mut shielded_data),
+            ..
+        } => duplicate_sapling_spend_in_shielded_data(shielded_data),
+        _ => unreachable!("Transaction has no Sapling shielded data"),
+    }
+}
+
+/// Duplicates the first spend of the `shielded_data`.
+///
+/// Returns the nullifier of the duplicate spend.
+///
+/// # Panics
+///
+/// Will panic if `shielded_data` has no spends.
+fn duplicate_sapling_spend_in_shielded_data<A: sapling::AnchorVariant + Clone>(
+    shielded_data: &mut sapling::ShieldedData<A>,
+) -> sapling::Nullifier {
+    match shielded_data.transfers {
+        sapling::TransferData::SpendsAndMaybeOutputs { ref mut spends, .. } => {
+            let duplicate_spend = spends.first().clone();
+            let duplicate_nullifier = duplicate_spend.nullifier;
+
+            spends.push(duplicate_spend);
+
+            duplicate_nullifier
+        }
+        sapling::TransferData::JustOutputs { .. } => {
+            unreachable!("Sapling shielded data has no spends")
+        }
+    }
 }
 
 #[test]
@@ -1027,4 +1614,176 @@ fn add_to_sprout_pool_after_nu() {
         check::disabled_add_to_sprout_pool(&block.transactions[7], block_height, network),
         Ok(())
     );
+}
+
+#[test]
+fn coinbase_outputs_are_decryptable_for_historical_blocks() -> Result<(), Report> {
+    zebra_test::init();
+
+    coinbase_outputs_are_decryptable_for_historical_blocks_for_network(Network::Mainnet)?;
+    coinbase_outputs_are_decryptable_for_historical_blocks_for_network(Network::Testnet)?;
+
+    Ok(())
+}
+
+fn coinbase_outputs_are_decryptable_for_historical_blocks_for_network(
+    network: Network,
+) -> Result<(), Report> {
+    let block_iter = match network {
+        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+    };
+
+    let mut tested_coinbase_txs = 0;
+    let mut tested_non_coinbase_txs = 0;
+
+    for (height, block) in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+        let height = Height(*height);
+        let heartwood_onward = height
+            >= NetworkUpgrade::Heartwood
+                .activation_height(network)
+                .unwrap();
+        let coinbase_tx = block
+            .transactions
+            .get(0)
+            .expect("must have coinbase transaction");
+
+        // Check if the coinbase outputs are decryptable with an all-zero key.
+        if heartwood_onward
+            && (coinbase_tx.sapling_outputs().count() > 0
+                || coinbase_tx.orchard_actions().count() > 0)
+        {
+            // We are only truly decrypting something if it's Heartwood-onward
+            // and there are relevant outputs.
+            tested_coinbase_txs += 1;
+        }
+        check::coinbase_outputs_are_decryptable(coinbase_tx, network, height)
+            .expect("coinbase outputs must be decryptable with an all-zero key");
+
+        // For remaining transactions, check if existing outputs are NOT decryptable
+        // with an all-zero key, if applicable.
+        for tx in block.transactions.iter().skip(1) {
+            let has_outputs = tx.sapling_outputs().count() > 0 || tx.orchard_actions().count() > 0;
+            if has_outputs && heartwood_onward {
+                tested_non_coinbase_txs += 1;
+                check::coinbase_outputs_are_decryptable(tx, network, height).expect_err(
+                    "decrypting a non-coinbase output with an all-zero key should fail",
+                );
+            } else {
+                check::coinbase_outputs_are_decryptable(tx, network, height)
+                    .expect("a transaction without outputs, or pre-Heartwood, must be considered 'decryptable'");
+            }
+        }
+    }
+
+    assert!(tested_coinbase_txs > 0, "ensure it was actually tested");
+    assert!(tested_non_coinbase_txs > 0, "ensure it was actually tested");
+
+    Ok(())
+}
+
+/// Given an Orchard action as a base, fill fields related to note encryption
+/// from the given test vector and returned the modified action.
+fn fill_action_with_note_encryption_test_vector(
+    action: &zebra_chain::orchard::Action,
+    v: &zebra_test::vectors::TestVector,
+) -> zebra_chain::orchard::Action {
+    let mut action = action.clone();
+    action.cv = v.cv_net.try_into().expect("test vector must be valid");
+    action.cm_x = pallas::Base::from_bytes(&v.cmx).unwrap();
+    action.nullifier = v.rho.try_into().expect("test vector must be valid");
+    action.ephemeral_key = v
+        .ephemeral_key
+        .try_into()
+        .expect("test vector must be valid");
+    action.out_ciphertext = v.c_out.into();
+    action.enc_ciphertext = v.c_enc.into();
+    action
+}
+
+/// Test if shielded coinbase outputs are decryptable with an all-zero outgoing
+/// viewing key.
+#[test]
+fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
+    let network = Network::Testnet;
+
+    for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter() {
+        // Find a transaction with no inputs or outputs to use as base
+        let mut transaction =
+            fake_v5_transactions_for_network(network, zebra_test::vectors::TESTNET_BLOCKS.iter())
+                .rev()
+                .find(|transaction| {
+                    transaction.inputs().is_empty()
+                        && transaction.outputs().is_empty()
+                        && transaction.sapling_spends_per_anchor().next().is_none()
+                        && transaction.sapling_outputs().next().is_none()
+                        && transaction.joinsplit_count() == 0
+                })
+                .expect("At least one fake V5 transaction with no inputs and no outputs");
+
+        let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+        shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS
+            | zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
+
+        let action =
+            fill_action_with_note_encryption_test_vector(&shielded_data.actions[0].action, v);
+        let sig = shielded_data.actions[0].spend_auth_sig;
+        shielded_data.actions = vec![AuthorizedAction::from_parts(action, sig)]
+            .try_into()
+            .unwrap();
+
+        assert_eq!(
+            check::coinbase_outputs_are_decryptable(
+                &transaction,
+                network,
+                NetworkUpgrade::Nu5.activation_height(network).unwrap(),
+            ),
+            Ok(())
+        );
+    }
+}
+
+/// Test if random shielded outputs are NOT decryptable with an all-zero outgoing
+/// viewing key.
+#[test]
+fn shielded_outputs_are_not_decryptable_for_fake_v5_blocks() {
+    let network = Network::Testnet;
+
+    for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_VECTOR.iter() {
+        // Find a transaction with no inputs or outputs to use as base
+        let mut transaction =
+            fake_v5_transactions_for_network(network, zebra_test::vectors::TESTNET_BLOCKS.iter())
+                .rev()
+                .find(|transaction| {
+                    transaction.inputs().is_empty()
+                        && transaction.outputs().is_empty()
+                        && transaction.sapling_spends_per_anchor().next().is_none()
+                        && transaction.sapling_outputs().next().is_none()
+                        && transaction.joinsplit_count() == 0
+                })
+                .expect("At least one fake V5 transaction with no inputs and no outputs");
+
+        let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
+        shielded_data.flags = zebra_chain::orchard::Flags::ENABLE_SPENDS
+            | zebra_chain::orchard::Flags::ENABLE_OUTPUTS;
+
+        let action =
+            fill_action_with_note_encryption_test_vector(&shielded_data.actions[0].action, v);
+        let sig = shielded_data.actions[0].spend_auth_sig;
+        shielded_data.actions = vec![AuthorizedAction::from_parts(action, sig)]
+            .try_into()
+            .unwrap();
+
+        assert_eq!(
+            check::coinbase_outputs_are_decryptable(
+                &transaction,
+                network,
+                NetworkUpgrade::Nu5.activation_height(network).unwrap(),
+            ),
+            Err(TransactionError::CoinbaseOutputsNotDecryptable)
+        );
+    }
 }

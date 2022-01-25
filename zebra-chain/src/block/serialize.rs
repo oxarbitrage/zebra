@@ -5,8 +5,7 @@ use chrono::{TimeZone, Utc};
 
 use crate::{
     serialization::{
-        ReadZcashExt, SerializationError, WriteZcashExt, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashSerialize,
+        ReadZcashExt, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
     work::{difficulty::CompactDifficulty, equihash},
 };
@@ -68,6 +67,12 @@ impl ZcashDeserialize for Header {
                 "high bit was set in version field",
             ));
         }
+
+        // # Consensus
+        //
+        // > The block version number MUST be greater than or equal to 4.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#blockheader
         if version < 4 {
             return Err(SerializationError::Parse("version must be at least 4"));
         }
@@ -89,7 +94,7 @@ impl ZcashDeserialize for Header {
 impl ZcashSerialize for CountedHeader {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         self.header.zcash_serialize(&mut writer)?;
-        writer.write_compactsize(self.transaction_count as u64)?;
+        self.transaction_count.zcash_serialize(&mut writer)?;
         Ok(())
     }
 }
@@ -98,7 +103,7 @@ impl ZcashDeserialize for CountedHeader {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         Ok(CountedHeader {
             header: (&mut reader).zcash_deserialize_into()?,
-            transaction_count: reader.read_compactsize()?.try_into().unwrap(),
+            transaction_count: (&mut reader).zcash_deserialize_into()?,
         })
     }
 }
@@ -116,6 +121,12 @@ impl ZcashSerialize for Block {
 
 impl ZcashDeserialize for Block {
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+        // # Consensus
+        //
+        // > The size of a block MUST be less than or equal to 2000000 bytes.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#blockheader
+        //
         // If the limit is reached, we'll get an UnexpectedEof error
         let limited_reader = &mut reader.take(MAX_BLOCK_BYTES);
         Ok(Block {

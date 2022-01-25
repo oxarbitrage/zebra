@@ -22,6 +22,7 @@ use std::{
 use displaydoc::Display;
 use futures::{FutureExt, TryFutureExt};
 use thiserror::Error;
+use tokio::task::{spawn_blocking, JoinHandle};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 use tracing::instrument;
 
@@ -75,9 +76,18 @@ where
         + 'static,
     V::Future: Send + 'static,
 {
-    block: BlockVerifier<S, V>,
+    /// The checkpointing block verifier.
+    ///
+    /// Always used for blocks before `Canopy`, optionally used for the entire checkpoint list.
     checkpoint: CheckpointVerifier<S>,
+
+    /// The highest permitted checkpoint block.
+    ///
+    /// This height must be in the `checkpoint` verifier's checkpoint list.
     max_checkpoint_height: block::Height,
+
+    /// The full block verifier, used for blocks after `max_checkpoint_height`.
+    block: BlockVerifier<S, V>,
 }
 
 /// An error while semantically verifying a block.
@@ -148,7 +158,12 @@ where
     }
 }
 
-/// Initialize block and transaction verification services.
+/// Initialize block and transaction verification services,
+/// and pre-download Groth16 parameters if requested by the `debug_skip_parameter_preload`
+/// config parameter and if the download is not already started.
+///
+/// Returns a block verifier, transaction verifier,
+/// and the Groth16 parameter download task [`JoinHandle`].
 ///
 /// The consensus configuration is specified by `config`, and the Zcash network
 /// to verify blocks for is specified by `network`.
@@ -159,6 +174,12 @@ where
 ///
 /// The transaction verification service asynchronously performs semantic verification
 /// checks. Transactions that pass semantic verification return an `Ok` result to the caller.
+///
+/// Pre-downloads the Sapling and Sprout Groth16 parameters if needed,
+/// checks they were downloaded correctly, and loads them into Zebra.
+/// (The transaction verifier automatically downloads the parameters on first use.
+/// But the parameter downloads can take around 10 minutes.
+/// So we pre-download the parameters, to avoid verification timeouts.)
 ///
 /// This function should only be called once for a particular state service.
 ///
@@ -174,17 +195,35 @@ pub async fn init<S>(
     config: Config,
     network: Network,
     mut state_service: S,
+    debug_skip_parameter_preload: bool,
 ) -> (
     Buffer<BoxService<Arc<Block>, block::Hash, VerifyChainError>, Arc<Block>>,
     Buffer<
         BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
     >,
+    JoinHandle<()>,
 )
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
+    // Pre-download Groth16 parameters in a separate thread.
+
+    // Give other tasks priority, before spawning the download task.
+    tokio::task::yield_now().await;
+
+    // The parameter download thread must be launched before initializing any verifiers.
+    // Otherwise, the download might happen on the startup thread.
+    let groth16_download_handle = spawn_blocking(move || {
+        if !debug_skip_parameter_preload {
+            // The lazy static initializer does the download, if needed,
+            // and the file hash checks.
+            lazy_static::initialize(&crate::groth16::GROTH16_PARAMETERS);
+            tracing::info!("Groth16 pre-download and check task finished");
+        }
+    });
+
     // transaction verification
 
     let script = script::Verifier::new(state_service.clone());
@@ -203,7 +242,7 @@ where
     };
 
     let tip = match state_service
-        .ready_and()
+        .ready()
         .await
         .unwrap()
         .call(zs::Request::Tip)
@@ -218,12 +257,12 @@ where
     let block = BlockVerifier::new(network, state_service.clone(), transaction.clone());
     let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
     let chain = ChainVerifier {
-        block,
         checkpoint,
         max_checkpoint_height,
+        block,
     };
 
     let chain = Buffer::new(BoxService::new(chain), VERIFIER_BUFFER_BOUND);
 
-    (chain, transaction)
+    (chain, transaction, groth16_download_handle)
 }

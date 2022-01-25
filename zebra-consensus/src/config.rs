@@ -12,12 +12,18 @@ pub struct Config {
     /// Future versions of Zebra may change the mandatory checkpoint
     /// height.
     pub checkpoint_sync: bool,
+    /// Skip the pre-download of Groth16 parameters if this option is true.
+    pub debug_skip_parameter_preload: bool,
 }
 
+// we like our default configs to be explicit
+#[allow(unknown_lints)]
+#[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Self {
         Self {
             checkpoint_sync: false,
+            debug_skip_parameter_preload: false,
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Definitions of network messages.
 
-use std::{error::Error, fmt, net, sync::Arc};
+use std::{error::Error, fmt, sync::Arc};
 
 use chrono::{DateTime, Utc};
 
@@ -11,7 +11,7 @@ use zebra_chain::{
 
 use crate::meta_addr::MetaAddr;
 
-use super::{inv::InventoryHash, types::*};
+use super::{addr::AddrInVersion, inv::InventoryHash, types::*};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -65,11 +65,11 @@ pub enum Message {
         /// advertised network services.
         ///
         /// Q: how does the handshake know the remote peer's services already?
-        address_recv: (PeerServices, net::SocketAddr),
+        address_recv: AddrInVersion,
 
         /// The network address of the node sending this message, and its
         /// advertised network services.
-        address_from: (PeerServices, net::SocketAddr),
+        address_from: AddrInVersion,
 
         /// Node random nonce, randomly generated every time a version
         /// packet is sent. This nonce is used to detect connections
@@ -84,6 +84,11 @@ pub enum Message {
 
         /// Whether the remote peer should announce relayed
         /// transactions or not, see [BIP 0037](https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki)
+        ///
+        /// Zebra does not implement the bloom filters in BIP 0037.
+        /// Instead, it only relays:
+        /// - newly verified best chain block hashes and mempool transaction IDs,
+        /// - after it reaches the chain tip.
         relay: bool,
     },
 
@@ -127,9 +132,6 @@ pub enum Message {
         // Currently, all errors which provide this field fill it with
         // the TXID or block header hash of the object being rejected,
         // so the field is 32 bytes.
-        //
-        // Q: can we tell Rust that this field is optional? Or just
-        // default its value to an empty array, I guess.
         data: Option<[u8; 32]>,
     },
 
@@ -138,9 +140,21 @@ pub enum Message {
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#getaddr)
     GetAddr,
 
-    /// An `addr` message.
+    /// A sent or received `addr` message, or a received `addrv2` message.
     ///
-    /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#addr)
+    /// Currently, Zebra:
+    /// - sends and receives `addr` messages,
+    /// - parses received `addrv2` messages, ignoring some address types,
+    /// - but does not send `addrv2` messages.
+    ///
+    ///
+    /// The list contains `0..=MAX_META_ADDR` addresses.
+    ///
+    /// Because some address types are ignored, the deserialized vector can be empty,
+    /// even if the peer sent addresses. This is not an error.
+    ///
+    /// [addr Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#addr)
+    /// [addrv2 ZIP 155](https://zips.z.cash/zip-0155#specification)
     Addr(Vec<MetaAddr>),
 
     /// A `getblocks` message.
@@ -153,6 +167,8 @@ pub enum Message {
     /// The peer responds with an `inv` packet with the hashes of subsequent blocks.
     /// If supplied, the `stop` parameter specifies the last header to request.
     /// Otherwise, an inv packet with the maximum number (500) are sent.
+    ///
+    /// The known blocks list contains zero or more block hashes.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#getheaders)
     GetBlocks {
@@ -167,6 +183,8 @@ pub enum Message {
     /// Allows a node to advertise its knowledge of one or more
     /// objects. It can be received unsolicited, or in reply to
     /// `getblocks`.
+    ///
+    /// The list contains zero or more inventory hashes.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#inv)
     /// [ZIP-239](https://zips.z.cash/zip-0239)
@@ -183,6 +201,8 @@ pub enum Message {
     /// If supplied, the `stop` parameter specifies the last header to request.
     /// Otherwise, the maximum number of block headers (160) are sent.
     ///
+    /// The known blocks list contains zero or more block hashes.
+    ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#getheaders)
     GetHeaders {
         /// Hashes of known blocks, ordered from highest height to lowest height.
@@ -197,6 +217,8 @@ pub enum Message {
     ///
     /// Each block header is accompanied by a transaction count.
     ///
+    /// The list contains zero or more headers.
+    ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#headers)
     Headers(Vec<block::CountedHeader>),
 
@@ -210,6 +232,8 @@ pub enum Message {
     /// Missing blocks are silently skipped. Missing transaction hashes are
     /// included in a single `NotFound` message following the transactions.
     /// Other item or non-item messages can come before or after the batch.
+    ///
+    /// The list contains zero or more inventory hashes.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#getdata)
     /// [ZIP-239](https://zips.z.cash/zip-0239)
@@ -238,6 +262,8 @@ pub enum Message {
     /// But when a peer requests blocks or headers, any missing items are
     /// silently skipped, without any `NotFound` messages.
     ///
+    /// The list contains zero or more inventory hashes.
+    ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#notfound)
     /// [ZIP-239](https://zips.z.cash/zip-0239)
     /// [zcashd code](https://github.com/zcash/zcash/blob/e7b425298f6d9a54810cb7183f00be547e4d9415/src/main.cpp#L5632)
@@ -255,6 +281,8 @@ pub enum Message {
     /// A `filterload` message.
     ///
     /// This was defined in [BIP37], which is included in Zcash.
+    ///
+    /// Zebra currently ignores this message.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
     /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
@@ -279,6 +307,8 @@ pub enum Message {
     ///
     /// This was defined in [BIP37], which is included in Zcash.
     ///
+    /// Zebra currently ignores this message.
+    ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
     /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
     FilterAdd {
@@ -294,6 +324,8 @@ pub enum Message {
     /// A `filterclear` message.
     ///
     /// This was defined in [BIP37], which is included in Zcash.
+    ///
+    /// Zebra currently ignores this message.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
     /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
@@ -341,7 +373,80 @@ pub enum RejectReason {
 
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
+        f.write_str(&match self {
+            Message::Version {
+                version,
+                address_recv,
+                address_from,
+                user_agent,
+                ..
+            } => format!(
+                "version {{ network: {}, recv: {},_from: {}, user_agent: {:?} }}",
+                version,
+                address_recv.addr(),
+                address_from.addr(),
+                user_agent,
+            ),
+            Message::Verack => "verack".to_string(),
+
+            Message::Ping(_) => "ping".to_string(),
+            Message::Pong(_) => "pong".to_string(),
+
+            Message::Reject {
+                message,
+                reason,
+                data,
+                ..
+            } => format!(
+                "reject {{ message: {:?}, reason: {:?}, data: {} }}",
+                message,
+                reason,
+                if data.is_some() { "Some" } else { "None" },
+            ),
+
+            Message::GetAddr => "getaddr".to_string(),
+            Message::Addr(addrs) => format!("addr {{ addrs: {} }}", addrs.len()),
+
+            Message::GetBlocks { known_blocks, stop } => format!(
+                "getblocks {{ known_blocks: {}, stop: {} }}",
+                known_blocks.len(),
+                if stop.is_some() { "Some" } else { "None" },
+            ),
+            Message::Inv(invs) => format!("inv {{ invs: {} }}", invs.len()),
+
+            Message::GetHeaders { known_blocks, stop } => format!(
+                "getheaders {{ known_blocks: {}, stop: {} }}",
+                known_blocks.len(),
+                if stop.is_some() { "Some" } else { "None" },
+            ),
+            Message::Headers(headers) => format!("headers {{ headers: {} }}", headers.len()),
+
+            Message::GetData(invs) => format!("getdata {{ invs: {} }}", invs.len()),
+            Message::Block(block) => format!(
+                "block {{ height: {}, hash: {} }}",
+                block
+                    .coinbase_height()
+                    .as_ref()
+                    .map(|h| h.0.to_string())
+                    .unwrap_or_else(|| "None".into()),
+                block.hash(),
+            ),
+            Message::Tx(_) => "tx".to_string(),
+            Message::NotFound(invs) => format!("notfound {{ invs: {} }}", invs.len()),
+
+            Message::Mempool => "mempool".to_string(),
+
+            Message::FilterLoad { .. } => "filterload".to_string(),
+            Message::FilterAdd { .. } => "filteradd".to_string(),
+            Message::FilterClear => "filterclear".to_string(),
+        })
+    }
+}
+
+impl Message {
+    /// Returns the Zcash protocol message command as a string.
+    pub fn command(&self) -> &'static str {
+        match self {
             Message::Version { .. } => "version",
             Message::Verack => "verack",
             Message::Ping(_) => "ping",
@@ -361,6 +466,6 @@ impl fmt::Display for Message {
             Message::FilterLoad { .. } => "filterload",
             Message::FilterAdd { .. } => "filteradd",
             Message::FilterClear => "filterclear",
-        })
+        }
     }
 }

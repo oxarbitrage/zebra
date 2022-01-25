@@ -1,8 +1,10 @@
 //! Consensus check functions
 
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 
 use zebra_chain::{
+    amount::{Amount, Error as AmountError, NonNegative},
     block::{Block, Hash, Header, Height},
     parameters::{Network, NetworkUpgrade},
     transaction,
@@ -69,13 +71,13 @@ pub fn difficulty_is_valid(
         ))?;
     }
 
-    // The difficulty filter is also context-free.
+    // # Consensus
     //
-    // ZIP 205 and ZIP 208 incorrectly describe testnet minimum difficulty blocks
-    // as a change to the difficulty filter. But in `zcashd`, it is implemented
-    // as a change to the difficulty adjustment algorithm. So we don't need to
-    // do anything special for testnet here.
-    // For details, see https://github.com/zcash/zips/issues/416
+    // > The block MUST pass the difficulty filter.
+    //
+    // https://zips.z.cash/protocol/protocol.pdf#blockheader
+    //
+    // The difficulty filter is also context-free.
     if hash > &difficulty_threshold {
         Err(BlockError::DifficultyFilter(
             *height,
@@ -90,24 +92,27 @@ pub fn difficulty_is_valid(
 
 /// Returns `Ok(())` if the `EquihashSolution` is valid for `header`
 pub fn equihash_solution_is_valid(header: &Header) -> Result<(), equihash::Error> {
+    // # Consensus
+    //
+    // > `solution` MUST represent a valid Equihash solution.
+    //
+    // https://zips.z.cash/protocol/protocol.pdf#blockheader
     header.solution.check(header)
 }
 
-/// Returns `Ok(())` if the block subsidy and miner fees in `block` are valid for `network`
+/// Returns `Ok(())` if the block subsidy in `block` is valid for `network`
 ///
 /// [3.9]: https://zips.z.cash/protocol/protocol.pdf#subsidyconcepts
 pub fn subsidy_is_valid(block: &Block, network: Network) -> Result<(), BlockError> {
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
     let coinbase = block.transactions.get(0).ok_or(SubsidyError::NoCoinbase)?;
 
+    // Validate founders reward and funding streams
     let halving_div = subsidy::general::halving_divisor(height, network);
     let canopy_activation_height = NetworkUpgrade::Canopy
         .activation_height(network)
         .expect("Canopy activation height is known");
 
-    // TODO: the sum of the coinbase transaction outputs must be less than or equal to the block subsidy plus transaction fees
-
-    // Check founders reward and funding streams
     if height < SLOW_START_INTERVAL {
         unreachable!(
             "unsupported block height: callers should handle blocks below {:?}",
@@ -131,13 +136,76 @@ pub fn subsidy_is_valid(block: &Block, network: Network) -> Result<(), BlockErro
         // Funding streams are paid from Canopy activation to the second halving
         // Note: Canopy activation is at the first halving on mainnet, but not on testnet
         // ZIP-1014 only applies to mainnet, ZIP-214 contains the specific rules for testnet
-        tracing::trace!("funding stream block subsidy validation is not implemented");
-        // Return ok for now
+        // funding stream amount values
+        let funding_streams = subsidy::funding_streams::funding_stream_values(height, network)
+            .expect("We always expect a funding stream hashmap response even if empty");
+
+        // # Consensus
+        //
+        // > [Canopy onward] The coinbase transaction at block height `height`
+        // > MUST contain at least one output per funding stream `fs` active at `height`,
+        // > that pays `fs.Value(height)` zatoshi in the prescribed way to the stream's
+        // > recipient address represented by `fs.AddressList[fs.AddressIndex(height)]
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#fundingstreams
+        for (receiver, expected_amount) in funding_streams {
+            let address =
+                subsidy::funding_streams::funding_stream_address(height, network, receiver);
+
+            let has_expected_output =
+                subsidy::funding_streams::filter_outputs_by_address(coinbase, address)
+                    .iter()
+                    .map(zebra_chain::transparent::Output::value)
+                    .any(|value| value == expected_amount);
+
+            if !has_expected_output {
+                Err(SubsidyError::FundingStreamNotFound)?;
+            }
+        }
         Ok(())
     } else {
         // Future halving, with no founders reward or funding streams
         Ok(())
     }
+}
+
+/// Returns `Ok(())` if the miner fees consensus rule is valid.
+///
+/// [7.1.2]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+pub fn miner_fees_are_valid(
+    block: &Block,
+    network: Network,
+    block_miner_fees: Amount<NonNegative>,
+) -> Result<(), BlockError> {
+    let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
+    let coinbase = block.transactions.get(0).ok_or(SubsidyError::NoCoinbase)?;
+
+    let transparent_value_balance: Amount = subsidy::general::output_amounts(coinbase)
+        .iter()
+        .sum::<Result<Amount<NonNegative>, AmountError>>()
+        .map_err(|_| SubsidyError::SumOverflow)?
+        .constrain()
+        .expect("positive value always fit in `NegativeAllowed`");
+    let sapling_value_balance = coinbase.sapling_value_balance().sapling_amount();
+    let orchard_value_balance = coinbase.orchard_value_balance().orchard_amount();
+
+    let block_subsidy = subsidy::general::block_subsidy(height, network)
+        .expect("a valid block subsidy for this height and network");
+
+    // Consensus rule: The total value in zatoshi of transparent outputs from a
+    // coinbase transaction, minus vbalanceSapling, minus vbalanceOrchard, MUST NOT
+    // be greater than the value in zatoshi of block subsidy plus the transaction fees
+    // paid by transactions in this block.
+    // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+    let left = (transparent_value_balance - sapling_value_balance - orchard_value_balance)
+        .map_err(|_| SubsidyError::SumOverflow)?;
+    let right = (block_subsidy + block_miner_fees).map_err(|_| SubsidyError::SumOverflow)?;
+
+    if left > right {
+        return Err(SubsidyError::InvalidMinerFees)?;
+    }
+
+    Ok(())
 }
 
 /// Returns `Ok(())` if `header.time` is less than or equal to
@@ -172,7 +240,7 @@ pub fn time_is_valid_at(
 /// # Consensus rules:
 ///
 /// - The nConsensusBranchId field MUST match the consensus branch ID used for
-///  SIGHASH transaction hashes, as specifed in [ZIP-244] ([7.1]).
+///  SIGHASH transaction hashes, as specified in [ZIP-244] ([7.1]).
 /// - A SHA-256d hash in internal byte order. The merkle root is derived from the
 ///  hashes of all transactions included in this block, ensuring that none of
 ///  those transactions can be modified without modifying the header. [7.6]
@@ -189,12 +257,10 @@ pub fn merkle_root_validity(
     block: &Block,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
-    if block
+    // TODO: deduplicate zebra-chain and zebra-consensus errors (#2908)
+    block
         .check_transaction_network_upgrade_consistency(network)
-        .is_err()
-    {
-        return Err(BlockError::WrongTransactionConsensusBranchId);
-    }
+        .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
 
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
@@ -223,7 +289,6 @@ pub fn merkle_root_validity(
     //
     // To prevent malleability (CVE-2012-2459), we also need to check
     // whether the transaction hashes are unique.
-    use std::collections::HashSet;
     if transaction_hashes.len() != transaction_hashes.iter().collect::<HashSet<_>>().len() {
         return Err(BlockError::DuplicateTransaction);
     }

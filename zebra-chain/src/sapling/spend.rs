@@ -3,7 +3,7 @@
 //! Zebra uses a generic spend type for `V4` and `V5` transactions.
 //! The anchor change is handled using the `AnchorVariant` type trait.
 
-use std::io;
+use std::{convert::TryInto, fmt, io};
 
 use crate::{
     block::MAX_BLOCK_BYTES,
@@ -17,7 +17,10 @@ use crate::{
     },
 };
 
-use super::{commitment, note, tree, AnchorVariant, FieldNotPresent, PerSpendAnchor, SharedAnchor};
+use super::{
+    commitment, keys::ValidatingKey, note, tree, AnchorVariant, FieldNotPresent, PerSpendAnchor,
+    SharedAnchor,
+};
 
 /// A _Spend Description_, as described in [protocol specification §7.3][ps].
 ///
@@ -31,10 +34,10 @@ use super::{commitment, note, tree, AnchorVariant, FieldNotPresent, PerSpendAnch
 /// `V5` transactions split them into multiple arrays.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Spend<AnchorV: AnchorVariant> {
     /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    pub cv: commitment::NotSmallOrderValueCommitment,
     /// An anchor for this spend.
     ///
     /// The anchor is the root of the Sapling note commitment tree in a previous
@@ -48,7 +51,7 @@ pub struct Spend<AnchorV: AnchorVariant> {
     /// The nullifier of the input note.
     pub nullifier: note::Nullifier,
     /// The randomized public key for `spend_auth_sig`.
-    pub rk: redjubjub::VerificationKeyBytes<SpendAuth>,
+    pub rk: ValidatingKey,
     /// The ZK spend proof.
     pub zkproof: Groth16Proof,
     /// A signature authorizing this spend.
@@ -63,14 +66,37 @@ pub struct Spend<AnchorV: AnchorVariant> {
 /// Serialized as `SpendDescriptionV5` in [protocol specification §7.3][ps].
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpendPrefixInTransactionV5 {
     /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    pub cv: commitment::NotSmallOrderValueCommitment,
     /// The nullifier of the input note.
     pub nullifier: note::Nullifier,
     /// The randomized public key for `spend_auth_sig`.
-    pub rk: redjubjub::VerificationKeyBytes<SpendAuth>,
+    pub rk: ValidatingKey,
+}
+
+// We can't derive Eq because `VerificationKey` does not implement it,
+// even if it is valid for it.
+impl<AnchorV: AnchorVariant + PartialEq> Eq for Spend<AnchorV> {}
+
+// We can't derive Eq because `VerificationKey` does not implement it,
+// even if it is valid for it.
+impl Eq for SpendPrefixInTransactionV5 {}
+
+impl<AnchorV> fmt::Display for Spend<AnchorV>
+where
+    AnchorV: AnchorVariant + Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fmter = f
+            .debug_struct(format!("sapling::Spend<{}>", std::any::type_name::<AnchorV>()).as_str());
+
+        fmter.field("per_spend_anchor", &self.per_spend_anchor);
+        fmter.field("nullifier", &self.nullifier);
+
+        fmter.finish()
+    }
 }
 
 impl From<(Spend<SharedAnchor>, tree::Root)> for Spend<PerSpendAnchor> {
@@ -92,36 +118,6 @@ impl From<(Spend<PerSpendAnchor>, FieldNotPresent)> for Spend<PerSpendAnchor> {
     /// Take the `Spend<PerSpendAnchor>` from a spend + anchor tuple.
     fn from(per_spend: (Spend<PerSpendAnchor>, FieldNotPresent)) -> Self {
         per_spend.0
-    }
-}
-
-impl Spend<PerSpendAnchor> {
-    /// Encodes the primary inputs for the proof statement as 7 Bls12_381 base
-    /// field elements, to match bellman::groth16::verify_proof.
-    ///
-    /// NB: jubjub::Fq is a type alias for bls12_381::Scalar.
-    ///
-    /// https://zips.z.cash/protocol/protocol.pdf#cctsaplingspend
-    pub fn primary_inputs(&self) -> Vec<jubjub::Fq> {
-        let mut inputs = vec![];
-
-        let rk_affine = jubjub::AffinePoint::from_bytes(self.rk.into()).unwrap();
-        inputs.push(rk_affine.get_u());
-        inputs.push(rk_affine.get_v());
-
-        let cv_affine = jubjub::AffinePoint::from_bytes(self.cv.into()).unwrap();
-        inputs.push(cv_affine.get_u());
-        inputs.push(cv_affine.get_v());
-
-        // TODO: V4 only
-        inputs.push(jubjub::Fq::from_bytes(&self.per_spend_anchor.into()).unwrap());
-
-        let nullifier_limbs: [jubjub::Fq; 2] = self.nullifier.into();
-
-        inputs.push(nullifier_limbs[0]);
-        inputs.push(nullifier_limbs[1]);
-
-        inputs
     }
 }
 
@@ -167,7 +163,7 @@ impl ZcashSerialize for Spend<PerSpendAnchor> {
         self.cv.zcash_serialize(&mut writer)?;
         writer.write_all(&self.per_spend_anchor.0[..])?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk)[..])?;
+        writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
         self.zkproof.zcash_serialize(&mut writer)?;
         writer.write_all(&<[u8; 64]>::from(self.spend_auth_sig)[..])?;
         Ok(())
@@ -175,12 +171,29 @@ impl ZcashSerialize for Spend<PerSpendAnchor> {
 }
 
 impl ZcashDeserialize for Spend<PerSpendAnchor> {
+    /// # Consensus
+    ///
+    /// > The anchor of each Spend description MUST refer to some earlier
+    /// > block’s final Sapling treestate. The anchor is encoded separately in
+    /// > each Spend description for v4 transactions, or encoded once and shared
+    /// > between all Spend descriptions in a v5 transaction.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#spendsandoutputs>
+    ///
+    /// This rule is also implemented in
+    /// [`zebra_state::service::check::anchor`] and
+    /// [`zebra_chain::transaction::serialize`].
+    ///
+    /// The "anchor encoding for v4 transactions" is implemented here.
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         Ok(Spend {
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: commitment::NotSmallOrderValueCommitment::zcash_deserialize(&mut reader)?,
             per_spend_anchor: tree::Root(reader.read_32_bytes()?),
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
-            rk: reader.read_32_bytes()?.into(),
+            rk: reader
+                .read_32_bytes()?
+                .try_into()
+                .map_err(SerializationError::Parse)?,
             zkproof: Groth16Proof::zcash_deserialize(&mut reader)?,
             spend_auth_sig: reader.read_64_bytes()?.into(),
         })
@@ -197,7 +210,7 @@ impl ZcashSerialize for SpendPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         self.cv.zcash_serialize(&mut writer)?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk)[..])?;
+        writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
         Ok(())
     }
 }
@@ -205,9 +218,12 @@ impl ZcashSerialize for SpendPrefixInTransactionV5 {
 impl ZcashDeserialize for SpendPrefixInTransactionV5 {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         Ok(SpendPrefixInTransactionV5 {
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: commitment::NotSmallOrderValueCommitment::zcash_deserialize(&mut reader)?,
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
-            rk: reader.read_32_bytes()?.into(),
+            rk: reader
+                .read_32_bytes()?
+                .try_into()
+                .map_err(SerializationError::Parse)?,
         })
     }
 }
@@ -247,7 +263,15 @@ pub(crate) const SHARED_ANCHOR_SPEND_SIZE: u64 = SHARED_ANCHOR_SPEND_PREFIX_SIZE
 /// The maximum number of sapling spends in a valid Zcash on-chain transaction V4.
 impl TrustedPreallocate for Spend<PerSpendAnchor> {
     fn max_allocation() -> u64 {
-        (MAX_BLOCK_BYTES - 1) / ANCHOR_PER_SPEND_SIZE
+        const MAX: u64 = (MAX_BLOCK_BYTES - 1) / ANCHOR_PER_SPEND_SIZE;
+        // > [NU5 onward] nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16.
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        // This acts as nSpendsSapling and is therefore subject to the rule.
+        // The maximum value is actually smaller due to the block size limit,
+        // but we ensure the 2^16 limit with a static assertion.
+        // (The check is not required pre-NU5, but it doesn't cause problems.)
+        static_assertions::const_assert!(MAX < (1 << 16));
+        MAX
     }
 }
 
@@ -261,7 +285,15 @@ impl TrustedPreallocate for SpendPrefixInTransactionV5 {
         // Since a serialized Vec<Spend> uses at least one byte for its length,
         // and the associated fields are required,
         // a valid max allocation can never exceed this size
-        (MAX_BLOCK_BYTES - 1) / SHARED_ANCHOR_SPEND_SIZE
+        const MAX: u64 = (MAX_BLOCK_BYTES - 1) / SHARED_ANCHOR_SPEND_SIZE;
+        // > [NU5 onward] nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16.
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        // This acts as nSpendsSapling and is therefore subject to the rule.
+        // The maximum value is actually smaller due to the block size limit,
+        // but we ensure the 2^16 limit with a static assertion.
+        // (The check is not required pre-NU5, but it doesn't cause problems.)
+        static_assertions::const_assert!(MAX < (1 << 16));
+        MAX
     }
 }
 

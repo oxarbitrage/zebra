@@ -20,7 +20,6 @@ impl ReverseCollection for [u8; 32] {
 }
 
 lazy_static! {
-
     /// All block test vectors
     pub static ref BLOCKS: Vec<&'static [u8]> = MAINNET_BLOCKS
         .iter()
@@ -30,8 +29,8 @@ lazy_static! {
 
     /// Continuous mainnet blocks, indexed by height
     ///
-    /// Contains the continuous blockchain from genesis onwards.
-    /// Stops at the first gap in the chain.
+    /// Contains the continuous blockchain from genesis onwards.  Stops at the
+    /// first gap in the chain.
     pub static ref CONTINUOUS_MAINNET_BLOCKS: BTreeMap<u32, &'static [u8]> = MAINNET_BLOCKS
         .iter()
         .enumerate()
@@ -41,8 +40,8 @@ lazy_static! {
 
     /// Continuous testnet blocks, indexed by height
     ///
-    /// Contains the continuous blockchain from genesis onwards.
-    /// Stops at the first gap in the chain.
+    /// Contains the continuous blockchain from genesis onwards.  Stops at the
+    /// first gap in the chain.
     pub static ref CONTINUOUS_TESTNET_BLOCKS: BTreeMap<u32, &'static [u8]> = TESTNET_BLOCKS
         .iter()
         .enumerate()
@@ -61,6 +60,7 @@ lazy_static! {
     pub static ref MAINNET_BLOCKS: BTreeMap<u32, &'static [u8]> = [
             // Genesis
             (0, BLOCK_MAINNET_GENESIS_BYTES.as_ref()),
+
             // BeforeOverwinter
             (1, BLOCK_MAINNET_1_BYTES.as_ref()),
             (2, BLOCK_MAINNET_2_BYTES.as_ref()),
@@ -73,45 +73,73 @@ lazy_static! {
             (9, BLOCK_MAINNET_9_BYTES.as_ref()),
             (10, BLOCK_MAINNET_10_BYTES.as_ref()),
             (202, BLOCK_MAINNET_202_BYTES.as_ref()),
+            // The first block that contains a tx with a JoinSplit.
+            (396, BLOCK_MAINNET_396_BYTES.as_ref()),
             (347_499, BLOCK_MAINNET_347499_BYTES.as_ref()),
+
             // Overwinter
             (347_500, BLOCK_MAINNET_347500_BYTES.as_ref()),
             (347_501, BLOCK_MAINNET_347501_BYTES.as_ref()),
             (415_000, BLOCK_MAINNET_415000_BYTES.as_ref()),
             (419_199, BLOCK_MAINNET_419199_BYTES.as_ref()),
+
             // Sapling
             (419_200, BLOCK_MAINNET_419200_BYTES.as_ref()),
             (419_201, BLOCK_MAINNET_419201_BYTES.as_ref()),
+            (419_202, BLOCK_MAINNET_419202_BYTES.as_ref()),
+
             // A bad version field
             (434_873, BLOCK_MAINNET_434873_BYTES.as_ref()),
             (653_599, BLOCK_MAINNET_653599_BYTES.as_ref()),
+
             // Blossom
             (653_600, BLOCK_MAINNET_653600_BYTES.as_ref()),
             (653_601, BLOCK_MAINNET_653601_BYTES.as_ref()),
             (902_999, BLOCK_MAINNET_902999_BYTES.as_ref()),
+
             // Heartwood
             (903_000, BLOCK_MAINNET_903000_BYTES.as_ref()),
             (903_001, BLOCK_MAINNET_903001_BYTES.as_ref()),
+
             // Shielded coinbase x3
             (949_496, BLOCK_MAINNET_949496_BYTES.as_ref()),
             (975_066, BLOCK_MAINNET_975066_BYTES.as_ref()),
             (982_681, BLOCK_MAINNET_982681_BYTES.as_ref()),
+
             // Last Heartwood
             (1_046_399, BLOCK_MAINNET_1046399_BYTES.as_ref()),
+
             // Canopy and First Coinbase Halving
             (1_046_400, BLOCK_MAINNET_1046400_BYTES.as_ref()),
             (1_046_401, BLOCK_MAINNET_1046401_BYTES.as_ref()),
             (1_180_900, BLOCK_MAINNET_1180900_BYTES.as_ref()),
         ].iter().cloned().collect();
 
-    /// Mainnet final sapling roots, indexed by height
+    /// Mainnet final Sprout roots, indexed by height.
     ///
-    /// Pre-sapling roots are all-zeroes.
-    /// If there are no sapling inputs or outputs in a block, the final sapling root is the same as the previous block.
+    /// If there are no Sprout inputs or outputs in a block, the final Sprout root is the same as
+    /// the previous block.
+    pub static ref MAINNET_FINAL_SPROUT_ROOTS: BTreeMap<u32, &'static [u8; 32]> = [
+            // Genesis
+            (0, SPROUT_FINAL_ROOT_MAINNET_0_BYTES.as_ref().try_into().unwrap()),
+            // The first block that contains a tx with a JoinSplit.
+            (396, SPROUT_FINAL_ROOT_MAINNET_396_BYTES.as_ref().try_into().unwrap()),
+
+            // Overwinter
+            (347_499, SPROUT_FINAL_ROOT_MAINNET_347499_BYTES.as_ref().try_into().unwrap()),
+            (347_500, SPROUT_FINAL_ROOT_MAINNET_347500_BYTES.as_ref().try_into().unwrap()),
+            (347_501, SPROUT_FINAL_ROOT_MAINNET_347501_BYTES.as_ref().try_into().unwrap()),
+        ].iter().cloned().collect();
+
+    /// Mainnet final Sapling roots, indexed by height
+    ///
+    /// Pre-Sapling roots are all-zeroes.  If there are no Sapling Outputs in a block, the final
+    /// Sapling root is the same as the previous block.
     pub static ref MAINNET_FINAL_SAPLING_ROOTS: BTreeMap<u32, &'static [u8; 32]> = [
             // Sapling
             (419_200, SAPLING_FINAL_ROOT_MAINNET_419200_BYTES.as_ref().try_into().unwrap()),
             (419_201, SAPLING_FINAL_ROOT_MAINNET_419201_BYTES.as_ref().try_into().unwrap()),
+            (419_202, SAPLING_FINAL_ROOT_MAINNET_419202_BYTES.as_ref().try_into().unwrap()),
             // A bad version field
             (434_873, SAPLING_FINAL_ROOT_MAINNET_434873_BYTES.as_ref().try_into().unwrap()),
             (653_599, SAPLING_FINAL_ROOT_MAINNET_653599_BYTES.as_ref().try_into().unwrap()),
@@ -151,6 +179,8 @@ lazy_static! {
             (8, BLOCK_TESTNET_8_BYTES.as_ref()),
             (9, BLOCK_TESTNET_9_BYTES.as_ref()),
             (10, BLOCK_TESTNET_10_BYTES.as_ref()),
+            // The first block that contains a tx with a JoinSplit.
+            (2_259, BLOCK_TESTNET_2259_BYTES.as_ref()),
             // A large block
             (141_042, BLOCK_TESTNET_141042_BYTES.as_ref()),
             (207_499, BLOCK_TESTNET_207499_BYTES.as_ref()),
@@ -193,12 +223,27 @@ lazy_static! {
             (1_116_000, BLOCK_TESTNET_1116000_BYTES.as_ref()),
             (1_116_001, BLOCK_TESTNET_1116001_BYTES.as_ref()),
             (1_326_100, BLOCK_TESTNET_1326100_BYTES.as_ref()),
+            (1_599_199, BLOCK_TESTNET_1599199_BYTES.as_ref()),
+            // Nu5
+            (1_599_200, BLOCK_TESTNET_1599200_BYTES.as_ref()),
+            (1_599_201, BLOCK_TESTNET_1599201_BYTES.as_ref()),
         ].iter().cloned().collect();
 
-    /// Testnet final sapling roots, indexed by height
+    /// Testnet final Sprout roots, indexed by height.
     ///
-    /// Pre-sapling roots are all-zeroes.
-    /// If there are no sapling inputs or outputs in a block, the final sapling root is the same as the previous block.
+    /// If there are no Sprout inputs or outputs in a block, the final Sprout root is the same as
+    /// the previous block.
+    pub static ref TESTNET_FINAL_SPROUT_ROOTS: BTreeMap<u32, &'static [u8; 32]> = [
+        // Genesis
+        (0, SPROUT_FINAL_ROOT_TESTNET_0_BYTES.as_ref().try_into().unwrap()),
+        // The first block that contains a tx with a JoinSplit.
+        (2259, SPROUT_FINAL_ROOT_TESTNET_2259_BYTES.as_ref().try_into().unwrap()),
+    ].iter().cloned().collect();
+
+    /// Testnet final Sapling roots, indexed by height
+    ///
+    /// Pre-sapling roots are all-zeroes.  If there are no Sapling Outputs in a block, the final
+    /// sapling root is the same as the previous block.
     pub static ref TESTNET_FINAL_SAPLING_ROOTS: BTreeMap<u32, &'static [u8; 32]> = [
             // Sapling
             (280_000, SAPLING_FINAL_ROOT_TESTNET_280000_BYTES.as_ref().try_into().unwrap()),
@@ -235,6 +280,10 @@ lazy_static! {
             (1_116_000, SAPLING_FINAL_ROOT_TESTNET_1116000_BYTES.as_ref().try_into().unwrap()),
             (1_116_001, SAPLING_FINAL_ROOT_TESTNET_1116001_BYTES.as_ref().try_into().unwrap()),
             (1_326_100, SAPLING_FINAL_ROOT_TESTNET_1326100_BYTES.as_ref().try_into().unwrap()),
+            (1_599_199, SAPLING_FINAL_ROOT_TESTNET_1599199_BYTES.as_ref().try_into().unwrap()),
+            // Nu5
+            (1_599_200, SAPLING_FINAL_ROOT_TESTNET_1599200_BYTES.as_ref().try_into().unwrap()),
+            (1_599_201, SAPLING_FINAL_ROOT_TESTNET_1599201_BYTES.as_ref().try_into().unwrap()),
         ].iter().cloned().collect();
 
     // Mainnet
@@ -280,12 +329,55 @@ lazy_static! {
     pub static ref BLOCK_MAINNET_202_BYTES: Vec<u8> =
         <Vec<u8>>::from_hex(include_str!("block-main-0-000-202.txt").trim())
         .expect("Block bytes are in valid hex representation");
+    // zcash-cli getblock 395 0 > block-main-0-000-395.txt
+    pub static ref BLOCK_MAINNET_395_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-main-0-000-395.txt").trim())
+        .expect("Block bytes are in valid hex representation");
+    // zcash-cli getblock 396 0 > block-main-0-000-396.txt
+    pub static ref BLOCK_MAINNET_396_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-main-0-000-396.txt").trim())
+        .expect("Block bytes are in valid hex representation");
 
     /// This contains an encoding of block 202 but with an improperly encoded
     /// coinbase height.
     pub static ref BAD_BLOCK_MAINNET_202_BYTES: Vec<u8> =
         <Vec<u8>>::from_hex(include_str!("block-main-0-000-202-bad.txt").trim())
         .expect("Block bytes are in valid hex representation");
+
+
+    // # Anchors for Sprout, starting at Genesis.
+    //
+    // for i in 0 396; do
+    //     zcash-cli z_gettreestate "$i" | \
+    //     jq --arg i "$i" \
+    //     --raw-output \
+    //     '"pub static ref SPROUT_FINAL_ROOT_MAINNET_\($i)_BYTES: [u8; 32] = <[u8; 32]>::from_hex(\"\(.sprout.commitments.finalRoot)\").expect(\"final root bytes are in valid hex representation\").rev();"'
+    //     done
+    pub static ref SPROUT_FINAL_ROOT_MAINNET_0_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("59d2cde5e65c1414c32ba54f0fe4bdb3d67618125286e6a191317917c812c6d7")
+        .expect("final root bytes are in valid hex representation").rev();
+    // The first block that contains a tx with a JoinSplit.
+    pub static ref SPROUT_FINAL_ROOT_MAINNET_396_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("6a5710d1ca7d079baf1ce6ed1ea1b0756e219e9f3ebb9c0ec5b8ca1ff81c8f06")
+        .expect("final root bytes are in valid hex representation").rev();
+
+    // # Anchors for the Overwinter transition, which is still in the Sprout pool.
+    //
+    // for i in 347499 347500 347501; do
+    //     zcash-cli z_gettreestate "$i" | \
+    //     jq --arg i "$i" \
+    //     --raw-output \
+    //     '"pub static ref SPROUT_FINAL_ROOT_MAINNET_\($i)_BYTES: [u8; 32] = <[u8; 32]>::from_hex(\"\(.sprout.commitments.finalRoot)\").expect(\"final root bytes are in valid hex representation\").rev();"'
+    //     done
+    pub static ref SPROUT_FINAL_ROOT_MAINNET_347499_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("ce01f64025aba7c0e30a29f239f0eecd3cc18e5b1e575ca018c789a99482724f")
+        .expect("final root bytes are in valid hex representation").rev();
+    pub static ref SPROUT_FINAL_ROOT_MAINNET_347500_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("ce01f64025aba7c0e30a29f239f0eecd3cc18e5b1e575ca018c789a99482724f")
+        .expect("final root bytes are in valid hex representation").rev();
+    pub static ref SPROUT_FINAL_ROOT_MAINNET_347501_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("db036e080299a7401fd816789b5ea1b092ba3dab21e0f1d44161fffa149c65c1")
+        .expect("final root bytes are in valid hex representation").rev();
 
     // Overwinter transition
     // for i in 347499 347500 347501; do
@@ -306,7 +398,7 @@ lazy_static! {
         .expect("Block bytes are in valid hex representation");
 
     // Sapling transition
-    // for i in 419199 419200 419201; do
+    // for i in 419199 419200 419201 419202; do
     //     zcash-cli getblock $i 0 > block-main-$[i/1000000]-$[i/1000%1000]-$[i%1000].txt
     // done
     //
@@ -328,11 +420,17 @@ lazy_static! {
     pub static ref BLOCK_MAINNET_419201_BYTES: Vec<u8> =
         <Vec<u8>>::from_hex(include_str!("block-main-0-419-201.txt").trim())
         .expect("Block bytes are in valid hex representation");
+    pub static ref BLOCK_MAINNET_419202_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-main-0-419-202.txt").trim())
+        .expect("Block bytes are in valid hex representation");
     pub static ref SAPLING_FINAL_ROOT_MAINNET_419200_BYTES: [u8; 32] =
         <[u8; 32]>::from_hex("3e49b5f954aa9d3545bc6c37744661eea48d7c34e3000d82b7f0010c30f4c2fb")
         .expect("final root bytes are in valid hex representation").rev();
     pub static ref SAPLING_FINAL_ROOT_MAINNET_419201_BYTES: [u8; 32] =
         <[u8; 32]>::from_hex("638d7e5ba37ab7921c51a4f3ae1b32d71c605a0ed9be7477928111a637f7421b")
+        .expect("final root bytes are in valid hex representation").rev();
+    pub static ref SAPLING_FINAL_ROOT_MAINNET_419202_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("54393f89293c8af01eb985398f5a984c446dd2974bf6ab63fdacbaf32d27a107")
         .expect("final root bytes are in valid hex representation").rev();
 
     // this one has a bad version field
@@ -498,6 +596,10 @@ lazy_static! {
     pub static ref BLOCK_TESTNET_10_BYTES: Vec<u8> =
         <Vec<u8>>::from_hex(include_str!("block-test-0-000-010.txt").trim())
         .expect("Block bytes are in valid hex representation");
+    // zcash-cli -testnet getblock 2259 0 > block-test-0-002-259.txt
+    pub static ref BLOCK_TESTNET_2259_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-0-002-259.txt").trim())
+        .expect("Block bytes are in valid hex representation");
     // A large block
     // i=141042
     // zcash-cli -testnet getblock $i 0 | xxd -revert -plain > block-test-$[i/1000000]-$[i/1000%1000]-0$[i%1000].bin
@@ -510,6 +612,22 @@ lazy_static! {
     // We store large blocks as binary, to reduce disk and network usage.
     // (git compresses blocks in transit and in its index, so there is not much need for extra compression.)
     pub static ref BLOCK_TESTNET_141042_BYTES: Vec<u8> = include_bytes!("block-test-0-141-042.bin").to_vec();
+
+    // # Anchors for Sprout, starting at Genesis.
+    //
+    // for i in 0 396; do
+    //     zcash-cli z_gettreestate "$i" | \
+    //     jq --arg i "$i" \
+    //     --raw-output \
+    //     '"pub static ref SPROUT_FINAL_ROOT_TESTNET_\($i)_BYTES: [u8; 32] = <[u8; 32]>::from_hex(\"\(.sprout.commitments.finalRoot)\").expect(\"final root bytes are in valid hex representation\").rev();"'
+    //     done
+    pub static ref SPROUT_FINAL_ROOT_TESTNET_0_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("59d2cde5e65c1414c32ba54f0fe4bdb3d67618125286e6a191317917c812c6d7")
+        .expect("final root bytes are in valid hex representation").rev();
+    // The first block that contains a tx with a JoinSplit.
+    pub static ref SPROUT_FINAL_ROOT_TESTNET_2259_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("2985231c8b3fb5624299fd7289c33667b0270a3fcde420c9047a6bad41f07733")
+        .expect("final root bytes are in valid hex representation").rev();
 
     // Overwinter transition
     // for i in 207499 207500 207501; do
@@ -738,6 +856,29 @@ lazy_static! {
         .expect("Block bytes are in valid hex representation");
     pub static ref SAPLING_FINAL_ROOT_TESTNET_1326100_BYTES: [u8; 32] =
         <[u8; 32]>::from_hex("2b30b19f4254709fe365bd0b381b2e3d9d0c933eb4dba4dd1d07f0f6e196a183")
+        .expect("final root bytes are in valid hex representation").rev();
+
+    // Nu5 transition
+    // for i in 1599199 1599200 1599201; do
+    //     zcash-cli -testnet getblock $i 0 > block-test-$[i/1000000]-$[i/1000%1000]-$[i%1000].txt
+    // done
+    pub static ref BLOCK_TESTNET_1599199_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-1-599-199.txt").trim())
+        .expect("Block bytes are in valid hex representation");
+    pub static ref BLOCK_TESTNET_1599200_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-1-599-200.txt").trim())
+        .expect("Block bytes are in valid hex representation");
+    pub static ref BLOCK_TESTNET_1599201_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-1-599-201.txt").trim())
+        .expect("Block bytes are in valid hex representation");
+    pub static ref SAPLING_FINAL_ROOT_TESTNET_1599199_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("4de75d10def701ad22ecc17517a3adc8789ea8c214ac5bfc917b8924377e6c89")
+        .expect("final root bytes are in valid hex representation").rev();
+    pub static ref SAPLING_FINAL_ROOT_TESTNET_1599200_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("4de75d10def701ad22ecc17517a3adc8789ea8c214ac5bfc917b8924377e6c89")
+        .expect("final root bytes are in valid hex representation").rev();
+    pub static ref SAPLING_FINAL_ROOT_TESTNET_1599201_BYTES: [u8; 32] =
+        <[u8; 32]>::from_hex("4de75d10def701ad22ecc17517a3adc8789ea8c214ac5bfc917b8924377e6c89")
         .expect("final root bytes are in valid hex representation").rev();
 }
 

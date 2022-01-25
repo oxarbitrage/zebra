@@ -2,7 +2,7 @@
 
 use std::{
     cmp::{Eq, PartialEq},
-    fmt::Debug,
+    fmt::{self, Debug},
     io,
 };
 
@@ -37,6 +37,22 @@ pub struct ShieldedData {
     pub actions: AtLeastOne<AuthorizedAction>,
     /// A signature on the transaction `sighash`.
     pub binding_sig: Signature<Binding>,
+}
+
+impl fmt::Display for ShieldedData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fmter = f.debug_struct("orchard::ShieldedData");
+
+        fmter.field("actions", &self.actions.len());
+        fmter.field("value_balance", &self.value_balance);
+        fmter.field("flags", &self.flags);
+
+        fmter.field("proof_len", &self.proof.zcash_serialized_size());
+
+        fmter.field("shared_anchor", &self.shared_anchor);
+
+        fmter.finish()
+    }
 }
 
 impl ShieldedData {
@@ -166,7 +182,14 @@ impl TrustedPreallocate for Action {
         // Since a serialized Vec<AuthorizedAction> uses at least one byte for its length,
         // and the signature is required,
         // a valid max allocation can never exceed this size
-        (MAX_BLOCK_BYTES - 1) / AUTHORIZED_ACTION_SIZE
+        const MAX: u64 = (MAX_BLOCK_BYTES - 1) / AUTHORIZED_ACTION_SIZE;
+        // > [NU5 onward] nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16.
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        // This acts as nActionsOrchard and is therefore subject to the rule.
+        // The maximum value is actually smaller due to the block size limit,
+        // but we ensure the 2^16 limit with a static assertion.
+        static_assertions::const_assert!(MAX < (1 << 16));
+        MAX
     }
 }
 

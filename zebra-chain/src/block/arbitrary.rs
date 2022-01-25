@@ -149,7 +149,7 @@ impl LedgerState {
     /// Returns a strategy for creating `LedgerState`s with features from
     /// `network_upgrade_override`.
     ///
-    /// These featues ignore the actual tip height and network.
+    /// These features ignore the actual tip height and network.
     pub fn network_upgrade_strategy(
         network_upgrade_override: NetworkUpgrade,
         transaction_version_override: impl Into<Option<u32>>,
@@ -551,7 +551,8 @@ where
     let mut spent_outputs = HashMap::new();
 
     // fixup the transparent spends
-    for mut input in transaction.inputs().to_vec().into_iter() {
+    let original_inputs = transaction.inputs().to_vec();
+    for mut input in original_inputs.into_iter() {
         if input.outpoint().is_some() {
             // the transparent chain value pool is the sum of unspent UTXOs,
             // so we don't need to check it separately, because we only spend unspent UTXOs

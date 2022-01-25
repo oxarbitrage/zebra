@@ -5,7 +5,14 @@ mod disk_format;
 #[cfg(test)]
 mod tests;
 
-use std::{borrow::Borrow, collections::HashMap, convert::TryInto, path::Path, sync::Arc};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    convert::TryInto,
+    io::{stderr, stdout, Write},
+    path::Path,
+    sync::Arc,
+};
 
 use zebra_chain::{
     amount::NonNegative,
@@ -46,6 +53,8 @@ pub struct FinalizedState {
 impl FinalizedState {
     pub fn new(config: &Config, network: Network) -> Self {
         let (path, db_options) = config.db_config(network);
+        // Note: The [`crate::constants::DATABASE_FORMAT_VERSION`] constant must
+        // be incremented each time the database format (column, serialization, etc) changes.
         let column_families = vec![
             rocksdb::ColumnFamilyDescriptor::new("hash_by_height", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("height_by_hash", db_options.clone()),
@@ -55,8 +64,10 @@ impl FinalizedState {
             rocksdb::ColumnFamilyDescriptor::new("sprout_nullifiers", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("sapling_nullifiers", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("orchard_nullifiers", db_options.clone()),
+            rocksdb::ColumnFamilyDescriptor::new("sprout_anchors", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("sapling_anchors", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("orchard_anchors", db_options.clone()),
+            rocksdb::ColumnFamilyDescriptor::new("sprout_note_commitment_tree", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new(
                 "sapling_note_commitment_tree",
                 db_options.clone(),
@@ -93,12 +104,17 @@ impl FinalizedState {
             network,
         };
 
+        // TODO: remove these extra logs once bugs like #2905 are fixed
+        tracing::info!("reading cached tip height");
         if let Some(tip_height) = new_state.finalized_tip_height() {
+            tracing::info!(?tip_height, "loaded cached tip height");
+
             if new_state.is_at_stop_height(tip_height) {
                 let debug_stop_at_height = new_state
                     .debug_stop_at_height
                     .expect("true from `is_at_stop_height` implies `debug_stop_at_height` is Some");
 
+                tracing::info!("reading cached tip hash");
                 let tip_hash = new_state.finalized_tip_hash();
 
                 if tip_height > debug_stop_at_height {
@@ -119,10 +135,14 @@ impl FinalizedState {
 
                 // RocksDB can do a cleanup when column families are opened.
                 // So we want to drop it before we exit.
+                tracing::info!("closing cached state");
                 std::mem::drop(new_state);
-                std::process::exit(0);
+
+                Self::exit_process();
             }
         }
+
+        tracing::info!(tip = ?new_state.tip(), "loaded Zebra state cache");
 
         new_state
     }
@@ -180,9 +200,9 @@ impl FinalizedState {
             self.max_queued_height = height.0 as _;
         }
 
-        metrics::gauge!("state.finalized.queued.max.height", self.max_queued_height);
+        metrics::gauge!("state.checkpoint.queued.max.height", self.max_queued_height);
         metrics::gauge!(
-            "state.finalized.queued.block.count",
+            "state.checkpoint.queued.block.count",
             self.queued_by_prev_hash.len() as f64
         );
 
@@ -228,8 +248,6 @@ impl FinalizedState {
         finalized: FinalizedBlock,
         source: &str,
     ) -> Result<block::Hash, BoxError> {
-        block_precommit_metrics(&finalized);
-
         let finalized_tip_height = self.finalized_tip_height();
 
         let hash_by_height = self.db.cf_handle("hash_by_height").unwrap();
@@ -242,9 +260,12 @@ impl FinalizedState {
         let sapling_nullifiers = self.db.cf_handle("sapling_nullifiers").unwrap();
         let orchard_nullifiers = self.db.cf_handle("orchard_nullifiers").unwrap();
 
+        let sprout_anchors = self.db.cf_handle("sprout_anchors").unwrap();
         let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
         let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
 
+        let sprout_note_commitment_tree_cf =
+            self.db.cf_handle("sprout_note_commitment_tree").unwrap();
         let sapling_note_commitment_tree_cf =
             self.db.cf_handle("sapling_note_commitment_tree").unwrap();
         let orchard_note_commitment_tree_cf =
@@ -284,13 +305,14 @@ impl FinalizedState {
 
         // Read the current note commitment trees. If there are no blocks in the
         // state, these will contain the empty trees.
+        let mut sprout_note_commitment_tree = self.sprout_note_commitment_tree();
         let mut sapling_note_commitment_tree = self.sapling_note_commitment_tree();
         let mut orchard_note_commitment_tree = self.orchard_note_commitment_tree();
         let mut history_tree = self.history_tree();
 
         // Check the block commitment. For Nu5-onward, the block hash commits only
         // to non-authorizing data (see ZIP-244). This checks the authorizing data
-        // commitment, making sure the entire block contents were commited to.
+        // commitment, making sure the entire block contents were committed to.
         // The test is done here (and not during semantic validation) because it needs
         // the history tree root. While it _is_ checked during contextual validation,
         // that is not called by the checkpoint verifier, and keeping a history tree there
@@ -330,6 +352,11 @@ impl FinalizedState {
                 // used too early (e.g. the Orchard tree before Nu5 activates)
                 // since the block validation will make sure only appropriate
                 // transactions are allowed in a block.
+                batch.zs_insert(
+                    sprout_note_commitment_tree_cf,
+                    height,
+                    sprout_note_commitment_tree,
+                );
                 batch.zs_insert(
                     sapling_note_commitment_tree_cf,
                     height,
@@ -392,6 +419,9 @@ impl FinalizedState {
                     batch.zs_insert(orchard_nullifiers, orchard_nullifier, ());
                 }
 
+                for sprout_note_commitment in transaction.sprout_note_commitments() {
+                    sprout_note_commitment_tree.append(*sprout_note_commitment)?;
+                }
                 for sapling_note_commitment in transaction.sapling_note_commitments() {
                     sapling_note_commitment_tree.append(*sapling_note_commitment)?;
                 }
@@ -400,6 +430,7 @@ impl FinalizedState {
                 }
             }
 
+            let sprout_root = sprout_note_commitment_tree.root();
             let sapling_root = sapling_note_commitment_tree.root();
             let orchard_root = orchard_note_commitment_tree.root();
 
@@ -407,25 +438,36 @@ impl FinalizedState {
 
             // Compute the new anchors and index them
             // Note: if the root hasn't changed, we write the same value again.
+            batch.zs_insert(sprout_anchors, sprout_root, &sprout_note_commitment_tree);
             batch.zs_insert(sapling_anchors, sapling_root, ());
             batch.zs_insert(orchard_anchors, orchard_root, ());
 
             // Update the trees in state
             if let Some(h) = finalized_tip_height {
+                batch.zs_delete(sprout_note_commitment_tree_cf, h);
                 batch.zs_delete(sapling_note_commitment_tree_cf, h);
                 batch.zs_delete(orchard_note_commitment_tree_cf, h);
                 batch.zs_delete(history_tree_cf, h);
             }
+
+            batch.zs_insert(
+                sprout_note_commitment_tree_cf,
+                height,
+                sprout_note_commitment_tree,
+            );
+
             batch.zs_insert(
                 sapling_note_commitment_tree_cf,
                 height,
                 sapling_note_commitment_tree,
             );
+
             batch.zs_insert(
                 orchard_note_commitment_tree_cf,
                 height,
                 orchard_note_commitment_tree,
             );
+
             if let Some(history_tree) = history_tree.as_ref() {
                 batch.zs_insert(history_tree_cf, height, history_tree);
             }
@@ -443,22 +485,51 @@ impl FinalizedState {
         // In case of errors, propagate and do not write the batch.
         let batch = prepare_commit()?;
 
+        // The block has passed contextual validation, so update the metrics
+        block_precommit_metrics(&block, hash, height);
+
         let result = self.db.write(batch).map(|()| hash);
 
         tracing::trace!(?source, "committed block from");
 
         if result.is_ok() && self.is_at_stop_height(height) {
             tracing::info!(?source, "committed block from");
-            tracing::info!(?height, ?hash, "stopping at configured height");
+            tracing::info!(
+                ?height,
+                ?hash,
+                "stopping at configured height, flushing database to disk"
+            );
+
             // We'd like to drop the database here, because that closes the
             // column families and the database. But Rust's ownership rules
-            // make that difficult, so we just flush instead.
+            // make that difficult, so we just flush and delete ephemeral data instead.
+
+            // TODO: remove these extra logs once bugs like #2905 are fixed
             self.db.flush().expect("flush is successful");
+            tracing::info!("flushed database to disk");
+
             self.delete_ephemeral();
-            std::process::exit(0);
+
+            Self::exit_process();
         }
 
         result.map_err(Into::into)
+    }
+
+    /// Exit the host process.
+    ///
+    /// Designed for debugging and tests.
+    fn exit_process() -> ! {
+        tracing::info!("exiting Zebra");
+
+        // Some OSes require a flush to send all output to the terminal.
+        // Zebra's logging doesn't depend on `tokio`, so we flush the stdlib sync streams.
+        //
+        // TODO: if this doesn't work, send an empty line as well.
+        let _ = stdout().lock().flush();
+        let _ = stderr().lock().flush();
+
+        std::process::exit(0);
     }
 
     /// Commit a finalized block to the state.
@@ -471,24 +542,29 @@ impl FinalizedState {
         let (finalized, rsp_tx) = queued_block;
         let result = self.commit_finalized_direct(finalized.clone(), "CommitFinalized request");
 
-        let block_result;
-        if result.is_ok() {
-            metrics::counter!("state.finalized.committed.block.count", 1);
+        let block_result = if result.is_ok() {
+            metrics::counter!("state.checkpoint.finalized.block.count", 1);
             metrics::gauge!(
-                "state.finalized.committed.block.height",
+                "state.checkpoint.finalized.block.height",
                 finalized.height.0 as _
             );
 
-            block_result = Ok(finalized);
+            // This height gauge is updated for both fully verified and checkpoint blocks.
+            // These updates can't conflict, because the state makes sure that blocks
+            // are committed in order.
+            metrics::gauge!("zcash.chain.verified.block.height", finalized.height.0 as _);
+            metrics::counter!("zcash.chain.verified.block.total", 1);
+
+            Ok(finalized)
         } else {
-            metrics::counter!("state.finalized.error.block.count", 1);
+            metrics::counter!("state.checkpoint.error.block.count", 1);
             metrics::gauge!(
-                "state.finalized.error.block.height",
+                "state.checkpoint.error.block.height",
                 finalized.height.0 as _
             );
 
-            block_result = Err(());
-        }
+            Err(())
+        };
 
         let _ = rsp_tx.send(result.map_err(Into::into));
 
@@ -555,6 +631,25 @@ impl FinalizedState {
         self.db.zs_contains(orchard_nullifiers, &orchard_nullifier)
     }
 
+    /// Returns `true` if the finalized state contains `sprout_anchor`.
+    #[allow(unused)]
+    pub fn contains_sprout_anchor(&self, sprout_anchor: &sprout::tree::Root) -> bool {
+        let sprout_anchors = self.db.cf_handle("sprout_anchors").unwrap();
+        self.db.zs_contains(sprout_anchors, &sprout_anchor)
+    }
+
+    /// Returns `true` if the finalized state contains `sapling_anchor`.
+    pub fn contains_sapling_anchor(&self, sapling_anchor: &sapling::tree::Root) -> bool {
+        let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
+        self.db.zs_contains(sapling_anchors, &sapling_anchor)
+    }
+
+    /// Returns `true` if the finalized state contains `orchard_anchor`.
+    pub fn contains_orchard_anchor(&self, orchard_anchor: &orchard::tree::Root) -> bool {
+        let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
+        self.db.zs_contains(orchard_anchors, &orchard_anchor)
+    }
+
     /// Returns the finalized hash for a given `block::Height` if it is present.
     pub fn hash(&self, height: block::Height) -> Option<block::Hash> {
         let hash_by_height = self.db.cf_handle("hash_by_height").unwrap();
@@ -575,6 +670,33 @@ impl FinalizedState {
             })
     }
 
+    /// Returns the Sprout note commitment tree of the finalized tip
+    /// or the empty tree if the state is empty.
+    pub fn sprout_note_commitment_tree(&self) -> sprout::tree::NoteCommitmentTree {
+        let height = match self.finalized_tip_height() {
+            Some(h) => h,
+            None => return Default::default(),
+        };
+
+        let sprout_note_commitment_tree = self.db.cf_handle("sprout_note_commitment_tree").unwrap();
+
+        self.db
+            .zs_get(sprout_note_commitment_tree, &height)
+            .expect("Sprout note commitment tree must exist if there is a finalized tip")
+    }
+
+    /// Returns the Sprout note commitment tree matching the given anchor.
+    ///
+    /// This is used for interstitial tree building, which is unique to Sprout.
+    pub fn sprout_note_commitment_tree_by_anchor(
+        &self,
+        sprout_anchor: &sprout::tree::Root,
+    ) -> Option<sprout::tree::NoteCommitmentTree> {
+        let sprout_anchors = self.db.cf_handle("sprout_anchors").unwrap();
+
+        self.db.zs_get(sprout_anchors, sprout_anchor)
+    }
+
     /// Returns the Sapling note commitment tree of the finalized tip
     /// or the empty tree if the state is empty.
     pub fn sapling_note_commitment_tree(&self) -> sapling::tree::NoteCommitmentTree {
@@ -582,11 +704,13 @@ impl FinalizedState {
             Some(h) => h,
             None => return Default::default(),
         };
+
         let sapling_note_commitment_tree =
             self.db.cf_handle("sapling_note_commitment_tree").unwrap();
+
         self.db
             .zs_get(sapling_note_commitment_tree, &height)
-            .expect("note commitment tree must exist if there is a finalized tip")
+            .expect("Sapling note commitment tree must exist if there is a finalized tip")
     }
 
     /// Returns the Orchard note commitment tree of the finalized tip
@@ -596,11 +720,13 @@ impl FinalizedState {
             Some(h) => h,
             None => return Default::default(),
         };
+
         let orchard_note_commitment_tree =
             self.db.cf_handle("orchard_note_commitment_tree").unwrap();
+
         self.db
             .zs_get(orchard_note_commitment_tree, &height)
-            .expect("note commitment tree must exist if there is a finalized tip")
+            .expect("Orchard note commitment tree must exist if there is a finalized tip")
     }
 
     /// Returns the ZIP-221 history tree of the finalized tip or `None`
@@ -625,7 +751,8 @@ impl FinalizedState {
     fn delete_ephemeral(&self) {
         if self.ephemeral {
             let path = self.db.path();
-            tracing::debug!("removing temporary database files {:?}", path);
+            tracing::info!(cache_path = ?path, "removing temporary database files");
+
             // We'd like to use `rocksdb::Env::mem_env` for ephemeral databases,
             // but the Zcash blockchain might not fit in memory. So we just
             // delete the database files instead.
@@ -638,7 +765,11 @@ impl FinalizedState {
             // delete them using standard filesystem APIs. Deleting open files
             // might cause errors on non-Unix platforms, so we ignore the result.
             // (The OS will delete them eventually anyway.)
-            let _res = std::fs::remove_dir_all(path);
+            let res = std::fs::remove_dir_all(path);
+
+            // TODO: downgrade to debug once bugs like #2905 are fixed
+            //       but leave any errors at "info" level
+            tracing::info!(?res, "removed temporary database files");
         }
     }
 
@@ -665,6 +796,40 @@ impl FinalizedState {
         batch.zs_insert(value_pool_cf, (), fake_value_pool);
         self.db.write(batch).unwrap();
     }
+
+    /// Artificially prime the note commitment tree anchor sets with anchors
+    /// referenced in a block, for testing purposes _only_.
+    #[cfg(test)]
+    pub fn populate_with_anchors(&self, block: &Block) {
+        let mut batch = rocksdb::WriteBatch::default();
+
+        let sprout_anchors = self.db.cf_handle("sprout_anchors").unwrap();
+        let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
+        let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
+
+        for transaction in block.transactions.iter() {
+            // Sprout
+            for joinsplit in transaction.sprout_groth16_joinsplits() {
+                batch.zs_insert(
+                    sprout_anchors,
+                    joinsplit.anchor,
+                    sprout::tree::NoteCommitmentTree::default(),
+                );
+            }
+
+            // Sapling
+            for anchor in transaction.sapling_anchors() {
+                batch.zs_insert(sapling_anchors, anchor, ());
+            }
+
+            // Orchard
+            if let Some(orchard_shielded_data) = transaction.orchard_shielded_data() {
+                batch.zs_insert(orchard_anchors, orchard_shielded_data.shared_anchor, ());
+            }
+        }
+
+        self.db.write(batch).unwrap();
+    }
 }
 
 // Drop isn't guaranteed to run, such as when we panic, or if someone stored
@@ -677,9 +842,7 @@ impl Drop for FinalizedState {
     }
 }
 
-fn block_precommit_metrics(finalized: &FinalizedBlock) {
-    let (hash, height, block) = (finalized.hash, finalized.height, finalized.block.as_ref());
-
+fn block_precommit_metrics(block: &Block, hash: block::Hash, height: block::Height) {
     let transaction_count = block.transactions.len();
     let transparent_prevout_count = block
         .transactions
@@ -723,6 +886,10 @@ fn block_precommit_metrics(finalized: &FinalizedBlock) {
         orchard_nullifier_count,
         "preparing to commit finalized block"
     );
+
+    metrics::counter!("state.finalized.block.count", 1);
+    metrics::gauge!("state.finalized.block.height", height.0 as _);
+
     metrics::counter!(
         "state.finalized.cumulative.transactions",
         transaction_count as u64

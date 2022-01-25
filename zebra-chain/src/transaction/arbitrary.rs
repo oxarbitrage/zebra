@@ -9,7 +9,9 @@ use std::{
 };
 
 use chrono::{TimeZone, Utc};
-use proptest::{arbitrary::any, array, collection::vec, option, prelude::*};
+use proptest::{
+    arbitrary::any, array, collection::vec, option, prelude::*, test_runner::TestRunner,
+};
 
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -22,7 +24,7 @@ use crate::{
         Bctv14Proof, Groth16Proof, Halo2Proof, ZkSnarkProof,
     },
     sapling::{self, AnchorVariant, PerSpendAnchor, SharedAnchor},
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::ZcashDeserializeInto,
     sprout, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
     LedgerState,
@@ -30,7 +32,7 @@ use crate::{
 
 use itertools::Itertools;
 
-use super::{FieldNotPresent, JoinSplitData, LockTime, Memo, Transaction};
+use super::{FieldNotPresent, JoinSplitData, LockTime, Memo, Transaction, UnminedTx};
 
 /// The maximum number of arbitrary transactions, inputs, or outputs.
 ///
@@ -768,6 +770,16 @@ impl Arbitrary for Transaction {
     type Strategy = BoxedStrategy<Self>;
 }
 
+impl Arbitrary for UnminedTx {
+    type Parameters = ();
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        any::<Transaction>().prop_map_into().boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
+}
+
 // Utility functions
 
 /// Convert `trans` into a fake v5 transaction,
@@ -791,7 +803,7 @@ pub fn transaction_to_fake_v5(
             inputs: inputs.to_vec(),
             outputs: outputs.to_vec(),
             lock_time: *lock_time,
-            expiry_height: block::Height(0),
+            expiry_height: height,
             sapling_shielded_data: None,
             orchard_shielded_data: None,
         },
@@ -805,7 +817,7 @@ pub fn transaction_to_fake_v5(
             inputs: inputs.to_vec(),
             outputs: outputs.to_vec(),
             lock_time: *lock_time,
-            expiry_height: block::Height(0),
+            expiry_height: height,
             sapling_shielded_data: None,
             orchard_shielded_data: None,
         },
@@ -813,14 +825,13 @@ pub fn transaction_to_fake_v5(
             inputs,
             outputs,
             lock_time,
-            expiry_height,
             ..
         } => V5 {
             network_upgrade: block_nu,
             inputs: inputs.to_vec(),
             outputs: outputs.to_vec(),
             lock_time: *lock_time,
-            expiry_height: *expiry_height,
+            expiry_height: height,
             sapling_shielded_data: None,
             orchard_shielded_data: None,
         },
@@ -828,7 +839,6 @@ pub fn transaction_to_fake_v5(
             inputs,
             outputs,
             lock_time,
-            expiry_height,
             sapling_shielded_data,
             ..
         } => V5 {
@@ -836,11 +846,10 @@ pub fn transaction_to_fake_v5(
             inputs: inputs.to_vec(),
             outputs: outputs.to_vec(),
             lock_time: *lock_time,
-            expiry_height: *expiry_height,
+            expiry_height: height,
             sapling_shielded_data: sapling_shielded_data
                 .clone()
-                .map(sapling_shielded_v4_to_fake_v5)
-                .flatten(),
+                .and_then(sapling_shielded_v4_to_fake_v5),
             orchard_shielded_data: None,
         },
         v5 @ V5 { .. } => v5.clone(),
@@ -968,11 +977,12 @@ pub fn fake_v5_transactions_for_network<'b>(
 pub fn insert_fake_orchard_shielded_data(
     transaction: &mut Transaction,
 ) -> &mut orchard::ShieldedData {
-    // Create a dummy action, it doesn't need to be valid
-    let dummy_action_bytes = [0u8; 820];
-    let mut dummy_action_bytes_reader = &dummy_action_bytes[..];
-    let dummy_action = orchard::Action::zcash_deserialize(&mut dummy_action_bytes_reader)
-        .expect("Dummy action should deserialize");
+    // Create a dummy action
+    let mut runner = TestRunner::default();
+    let dummy_action = orchard::Action::arbitrary()
+        .new_tree(&mut runner)
+        .unwrap()
+        .current();
 
     // Pair the dummy action with a fake signature
     let dummy_authorized_action = orchard::AuthorizedAction {

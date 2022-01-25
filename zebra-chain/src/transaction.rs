@@ -25,13 +25,13 @@ pub use lock_time::LockTime;
 pub use memo::Memo;
 pub use sapling::FieldNotPresent;
 pub use sighash::{HashType, SigHash};
-pub use unmined::{UnminedTx, UnminedTxId};
+pub use unmined::{UnminedTx, UnminedTxId, VerifiedUnminedTx};
 
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, orchard,
     parameters::NetworkUpgrade,
-    primitives::{Bctv14Proof, Groth16Proof},
+    primitives::{ed25519, Bctv14Proof, Groth16Proof},
     sapling, sprout,
     transparent::{
         self, outputs_from_utxos,
@@ -40,15 +40,15 @@ use crate::{
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
-use std::{collections::HashMap, iter};
+use std::{collections::HashMap, fmt, iter};
 
 /// A Zcash transaction.
 ///
 /// A transaction is an encoded data structure that facilitates the transfer of
 /// value between two public key addresses on the Zcash ecosystem. Everything is
-/// designed to ensure that transactions can created, propagated on the network,
-/// validated, and finally added to the global ledger of transactions (the
-/// blockchain).
+/// designed to ensure that transactions can be created, propagated on the
+/// network, validated, and finally added to the global ledger of transactions
+/// (the blockchain).
 ///
 /// Zcash has a number of different transaction formats. They are represented
 /// internally by different enum variants. Because we checkpoint on Canopy
@@ -109,7 +109,7 @@ pub enum Transaction {
         /// The sapling shielded data for this transaction, if any.
         sapling_shielded_data: Option<sapling::ShieldedData<sapling::PerSpendAnchor>>,
     },
-    /// A `version = 5` transaction, which supports `Sapling` and `Orchard`.
+    /// A `version = 5` transaction , which supports Orchard, Sapling, and transparent, but not Sprout.
     V5 {
         /// The Network Upgrade for this transaction.
         ///
@@ -129,6 +129,28 @@ pub enum Transaction {
         /// The orchard data for this transaction, if any.
         orchard_shielded_data: Option<orchard::ShieldedData>,
     },
+}
+
+impl fmt::Display for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fmter = f.debug_struct("Transaction");
+
+        fmter.field("version", &self.version());
+        if let Some(network_upgrade) = self.network_upgrade() {
+            fmter.field("network_upgrade", &network_upgrade);
+        }
+
+        fmter.field("transparent_inputs", &self.inputs().len());
+        fmter.field("transparent_outputs", &self.outputs().len());
+        fmter.field("sprout_joinsplits", &self.joinsplit_count());
+        fmter.field("sapling_spends", &self.sapling_spends_per_anchor().count());
+        fmter.field("sapling_outputs", &self.sapling_outputs().count());
+        fmter.field("orchard_actions", &self.orchard_actions().count());
+
+        fmter.field("unmined_id", &self.unmined_id());
+
+        fmter.finish()
+    }
 }
 
 impl Transaction {
@@ -244,6 +266,21 @@ impl Transaction {
                     .contains(orchard::Flags::ENABLE_OUTPUTS))
     }
 
+    /// Does this transaction has at least one flag when we have at least one orchard action?
+    ///
+    /// [NU5 onward] If effectiveVersion >= 5 and nActionsOrchard > 0, then at least one
+    /// of enableSpendsOrchard and enableOutputsOrchard MUST be 1.
+    ///
+    /// https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+    pub fn has_enough_orchard_flags(&self) -> bool {
+        if self.version() < 5 || self.orchard_actions().count() == 0 {
+            return true;
+        }
+        self.orchard_flags()
+            .unwrap_or_else(orchard::Flags::empty)
+            .intersects(orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS)
+    }
+
     /// Returns the [`CoinbaseSpendRestriction`] for this transaction,
     /// assuming it is mined at `spend_height`.
     pub fn coinbase_spend_restriction(
@@ -281,24 +318,91 @@ impl Transaction {
     }
 
     /// Get this transaction's lock time.
-    pub fn lock_time(&self) -> LockTime {
-        match self {
-            Transaction::V1 { lock_time, .. } => *lock_time,
-            Transaction::V2 { lock_time, .. } => *lock_time,
-            Transaction::V3 { lock_time, .. } => *lock_time,
-            Transaction::V4 { lock_time, .. } => *lock_time,
-            Transaction::V5 { lock_time, .. } => *lock_time,
+    pub fn lock_time(&self) -> Option<LockTime> {
+        let lock_time = match self {
+            Transaction::V1 { lock_time, .. }
+            | Transaction::V2 { lock_time, .. }
+            | Transaction::V3 { lock_time, .. }
+            | Transaction::V4 { lock_time, .. }
+            | Transaction::V5 { lock_time, .. } => *lock_time,
+        };
+
+        // `zcashd` checks that the block height is greater than the lock height.
+        // This check allows the genesis block transaction, which would otherwise be invalid.
+        // (Or have to use a lock time.)
+        //
+        // It matches the `zcashd` check here:
+        // https://github.com/zcash/zcash/blob/1a7c2a3b04bcad6549be6d571bfdff8af9a2c814/src/main.cpp#L720
+        if lock_time == LockTime::unlocked() {
+            return None;
+        }
+
+        // Consensus rule:
+        //
+        // > The transaction must be finalized: either its locktime must be in the past (or less
+        // > than or equal to the current block height), or all of its sequence numbers must be
+        // > 0xffffffff.
+        //
+        // In `zcashd`, this rule applies to both coinbase and prevout input sequence numbers.
+        //
+        // Unlike Bitcoin, Zcash allows transactions with no transparent inputs. These transactions
+        // only have shielded inputs. Surprisingly, the `zcashd` implementation ignores the lock
+        // time in these transactions. `zcashd` only checks the lock time when it finds a
+        // transparent input sequence number that is not `u32::MAX`.
+        //
+        // https://developer.bitcoin.org/devguide/transactions.html#non-standard-transactions
+        let has_sequence_number_enabling_lock_time = self
+            .inputs()
+            .iter()
+            .map(transparent::Input::sequence)
+            .any(|sequence_number| sequence_number != u32::MAX);
+
+        if has_sequence_number_enabling_lock_time {
+            Some(lock_time)
+        } else {
+            None
         }
     }
 
     /// Get this transaction's expiry height, if any.
     pub fn expiry_height(&self) -> Option<block::Height> {
         match self {
-            Transaction::V1 { .. } => None,
-            Transaction::V2 { .. } => None,
-            Transaction::V3 { expiry_height, .. } => Some(*expiry_height),
-            Transaction::V4 { expiry_height, .. } => Some(*expiry_height),
-            Transaction::V5 { expiry_height, .. } => Some(*expiry_height),
+            Transaction::V1 { .. } | Transaction::V2 { .. } => None,
+            Transaction::V3 { expiry_height, .. }
+            | Transaction::V4 { expiry_height, .. }
+            | Transaction::V5 { expiry_height, .. } => match expiry_height {
+                // Consensus rule:
+                // > No limit: To set no limit on transactions (so that they do not expire), nExpiryHeight should be set to 0.
+                // https://zips.z.cash/zip-0203#specification
+                block::Height(0) => None,
+                block::Height(expiry_height) => Some(block::Height(*expiry_height)),
+            },
+        }
+    }
+
+    /// Modify the expiry height of this transaction.
+    ///
+    /// # Panics
+    ///
+    /// - if called on a v1 or v2 transaction
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn expiry_height_mut(&mut self) -> &mut block::Height {
+        match self {
+            Transaction::V1 { .. } | Transaction::V2 { .. } => {
+                panic!("v1 and v2 transactions are not supported")
+            }
+            Transaction::V3 {
+                ref mut expiry_height,
+                ..
+            }
+            | Transaction::V4 {
+                ref mut expiry_height,
+                ..
+            }
+            | Transaction::V5 {
+                ref mut expiry_height,
+                ..
+            } => expiry_height,
         }
     }
 
@@ -341,6 +445,13 @@ impl Transaction {
             Transaction::V4 { ref mut inputs, .. } => inputs,
             Transaction::V5 { ref mut inputs, .. } => inputs,
         }
+    }
+
+    /// Access the [`transparent::OutPoint`]s spent by this transaction's [`transparent::Input`]s.
+    pub fn spent_outpoints(&self) -> impl Iterator<Item = transparent::OutPoint> + '_ {
+        self.inputs()
+            .iter()
+            .filter_map(transparent::Input::outpoint)
     }
 
     /// Access the transparent outputs of this transaction, regardless of version.
@@ -403,6 +514,29 @@ impl Transaction {
     }
 
     // sprout
+
+    /// Returns the Sprout `JoinSplit<Groth16Proof>`s in this transaction, regardless of version.
+    pub fn sprout_groth16_joinsplits(
+        &self,
+    ) -> Box<dyn Iterator<Item = &sprout::JoinSplit<Groth16Proof>> + '_> {
+        match self {
+            // JoinSplits with Groth16 Proofs
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => Box::new(joinsplit_data.joinsplits()),
+
+            // No JoinSplits / JoinSplits with BCTV14 proofs
+            Transaction::V1 { .. }
+            | Transaction::V2 { .. }
+            | Transaction::V3 { .. }
+            | Transaction::V4 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V5 { .. } => Box::new(std::iter::empty()),
+        }
+    }
 
     /// Returns the number of `JoinSplit`s in this transaction, regardless of version.
     pub fn joinsplit_count(&self) -> usize {
@@ -478,7 +612,129 @@ impl Transaction {
         }
     }
 
+    /// Access the JoinSplit public validating key in this transaction,
+    /// regardless of version, if any.
+    pub fn sprout_joinsplit_pub_key(&self) -> Option<ed25519::VerificationKeyBytes> {
+        match self {
+            // JoinSplits with Bctv14 Proofs
+            Transaction::V2 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            }
+            | Transaction::V3 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => Some(joinsplit_data.pub_key),
+            // JoinSplits with Groth Proofs
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => Some(joinsplit_data.pub_key),
+            // No JoinSplits
+            Transaction::V1 { .. }
+            | Transaction::V2 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V3 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V4 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V5 { .. } => None,
+        }
+    }
+
+    /// Return if the transaction has any Sprout JoinSplit data.
+    pub fn has_sprout_joinsplit_data(&self) -> bool {
+        match self {
+            // No JoinSplits
+            Transaction::V1 { .. } | Transaction::V5 { .. } => false,
+
+            // JoinSplits-on-BCTV14
+            Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
+                joinsplit_data.is_some()
+            }
+
+            // JoinSplits-on-Groth16
+            Transaction::V4 { joinsplit_data, .. } => joinsplit_data.is_some(),
+        }
+    }
+
+    /// Returns the Sprout note commitments in this transaction.
+    pub fn sprout_note_commitments(
+        &self,
+    ) -> Box<dyn Iterator<Item = &sprout::commitment::NoteCommitment> + '_> {
+        match self {
+            // Return [`NoteCommitment`]s with [`Bctv14Proof`]s.
+            Transaction::V2 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            }
+            | Transaction::V3 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => Box::new(joinsplit_data.note_commitments()),
+
+            // Return [`NoteCommitment`]s with [`Groth16Proof`]s.
+            Transaction::V4 {
+                joinsplit_data: Some(joinsplit_data),
+                ..
+            } => Box::new(joinsplit_data.note_commitments()),
+
+            // Return an empty iterator.
+            Transaction::V2 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V3 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V4 {
+                joinsplit_data: None,
+                ..
+            }
+            | Transaction::V1 { .. }
+            | Transaction::V5 { .. } => Box::new(std::iter::empty()),
+        }
+    }
+
     // sapling
+
+    /// Access the deduplicated [`sapling::tree::Root`]s in this transaction,
+    /// regardless of version.
+    pub fn sapling_anchors(&self) -> Box<dyn Iterator<Item = sapling::tree::Root> + '_> {
+        // This function returns a boxed iterator because the different
+        // transaction variants end up having different iterator types
+        match self {
+            Transaction::V4 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => Box::new(sapling_shielded_data.anchors()),
+
+            Transaction::V5 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => Box::new(sapling_shielded_data.anchors()),
+
+            // No Spends
+            Transaction::V1 { .. }
+            | Transaction::V2 { .. }
+            | Transaction::V3 { .. }
+            | Transaction::V4 {
+                sapling_shielded_data: None,
+                ..
+            }
+            | Transaction::V5 {
+                sapling_shielded_data: None,
+                ..
+            } => Box::new(std::iter::empty()),
+        }
+    }
 
     /// Iterate over the sapling [`Spend`](sapling::Spend)s for this transaction,
     /// returning `Spend<PerSpendAnchor>` regardless of the underlying
@@ -576,7 +832,7 @@ impl Transaction {
         }
     }
 
-    /// Access the note commitments in this transaction, regardless of version.
+    /// Returns the Sapling note commitments in this transaction, regardless of version.
     pub fn sapling_note_commitments(&self) -> Box<dyn Iterator<Item = &jubjub::Fq> + '_> {
         // This function returns a boxed iterator because the different
         // transaction variants end up having different iterator types
@@ -667,8 +923,7 @@ impl Transaction {
     pub fn orchard_actions(&self) -> impl Iterator<Item = &orchard::Action> {
         self.orchard_shielded_data()
             .into_iter()
-            .map(orchard::ShieldedData::actions)
-            .flatten()
+            .flat_map(orchard::ShieldedData::actions)
     }
 
     /// Access the [`orchard::Nullifier`]s in this transaction, if there are any,
@@ -676,8 +931,7 @@ impl Transaction {
     pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
         self.orchard_shielded_data()
             .into_iter()
-            .map(orchard::ShieldedData::nullifiers)
-            .flatten()
+            .flat_map(orchard::ShieldedData::nullifiers)
     }
 
     /// Access the note commitments in this transaction, if there are any,
@@ -685,8 +939,7 @@ impl Transaction {
     pub fn orchard_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
         self.orchard_shielded_data()
             .into_iter()
-            .map(orchard::ShieldedData::note_commitments)
-            .flatten()
+            .flat_map(orchard::ShieldedData::note_commitments)
     }
 
     /// Access the [`orchard::Flags`] in this transaction, if there is any,
@@ -767,7 +1020,7 @@ impl Transaction {
     }
 
     /// Returns the `vpub_old` fields from `JoinSplit`s in this transaction,
-    /// regardless of version.
+    /// regardless of version, in the order they appear in the transaction.
     ///
     /// These values are added to the sprout chain value pool,
     /// and removed from the value pool of this transaction.
@@ -814,7 +1067,7 @@ impl Transaction {
     }
 
     /// Modify the `vpub_old` fields from `JoinSplit`s in this transaction,
-    /// regardless of version.
+    /// regardless of version, in the order they appear in the transaction.
     ///
     /// See `output_values_to_sprout` for details.
     #[cfg(any(test, feature = "proptest-impl"))]
@@ -835,7 +1088,7 @@ impl Transaction {
                     .joinsplits_mut()
                     .map(|joinsplit| &mut joinsplit.vpub_old),
             ),
-            // JoinSplits with Groth Proofs
+            // JoinSplits with Groth16 Proofs
             Transaction::V4 {
                 joinsplit_data: Some(joinsplit_data),
                 ..
@@ -863,7 +1116,7 @@ impl Transaction {
     }
 
     /// Returns the `vpub_new` fields from `JoinSplit`s in this transaction,
-    /// regardless of version.
+    /// regardless of version, in the order they appear in the transaction.
     ///
     /// These values are removed from the value pool of this transaction.
     /// and added to the sprout chain value pool.
@@ -910,7 +1163,7 @@ impl Transaction {
     }
 
     /// Modify the `vpub_new` fields from `JoinSplit`s in this transaction,
-    /// regardless of version.
+    /// regardless of version, in the order they appear in the transaction.
     ///
     /// See `input_values_from_sprout` for details.
     #[cfg(any(test, feature = "proptest-impl"))]
@@ -1025,7 +1278,7 @@ impl Transaction {
     /// and added to sapling pool.
     ///
     /// https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
-    fn sapling_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+    pub fn sapling_value_balance(&self) -> ValueBalance<NegativeAllowed> {
         let sapling_value_balance = match self {
             Transaction::V4 {
                 sapling_shielded_data: Some(sapling_shielded_data),
@@ -1092,7 +1345,7 @@ impl Transaction {
     /// and added to orchard pool.
     ///
     /// https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
-    fn orchard_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+    pub fn orchard_value_balance(&self) -> ValueBalance<NegativeAllowed> {
         let orchard_value_balance = self
             .orchard_shielded_data()
             .map(|shielded_data| shielded_data.value_balance)

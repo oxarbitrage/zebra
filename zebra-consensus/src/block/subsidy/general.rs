@@ -1,8 +1,8 @@
-//! Block and Miner subsidies, halvings and target spacing modifiers. - [§7.7][7.7]
+//! Block and Miner subsidies, halvings and target spacing modifiers. - [§7.8][7.8]
 //!
-//! [7.7]: https://zips.z.cash/protocol/protocol.pdf#subsidies
+//! [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 
-use std::convert::TryFrom;
+use std::{collections::HashSet, convert::TryFrom};
 
 use zebra_chain::{
     amount::{Amount, Error, NonNegative},
@@ -16,9 +16,9 @@ use crate::parameters::subsidy::*;
 
 /// The divisor used for halvings.
 ///
-/// `1 << Halving(height)`, as described in [protocol specification §7.7][7.7]
+/// `1 << Halving(height)`, as described in [protocol specification §7.8][7.8]
 ///
-/// [7.7]: https://zips.z.cash/protocol/protocol.pdf#subsidies
+/// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn halving_divisor(height: Height, network: Network) -> u64 {
     let blossom_height = Blossom
         .activation_height(network)
@@ -43,9 +43,9 @@ pub fn halving_divisor(height: Height, network: Network) -> u64 {
     }
 }
 
-/// `BlockSubsidy(height)` as described in [protocol specification §7.7][7.7]
+/// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
-/// [7.7]: https://zips.z.cash/protocol/protocol.pdf#subsidies
+/// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn block_subsidy(height: Height, network: Network) -> Result<Amount<NonNegative>, Error> {
     let blossom_height = Blossom
         .activation_height(network)
@@ -69,9 +69,9 @@ pub fn block_subsidy(height: Height, network: Network) -> Result<Amount<NonNegat
     }
 }
 
-/// `MinerSubsidy(height)` as described in [protocol specification §7.7][7.7]
+/// `MinerSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
-/// [7.7]: https://zips.z.cash/protocol/protocol.pdf#subsidies
+/// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 ///
 /// `non_miner_reward` is the founders reward or funding stream value.
 /// If all the rewards for a block go to the miner, use `None`.
@@ -102,10 +102,26 @@ pub fn find_output_with_amount(
         .collect()
 }
 
+/// Returns all output amounts in `Transaction`.
+#[allow(dead_code)]
+pub fn output_amounts(transaction: &Transaction) -> HashSet<Amount<NonNegative>> {
+    transaction
+        .outputs()
+        .iter()
+        .map(|o| &o.value)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use color_eyre::Report;
+
+    use crate::block::subsidy::{
+        founders_reward::founders_reward,
+        funding_streams::{funding_stream_values, height_for_first_halving},
+    };
 
     #[test]
     fn halving_test() -> Result<(), Report> {
@@ -121,7 +137,7 @@ mod test {
         let blossom_height = Blossom.activation_height(network).unwrap();
         let first_halving_height = match network {
             Network::Mainnet => Canopy.activation_height(network).unwrap(),
-            // Based on "7.7 Calculation of Block Subsidy and Founders' Reward"
+            // Based on "7.8 Calculation of Block Subsidy and Founders' Reward"
             Network::Testnet => Height(1_116_000),
         };
 
@@ -208,7 +224,7 @@ mod test {
         let blossom_height = Blossom.activation_height(network).unwrap();
         let first_halving_height = match network {
             Network::Mainnet => Canopy.activation_height(network).unwrap(),
-            // Based on "7.7 Calculation of Block Subsidy and Founders' Reward"
+            // Based on "7.8 Calculation of Block Subsidy and Founders' Reward"
             Network::Testnet => Height(1_116_000),
         };
 
@@ -234,7 +250,7 @@ mod test {
         );
 
         // After the 2nd halving, the block subsidy is reduced to 1.5625 ZEC
-        // See "7.7 Calculation of Block Subsidy and Founders' Reward"
+        // See "7.8 Calculation of Block Subsidy and Founders' Reward"
         assert_eq!(
             Amount::try_from(156_250_000),
             block_subsidy(
@@ -296,8 +312,8 @@ mod test {
     }
 
     fn miner_subsidy_for_network(network: Network) -> Result<(), Report> {
-        use crate::block::subsidy::founders_reward::founders_reward;
         let blossom_height = Blossom.activation_height(network).unwrap();
+        let first_halving_height = height_for_first_halving(network);
 
         // Miner reward before Blossom is 80% of the total block reward
         // 80*12.5/100 = 10 ZEC
@@ -319,8 +335,17 @@ mod test {
             miner_subsidy(blossom_height, network, Some(founders_amount))
         );
 
-        // TODO: After first halving, miner will get 2.5 ZEC per mined block
-        // but we need funding streams code to get this number
+        // After first halving, miner will get 2.5 ZEC per mined block (not counting fees)
+        let funding_stream_values = funding_stream_values(first_halving_height, network)?
+            .iter()
+            .map(|row| row.1)
+            .sum::<Result<Amount<NonNegative>, Error>>()
+            .unwrap();
+
+        assert_eq!(
+            Amount::try_from(250_000_000),
+            miner_subsidy(first_halving_height, network, Some(funding_stream_values))
+        );
 
         // TODO: After second halving, there will be no funding streams, and
         // miners will get all the block reward

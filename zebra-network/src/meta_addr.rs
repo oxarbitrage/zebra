@@ -3,21 +3,16 @@
 use std::{
     cmp::{Ord, Ordering},
     convert::TryInto,
-    io::{Read, Write},
     net::SocketAddr,
     time::Instant,
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-
-use zebra_chain::serialization::{
-    canonical_socket_addr, DateTime32, ReadZcashExt, SerializationError, TrustedPreallocate,
-    WriteZcashExt, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-};
+use chrono::Utc;
+use zebra_chain::serialization::DateTime32;
 
 use crate::{
     constants,
-    protocol::{external::MAX_PROTOCOL_MESSAGE_LEN, types::PeerServices},
+    protocol::{external::canonical_socket_addr, types::PeerServices},
 };
 
 use MetaAddrChange::*;
@@ -25,13 +20,15 @@ use PeerAddrState::*;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
+
 #[cfg(any(test, feature = "proptest-impl"))]
-use zebra_chain::serialization::arbitrary::canonical_socket_addr_strategy;
+use crate::protocol::external::arbitrary::canonical_socket_addr_strategy;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 pub(crate) mod arbitrary;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Peer connection state, based on our interactions with the peer.
 ///
@@ -121,6 +118,8 @@ impl PartialOrd for PeerAddrState {
 
 /// An address with metadata on its advertised services and last-seen time.
 ///
+/// This struct can be created from `addr` or `addrv2` messages.
+///
 /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#Network_address)
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
@@ -140,8 +139,8 @@ pub struct MetaAddr {
     /// The exact meaning depends on `last_connection_state`:
     ///   - `Responded`: the services advertised by this peer, the last time we
     ///      performed a handshake with it
-    ///   - `NeverAttempted`: the unverified services provided by the remote peer
-    ///     that sent us this address
+    ///   - `NeverAttempted`: the unverified services advertised by another peer,
+    ///      then gossiped by the peer that sent us this address
     ///   - `Failed` or `AttemptPending`: unverified services via another peer,
     ///      or services advertised in a previous handshake
     ///
@@ -150,9 +149,9 @@ pub struct MetaAddr {
     /// `services` from `NeverAttempted` peers may be invalid due to outdated
     /// records, older peer versions, or buggy or malicious peers.
     //
-    // TODO: make services private and optional
-    //       split gossiped and handshake services? (#2234)
-    pub(crate) services: PeerServices,
+    // TODO: make services private
+    //       split gossiped and handshake services? (#2324)
+    pub(crate) services: Option<PeerServices>,
 
     /// The unverified "last seen time" gossiped by the remote peer that sent us
     /// this address.
@@ -177,8 +176,7 @@ pub struct MetaAddr {
 
     /// The outcome of our most recent communication attempt with this peer.
     //
-    // TODO: make services private and optional?
-    //       move the time and services fields into PeerAddrState?
+    // TODO: move the time and services fields into PeerAddrState?
     //       then some fields could be required in some states
     pub(crate) last_connection_state: PeerAddrState,
 }
@@ -187,6 +185,15 @@ pub struct MetaAddr {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum MetaAddrChange {
+    /// Creates a `MetaAddr` for an initial peer.
+    NewInitial {
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "canonical_socket_addr_strategy()")
+        )]
+        addr: SocketAddr,
+    },
+
     /// Creates a new gossiped `MetaAddr`.
     NewGossiped {
         #[cfg_attr(
@@ -251,6 +258,14 @@ pub enum MetaAddrChange {
 }
 
 impl MetaAddr {
+    /// Returns a [`MetaAddrChange::NewInitial`] for a peer that was excluded from
+    /// the list of the initial peers.
+    pub fn new_initial_peer(addr: SocketAddr) -> MetaAddrChange {
+        NewInitial {
+            addr: canonical_socket_addr(addr),
+        }
+    }
+
     /// Returns a new `MetaAddr`, based on the deserialized fields from a
     /// gossiped peer [`Addr`][crate::protocol::external::Message::Addr] message.
     pub fn new_gossiped_meta_addr(
@@ -260,7 +275,7 @@ impl MetaAddr {
     ) -> MetaAddr {
         MetaAddr {
             addr: canonical_socket_addr(addr),
-            services: untrusted_services,
+            services: Some(untrusted_services),
             untrusted_last_seen: Some(untrusted_last_seen),
             last_response: None,
             last_attempt: None,
@@ -270,15 +285,19 @@ impl MetaAddr {
     }
 
     /// Returns a [`MetaAddrChange::NewGossiped`], based on a gossiped peer
-    /// `MetaAddr`.
-    pub fn new_gossiped_change(self) -> MetaAddrChange {
-        NewGossiped {
+    /// [`MetaAddr`].
+    ///
+    /// Returns [`None`] if the gossiped peer is missing the untrusted services field.
+    pub fn new_gossiped_change(self) -> Option<MetaAddrChange> {
+        let untrusted_services = self.services?;
+
+        Some(NewGossiped {
             addr: canonical_socket_addr(self.addr),
-            untrusted_services: self.services,
+            untrusted_services,
             untrusted_last_seen: self
                 .untrusted_last_seen
                 .expect("unexpected missing last seen"),
-        }
+        })
     }
 
     /// Returns a [`MetaAddrChange::UpdateResponded`] for a peer that has just
@@ -416,10 +435,10 @@ impl MetaAddr {
     /// connection. Therefore, if the last-seen timestamp is older than
     /// [`constants::MIN_PEER_RECONNECTION_DELAY`] ago, we know we should have
     /// disconnected from it. Otherwise, we could potentially be connected to it.
-    pub fn has_connection_recently_responded(&self) -> bool {
+    pub fn has_connection_recently_responded(&self, now: chrono::DateTime<Utc>) -> bool {
         if let Some(last_response) = self.last_response {
             // Recent times and future times are considered live
-            last_response.saturating_elapsed()
+            last_response.saturating_elapsed(now)
                 <= constants::MIN_PEER_RECONNECTION_DELAY
                     .try_into()
                     .expect("unexpectedly large constant")
@@ -433,12 +452,12 @@ impl MetaAddr {
     ///
     /// Returns `true` if this peer was recently attempted, or has a connection
     /// attempt in progress.
-    pub fn was_connection_recently_attempted(&self) -> bool {
+    pub fn was_connection_recently_attempted(&self, now: Instant) -> bool {
         if let Some(last_attempt) = self.last_attempt {
             // Recent times and future times are considered live.
             // Instants are monotonic, so `now` should always be later than `last_attempt`,
             // except for synthetic data in tests.
-            last_attempt.elapsed() <= constants::MIN_PEER_RECONNECTION_DELAY
+            now.saturating_duration_since(last_attempt) <= constants::MIN_PEER_RECONNECTION_DELAY
         } else {
             // If there has never been any attempt, it can't possibly be live
             false
@@ -448,14 +467,21 @@ impl MetaAddr {
     /// Have we recently had a failed connection to this peer?
     ///
     /// Returns `true` if this peer has recently failed.
-    pub fn has_connection_recently_failed(&self) -> bool {
+    pub fn has_connection_recently_failed(&self, now: Instant) -> bool {
         if let Some(last_failure) = self.last_failure {
             // Recent times and future times are considered live
-            last_failure.elapsed() <= constants::MIN_PEER_RECONNECTION_DELAY
+            now.saturating_duration_since(last_failure) <= constants::MIN_PEER_RECONNECTION_DELAY
         } else {
             // If there has never been any failure, it can't possibly be recent
             false
         }
+    }
+
+    /// Returns true if this peer has recently sent us a message.
+    pub fn was_recently_live(&self, now: chrono::DateTime<Utc>) -> bool {
+        // NeverAttempted, Failed, and AttemptPending peers should never be live
+        self.last_connection_state == PeerAddrState::Responded
+            && self.has_connection_recently_responded(now)
     }
 
     /// Has this peer been seen recently?
@@ -465,12 +491,12 @@ impl MetaAddr {
     ///
     /// [`constants::MAX_PEER_ACTIVE_FOR_GOSSIP`] represents the maximum time since a peer was seen
     /// to still be considered reachable.
-    pub fn is_active_for_gossip(&self) -> bool {
+    pub fn is_active_for_gossip(&self, now: chrono::DateTime<Utc>) -> bool {
         if let Some(last_seen) = self.last_seen() {
             // Correctness: `last_seen` shouldn't ever be in the future, either because we set the
             // time or because another peer's future time was sanitized when it was added to the
             // address book
-            last_seen.saturating_elapsed() <= constants::MAX_PEER_ACTIVE_FOR_GOSSIP
+            last_seen.saturating_elapsed(now) <= constants::MAX_PEER_ACTIVE_FOR_GOSSIP
         } else {
             // Peer has never responded and does not have a gossiped last seen time
             false
@@ -478,11 +504,16 @@ impl MetaAddr {
     }
 
     /// Is this address ready for a new outbound connection attempt?
-    pub fn is_ready_for_connection_attempt(&self) -> bool {
+    pub fn is_ready_for_connection_attempt(
+        &self,
+        instant_now: Instant,
+        chrono_now: chrono::DateTime<Utc>,
+    ) -> bool {
         self.last_known_info_is_valid_for_outbound()
-            && !self.has_connection_recently_responded()
-            && !self.was_connection_recently_attempted()
-            && !self.has_connection_recently_failed()
+            && !self.has_connection_recently_responded(chrono_now)
+            && !self.was_connection_recently_attempted(instant_now)
+            && !self.has_connection_recently_failed(instant_now)
+            && self.is_probably_reachable(chrono_now)
     }
 
     /// Is the [`SocketAddr`] we have for this peer valid for outbound
@@ -502,7 +533,44 @@ impl MetaAddr {
     /// - reject `NeverAttempted...` [`MetaAddrChange`]s, and
     /// - temporarily stop outbound connections to a [`MetaAddr`].
     pub fn last_known_info_is_valid_for_outbound(&self) -> bool {
-        self.services.contains(PeerServices::NODE_NETWORK) && self.address_is_valid_for_outbound()
+        let is_node = match self.services {
+            Some(services) => services.contains(PeerServices::NODE_NETWORK),
+            None => true,
+        };
+
+        is_node && self.address_is_valid_for_outbound()
+    }
+
+    /// Should this peer considered reachable?
+    ///
+    /// A peer is probably reachable if:
+    /// - it has never been attempted, or
+    /// - the last connection attempt was successful, or
+    /// - the last successful connection was less than 3 days ago.
+    ///
+    /// # Security
+    ///
+    /// This is used by [`Self::is_ready_for_connection_attempt`] so that Zebra stops trying to
+    /// connect to peers that are likely unreachable.
+    ///
+    /// The `untrusted_last_seen` time is used as a fallback time if the local node has never
+    /// itself seen the peer. If the reported last seen time is a long time ago or `None`, then the local
+    /// node will attempt to connect the peer once, and if that attempt fails it won't
+    /// try to connect ever again. (The state can't be `Failed` until after the first connection attempt.)
+    pub fn is_probably_reachable(&self, now: chrono::DateTime<Utc>) -> bool {
+        self.last_connection_state != PeerAddrState::Failed || self.last_seen_is_recent(now)
+    }
+
+    /// Was this peer last seen recently?
+    ///
+    /// Returns `true` if this peer was last seen at most
+    /// [`MAX_RECENT_PEER_AGE`][constants::MAX_RECENT_PEER_AGE] ago.
+    /// Returns false if the peer is outdated, or it has no last seen time.
+    pub fn last_seen_is_recent(&self, now: chrono::DateTime<Utc>) -> bool {
+        match self.last_seen() {
+            Some(last_seen) => last_seen.saturating_elapsed(now) <= constants::MAX_RECENT_PEER_AGE,
+            None => false,
+        }
     }
 
     /// Return a sanitized version of this `MetaAddr`, for sending to a remote peer.
@@ -524,9 +592,10 @@ impl MetaAddr {
 
         Some(MetaAddr {
             addr: canonical_socket_addr(self.addr),
+            // initial peers are sanitized assuming they are `NODE_NETWORK`
             // TODO: split untrusted and direct services
-            //       sanitize untrusted services to NODE_NETWORK only? (#2234)
-            services: self.services,
+            //       consider sanitizing untrusted services to NODE_NETWORK (#2324)
+            services: self.services.or(Some(PeerServices::NODE_NETWORK)),
             // only put the last seen time in the untrusted field,
             // this matches deserialization, and avoids leaking internal state
             untrusted_last_seen: Some(last_seen),
@@ -553,7 +622,8 @@ impl MetaAddrChange {
     /// Return the address for this change.
     pub fn addr(&self) -> SocketAddr {
         match self {
-            NewGossiped { addr, .. }
+            NewInitial { addr }
+            | NewGossiped { addr, .. }
             | NewAlternate { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -568,7 +638,8 @@ impl MetaAddrChange {
     /// This method should only be used in tests.
     pub fn set_addr(&mut self, new_addr: SocketAddr) {
         match self {
-            NewGossiped { addr, .. }
+            NewInitial { addr }
+            | NewGossiped { addr, .. }
             | NewAlternate { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -580,16 +651,17 @@ impl MetaAddrChange {
     /// Return the untrusted services for this change, if available.
     pub fn untrusted_services(&self) -> Option<PeerServices> {
         match self {
+            NewInitial { .. } => None,
             NewGossiped {
                 untrusted_services, ..
             } => Some(*untrusted_services),
             NewAlternate {
                 untrusted_services, ..
             } => Some(*untrusted_services),
-            // TODO: create a "services implemented by Zebra" constant (#2234)
+            // TODO: create a "services implemented by Zebra" constant (#2324)
             NewLocal { .. } => Some(PeerServices::NODE_NETWORK),
             UpdateAttempt { .. } => None,
-            // TODO: split untrusted and direct services (#2234)
+            // TODO: split untrusted and direct services (#2324)
             UpdateResponded { services, .. } => Some(*services),
             UpdateFailed { services, .. } => *services,
         }
@@ -598,6 +670,7 @@ impl MetaAddrChange {
     /// Return the untrusted last seen time for this change, if available.
     pub fn untrusted_last_seen(&self) -> Option<DateTime32> {
         match self {
+            NewInitial { .. } => None,
             NewGossiped {
                 untrusted_last_seen,
                 ..
@@ -614,6 +687,7 @@ impl MetaAddrChange {
     /// Return the last attempt for this change, if available.
     pub fn last_attempt(&self) -> Option<Instant> {
         match self {
+            NewInitial { .. } => None,
             NewGossiped { .. } => None,
             NewAlternate { .. } => None,
             NewLocal { .. } => None,
@@ -629,6 +703,7 @@ impl MetaAddrChange {
     /// Return the last response for this change, if available.
     pub fn last_response(&self) -> Option<DateTime32> {
         match self {
+            NewInitial { .. } => None,
             NewGossiped { .. } => None,
             NewAlternate { .. } => None,
             NewLocal { .. } => None,
@@ -643,9 +718,10 @@ impl MetaAddrChange {
         }
     }
 
-    /// Return the last attempt for this change, if available.
+    /// Return the last failure for this change, if available.
     pub fn last_failure(&self) -> Option<Instant> {
         match self {
+            NewInitial { .. } => None,
             NewGossiped { .. } => None,
             NewAlternate { .. } => None,
             NewLocal { .. } => None,
@@ -663,6 +739,7 @@ impl MetaAddrChange {
     /// Return the peer connection state for this change.
     pub fn peer_addr_state(&self) -> PeerAddrState {
         match self {
+            NewInitial { .. } => NeverAttemptedGossiped,
             NewGossiped { .. } => NeverAttemptedGossiped,
             NewAlternate { .. } => NeverAttemptedAlternate,
             // local listeners get sanitized, so the state doesn't matter here
@@ -675,21 +752,15 @@ impl MetaAddrChange {
 
     /// If this change can create a new `MetaAddr`, return that address.
     pub fn into_new_meta_addr(self) -> Option<MetaAddr> {
-        match self {
-            NewGossiped { .. } | NewAlternate { .. } | NewLocal { .. } => Some(MetaAddr {
-                addr: self.addr(),
-                // TODO: make services optional when we add a DNS seeder change and state
-                services: self
-                    .untrusted_services()
-                    .expect("unexpected missing services"),
-                untrusted_last_seen: self.untrusted_last_seen(),
-                last_response: None,
-                last_attempt: None,
-                last_failure: None,
-                last_connection_state: self.peer_addr_state(),
-            }),
-            UpdateAttempt { .. } | UpdateResponded { .. } | UpdateFailed { .. } => None,
-        }
+        Some(MetaAddr {
+            addr: self.addr(),
+            services: self.untrusted_services(),
+            untrusted_last_seen: self.untrusted_last_seen(),
+            last_response: self.last_response(),
+            last_attempt: self.last_attempt(),
+            last_failure: self.last_failure(),
+            last_connection_state: self.peer_addr_state(),
+        })
     }
 
     /// Apply this change to a previous `MetaAddr` from the address book,
@@ -727,8 +798,7 @@ impl MetaAddrChange {
                     // so malicious peers can't keep changing our peer connection order.
                     Some(MetaAddr {
                         addr: self.addr(),
-                        // TODO: or(self.untrusted_services()) when services become optional (#2234)
-                        services: previous.services,
+                        services: previous.services.or_else(|| self.untrusted_services()),
                         untrusted_last_seen: previous
                             .untrusted_last_seen
                             .or_else(|| self.untrusted_last_seen()),
@@ -752,7 +822,7 @@ impl MetaAddrChange {
                     addr: self.addr(),
                     // We want up-to-date services, even if they have fewer bits,
                     // or they are applied out of order.
-                    services: self.untrusted_services().unwrap_or(previous.services),
+                    services: self.untrusted_services().or(previous.services),
                     // Only NeverAttempted changes can modify the last seen field
                     untrusted_last_seen: previous.untrusted_last_seen,
                     // Since Some(time) is always greater than None, `max` prefers:
@@ -831,7 +901,9 @@ impl Ord for MetaAddr {
         // So this comparison will have no impact until Zebra implements
         // more service features.
         //
-        // TODO: order services by usefulness, not bit pattern values (#2234)
+        // None is less than Some(T), so peers with missing services are chosen last.
+        //
+        // TODO: order services by usefulness, not bit pattern values (#2324)
         //       Security: split gossiped and direct services
         let larger_services = self.services.cmp(&other.services);
 
@@ -875,40 +947,3 @@ impl PartialEq for MetaAddr {
 }
 
 impl Eq for MetaAddr {}
-
-impl ZcashSerialize for MetaAddr {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
-        self.last_seen()
-            .expect("unexpected MetaAddr with missing last seen time: MetaAddrs should be sanitized before serialization")
-            .zcash_serialize(&mut writer)?;
-        writer.write_u64::<LittleEndian>(self.services.bits())?;
-        writer.write_socket_addr(self.addr)?;
-        Ok(())
-    }
-}
-
-impl ZcashDeserialize for MetaAddr {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let untrusted_last_seen = (&mut reader).zcash_deserialize_into()?;
-        let untrusted_services =
-            PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?);
-        let addr = reader.read_socket_addr()?;
-
-        Ok(MetaAddr::new_gossiped_meta_addr(
-            addr,
-            untrusted_services,
-            untrusted_last_seen,
-        ))
-    }
-}
-
-/// A serialized meta addr has a 4 byte time, 8 byte services, 16 byte IP addr, and 2 byte port
-const META_ADDR_SIZE: usize = 4 + 8 + 16 + 2;
-
-impl TrustedPreallocate for MetaAddr {
-    fn max_allocation() -> u64 {
-        // Since a maximal serialized Vec<MetAddr> uses at least three bytes for its length (2MB  messages / 30B MetaAddr implies the maximal length is much greater than 253)
-        // the max allocation can never exceed (MAX_PROTOCOL_MESSAGE_LEN - 3) / META_ADDR_SIZE
-        ((MAX_PROTOCOL_MESSAGE_LEN - 3) / META_ADDR_SIZE) as u64
-    }
-}

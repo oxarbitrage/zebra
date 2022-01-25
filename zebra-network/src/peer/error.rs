@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use thiserror::Error;
 
@@ -28,40 +28,68 @@ pub enum PeerError {
     /// The remote peer closed the connection.
     #[error("Peer closed connection")]
     ConnectionClosed,
+
+    /// Zebra dropped the [`Connection`].
+    #[error("Internal connection dropped")]
+    ConnectionDropped,
+
+    /// Zebra dropped the [`Client`].
+    #[error("Internal client dropped")]
+    ClientDropped,
+
+    /// A [`Client`]'s internal connection task exited.
+    #[error("Internal peer connection task exited")]
+    ConnectionTaskExited,
+
+    /// Zebra's [`Client`] cancelled its heartbeat task.
+    #[error("Internal client cancelled its heartbeat task")]
+    ClientCancelledHeartbeatTask,
+
+    /// Zebra's internal heartbeat task exited.
+    #[error("Internal heartbeat task exited")]
+    HeartbeatTaskExited,
+
     /// The remote peer did not respond to a [`peer::Client`] request in time.
     #[error("Client request timed out")]
     ClientRequestTimeout,
+
     /// A serialization error occurred while reading or writing a message.
     #[error("Serialization error: {0}")]
     Serialization(#[from] SerializationError),
+
     /// A badly-behaved remote peer sent a handshake message after the handshake was
     /// already complete.
     #[error("Remote peer sent handshake messages after handshake")]
     DuplicateHandshake,
+
     /// This node's internal services were overloaded, so the connection was dropped
     /// to shed load.
     #[error("Internal services over capacity")]
     Overloaded,
-    /// A peer sent us a message we don't support.
-    #[error("Remote peer sent an unsupported message type: {0}")]
-    UnsupportedMessage(&'static str),
-    /// A peer sent us a message we couldn't interpret in context.
-    #[error("Remote peer sent an uninterpretable message: {0}")]
-    WrongMessage(&'static str),
-    /// We got a `Reject` message. This does not necessarily mean that
-    /// the peer connection is in a bad state, but for the time being
-    /// we are considering it a PeerError.
-    // TODO: Create a different error type (more at the application
-    // level than network/connection level) that will include the
-    // appropriate error when a `Reject` message is received.
-    #[error("Received a Reject message")]
-    Rejected,
-    /// The remote peer responded with a block we didn't ask for.
-    #[error("Remote peer responded with a block we didn't ask for.")]
-    WrongBlock,
+
     /// We requested data that the peer couldn't find.
     #[error("Remote peer could not find items: {0:?}")]
     NotFound(Vec<InventoryHash>),
+}
+
+impl PeerError {
+    /// Returns the Zebra internal handler type as a string.
+    pub fn kind(&self) -> Cow<'static, str> {
+        match self {
+            PeerError::ConnectionClosed => "ConnectionClosed".into(),
+            PeerError::ConnectionDropped => "ConnectionDropped".into(),
+            PeerError::ClientDropped => "ClientDropped".into(),
+            PeerError::ClientCancelledHeartbeatTask => "ClientCancelledHeartbeatTask".into(),
+            PeerError::HeartbeatTaskExited => "HeartbeatTaskExited".into(),
+            PeerError::ConnectionTaskExited => "ConnectionTaskExited".into(),
+            PeerError::ClientRequestTimeout => "ClientRequestTimeout".into(),
+            // TODO: add error kinds or summaries to `SerializationError`
+            PeerError::Serialization(inner) => format!("Serialization({})", inner).into(),
+            PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
+            PeerError::Overloaded => "Overloaded".into(),
+            PeerError::NotFound(_) => "NotFound".into(),
+        }
+    }
 }
 
 /// A shared error slot for peer errors.
@@ -71,8 +99,26 @@ pub enum PeerError {
 /// Error slots are shared between sync and async code. In async code, the error
 /// mutex should be held for as short a time as possible. This avoids blocking
 /// the async task thread on acquiring the mutex.
+///
+/// > If the value behind the mutex is just data, it’s usually appropriate to use a blocking mutex
+/// > ...
+/// > wrap the `Arc<Mutex<...>>` in a struct
+/// > that provides non-async methods for performing operations on the data within,
+/// > and only lock the mutex inside these methods
+///
+/// https://docs.rs/tokio/1.15.0/tokio/sync/struct.Mutex.html#which-kind-of-mutex-should-you-use
 #[derive(Default, Clone)]
-pub(super) struct ErrorSlot(Arc<std::sync::Mutex<Option<SharedPeerError>>>);
+pub struct ErrorSlot(Arc<std::sync::Mutex<Option<SharedPeerError>>>);
+
+impl std::fmt::Debug for ErrorSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // don't hang if the mutex is locked
+        // show the panic if the mutex was poisoned
+        f.debug_struct("ErrorSlot")
+            .field("error", &self.0.try_lock())
+            .finish()
+    }
+}
 
 impl ErrorSlot {
     /// Read the current error in the slot.
@@ -103,8 +149,7 @@ impl ErrorSlot {
         let mut guard = self.0.lock().expect("error mutex should be unpoisoned");
 
         if let Some(original_error) = guard.clone() {
-            error!(?original_error, new_error = ?e, "peer connection already errored");
-            Err(AlreadyErrored)
+            Err(AlreadyErrored { original_error })
         } else {
             *guard = Some(e);
             Ok(())
@@ -112,8 +157,12 @@ impl ErrorSlot {
     }
 }
 
-/// The `ErrorSlot` already contains an error.
-pub struct AlreadyErrored;
+/// Error returned when the `ErrorSlot` already contains an error.
+#[derive(Clone, Debug)]
+pub struct AlreadyErrored {
+    /// The original error in the error slot.
+    pub original_error: SharedPeerError,
+}
 
 /// An error during a handshake with a remote peer.
 #[derive(Error, Debug)]

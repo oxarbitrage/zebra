@@ -5,16 +5,20 @@ on:
   push:
     branches:
       - main
+    path:
+      - 'book/**'
+      - '**/firebase.json'
+      - 'katex-header.html'
+      - '.github/workflows/docs.yml'
 
 jobs:
-
   build:
     name: Build and Deploy Docs (+beta)
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
     - name: Checkout the source code
-      uses: actions/checkout@v2.3.4
+      uses: actions/checkout@v2.4.0
       with:
         persist-credentials: false
 

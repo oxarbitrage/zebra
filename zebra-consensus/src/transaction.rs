@@ -2,6 +2,7 @@
 //!
 use std::{
     collections::HashMap,
+    convert::TryInto,
     future::Future,
     iter::FromIterator,
     pin::Pin,
@@ -9,28 +10,33 @@ use std::{
     task::{Context, Poll},
 };
 
+use chrono::{DateTime, Utc};
 use futures::{
     stream::{FuturesUnordered, StreamExt},
-    FutureExt,
+    FutureExt, TryFutureExt,
 };
+use tokio::sync::mpsc;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zebra_chain::{
+    amount::{Amount, NonNegative},
     block, orchard,
     parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
     sapling,
-    transaction::{self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId},
+    transaction::{
+        self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
+    },
     transparent,
 };
 
 use zebra_script::CachedFfiTransaction;
 use zebra_state as zs;
 
-use crate::{error::TransactionError, primitives, script, BoxError};
+use crate::{error::TransactionError, groth16::DescriptionWrapper, primitives, script, BoxError};
 
-mod check;
+pub mod check;
 #[cfg(test)]
 mod tests;
 
@@ -76,6 +82,8 @@ pub enum Request {
         known_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
         /// The height of the block containing this transaction.
         height: block::Height,
+        /// The time that the block was mined.
+        time: DateTime<Utc>,
     },
     /// Verify the supplied transaction as part of the mempool.
     ///
@@ -95,13 +103,50 @@ pub enum Request {
 
 /// The response type for the transaction verifier service.
 /// Responses identify the transaction that was verified.
-///
-/// [`Block`] requests can be uniquely identified by [`UnminedTxId::mined_id`],
-/// because the block's authorizing data root will be checked during contextual validation.
-///
-/// [`Mempool`] requests are uniquely identified by the [`UnminedTxId`]
-/// variant for their transaction version.
-pub type Response = zebra_chain::transaction::UnminedTxId;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Response {
+    /// A response to a block transaction verification request.
+    Block {
+        /// The witnessed transaction ID for this transaction.
+        ///
+        /// [`Block`] responses can be uniquely identified by [`UnminedTxId::mined_id`],
+        /// because the block's authorizing data root will be checked during contextual validation.
+        tx_id: UnminedTxId,
+
+        /// The miner fee for this transaction.
+        /// `None` for coinbase transactions.
+        ///
+        /// Consensus rule:
+        /// > The remaining value in the transparent transaction value pool
+        /// > of a coinbase transaction is destroyed.
+        ///
+        /// https://zips.z.cash/protocol/protocol.pdf#transactions
+        miner_fee: Option<Amount<NonNegative>>,
+
+        /// The number of legacy signature operations in this transaction's
+        /// transparent inputs and outputs.
+        legacy_sigop_count: u64,
+    },
+
+    /// A response to a mempool transaction verification request.
+    Mempool {
+        /// The full content of the verified mempool transaction.
+        /// Also contains the transaction fee and other associated fields.
+        ///
+        /// Mempool transactions always have a transaction fee,
+        /// because coinbase transactions are rejected from the mempool.
+        ///
+        /// [`Mempool`] responses are uniquely identified by the [`UnminedTxId`]
+        /// variant for their transaction version.
+        transaction: VerifiedUnminedTx,
+    },
+}
+
+impl From<VerifiedUnminedTx> for Response {
+    fn from(transaction: VerifiedUnminedTx) -> Self {
+        Response::Mempool { transaction }
+    }
+}
 
 impl Request {
     /// The transaction to verify that's in this request.
@@ -109,6 +154,14 @@ impl Request {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
             Request::Mempool { transaction, .. } => transaction.transaction.clone(),
+        }
+    }
+
+    /// The unverified mempool transaction, if this is a mempool request.
+    pub fn into_mempool_transaction(self) -> Option<UnminedTx> {
+        match self {
+            Request::Block { .. } => None,
+            Request::Mempool { transaction, .. } => Some(transaction),
         }
     }
 
@@ -136,6 +189,14 @@ impl Request {
         }
     }
 
+    /// The block time used for lock time consensus rules validation.
+    pub fn block_time(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Request::Block { time, .. } => Some(*time),
+            Request::Mempool { .. } => None,
+        }
+    }
+
     /// The network upgrade to consider for the verification.
     ///
     /// This is based on the block height from the request, and the supplied `network`.
@@ -148,6 +209,56 @@ impl Request {
         match self {
             Request::Block { .. } => false,
             Request::Mempool { .. } => true,
+        }
+    }
+}
+
+impl Response {
+    /// The verified mempool transaction, if this is a mempool response.
+    pub fn into_mempool_transaction(self) -> Option<VerifiedUnminedTx> {
+        match self {
+            Response::Block { .. } => None,
+            Response::Mempool { transaction, .. } => Some(transaction),
+        }
+    }
+
+    /// The unmined transaction ID for the transaction in this response.
+    pub fn tx_id(&self) -> UnminedTxId {
+        match self {
+            Response::Block { tx_id, .. } => *tx_id,
+            Response::Mempool { transaction, .. } => transaction.transaction.id,
+        }
+    }
+
+    /// The miner fee for the transaction in this response.
+    ///
+    /// Coinbase transactions do not have a miner fee.
+    pub fn miner_fee(&self) -> Option<Amount<NonNegative>> {
+        match self {
+            Response::Block { miner_fee, .. } => *miner_fee,
+            Response::Mempool { transaction, .. } => Some(transaction.miner_fee),
+        }
+    }
+
+    /// The number of legacy transparent signature operations in this transaction's
+    /// inputs and outputs.
+    ///
+    /// Zebra does not check the legacy sigop count for mempool transactions,
+    /// because it is a standard rule (not a consensus rule).
+    pub fn legacy_sigop_count(&self) -> Option<u64> {
+        match self {
+            Response::Block {
+                legacy_sigop_count, ..
+            } => Some(*legacy_sigop_count),
+            Response::Mempool { .. } => None,
+        }
+    }
+
+    /// Returns true if the request is a mempool request.
+    pub fn is_mempool(&self) -> bool {
+        match self {
+            Response::Block { .. } => false,
+            Response::Mempool { .. } => true,
         }
     }
 }
@@ -172,14 +283,23 @@ where
         let network = self.network;
 
         let tx = req.transaction();
-        let id = req.tx_id();
-        let span = tracing::debug_span!("tx", ?id);
+        let tx_id = req.tx_id();
+        let span = tracing::debug_span!("tx", ?tx_id);
 
         async move {
             tracing::trace!(?req);
 
+            // the size of this channel is bounded by the maximum number of inputs in a transaction
+            // (approximately 50,000 for a 2 MB transaction)
+            let (utxo_sender, mut utxo_receiver) = mpsc::unbounded_channel();
+
             // Do basic checks first
+            if let Some(block_time) = req.block_time() {
+                check::lock_time_has_passed(&tx, req.height(), block_time)?;
+            }
+
             check::has_inputs_and_outputs(&tx)?;
+            check::has_enough_orchard_flags(&tx)?;
 
             if req.is_mempool() && tx.has_any_coinbase_inputs() {
                 return Err(TransactionError::CoinbaseInMempool);
@@ -188,9 +308,25 @@ where
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
             }
 
+            // Validate `nExpiryHeight` consensus rules
+            if tx.has_any_coinbase_inputs() {
+                check::coinbase_expiry_height(&req.height(), &tx, network)?;
+            } else {
+                check::non_coinbase_expiry_height(&req.height(), &tx)?;
+            }
+
+            // Consensus rule:
+            //
+            // > Either v_{pub}^{old} or v_{pub}^{new} MUST be zero.
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+            check::joinsplit_has_vpub_zero(&tx)?;
+
             // [Canopy onward]: `vpub_old` MUST be zero.
             // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
             check::disabled_add_to_sprout_pool(&tx, req.height(), network)?;
+
+            check::spend_conflicts(&tx)?;
 
             // "The consensus rules applied to valueBalance, vShieldedOutput, and bindingSig
             // in non-coinbase transactions MUST also be applied to coinbase transactions."
@@ -201,45 +337,83 @@ where
             // Note: this rule originally applied to Sapling, but we assume it also applies to Orchard.
             //
             // https://zips.z.cash/zip-0213#specification
+
+            let cached_ffi_transaction = Arc::new(CachedFfiTransaction::new(tx.clone()));
             let async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
                 }
                 Transaction::V4 {
-                    inputs,
-                    // outputs,
-                    // lock_time,
-                    // expiry_height,
                     joinsplit_data,
                     sapling_shielded_data,
                     ..
                 } => Self::verify_v4_transaction(
-                    req,
+                    &req,
                     network,
                     script_verifier,
-                    inputs,
+                    cached_ffi_transaction.clone(),
+                    utxo_sender,
                     joinsplit_data,
                     sapling_shielded_data,
                 )?,
                 Transaction::V5 {
-                    inputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
                     ..
                 } => Self::verify_v5_transaction(
-                    req,
+                    &req,
                     network,
                     script_verifier,
-                    inputs,
+                    cached_ffi_transaction.clone(),
+                    utxo_sender,
                     sapling_shielded_data,
                     orchard_shielded_data,
                 )?,
             };
 
+            // If the Groth16 parameter download hangs,
+            // Zebra will timeout here, waiting for the async checks.
             async_checks.check().await?;
 
-            Ok(id)
+            let mut spent_utxos = HashMap::new();
+            while let Some(script_rsp) = utxo_receiver.recv().await {
+                spent_utxos.insert(script_rsp.spent_outpoint, script_rsp.spent_utxo);
+            }
+
+            // Get the `value_balance` to calculate the transaction fee.
+            let value_balance = tx.value_balance(&spent_utxos);
+
+            // Calculate the fee only for non-coinbase transactions.
+            let mut miner_fee = None;
+            if !tx.has_valid_coinbase_transaction_inputs() {
+                // TODO: deduplicate this code with remaining_transaction_value (#TODO: open ticket)
+                miner_fee = match value_balance {
+                    Ok(vb) => match vb.remaining_transaction_value() {
+                        Ok(tx_rtv) => Some(tx_rtv),
+                        Err(_) => return Err(TransactionError::IncorrectFee),
+                    },
+                    Err(_) => return Err(TransactionError::IncorrectFee),
+                };
+            }
+
+            let rsp = match req {
+                Request::Block { .. } => Response::Block {
+                    tx_id,
+                    miner_fee,
+                    legacy_sigop_count: cached_ffi_transaction.legacy_sigop_count()?,
+                },
+                Request::Mempool { transaction, .. } => Response::Mempool {
+                    transaction: VerifiedUnminedTx::new(
+                        transaction,
+                        miner_fee.expect(
+                            "unexpected mempool coinbase transaction: should have already rejected",
+                        ),
+                    ),
+                },
+            };
+
+            Ok(rsp)
         }
         .instrument(span)
         .boxed()
@@ -266,14 +440,15 @@ where
     ///   for more information)
     /// - the `network` to consider when verifying
     /// - the `script_verifier` to use for verifying the transparent transfers
-    /// - the transparent `inputs` in the transaction
+    /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the Sprout `joinsplit_data` shielded data in the transaction
     /// - the `sapling_shielded_data` in the transaction
     fn verify_v4_transaction(
-        request: Request,
+        request: &Request,
         network: Network,
         script_verifier: script::Verifier<ZS>,
-        inputs: &[transparent::Input],
+        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        utxo_sender: mpsc::UnboundedSender<script::Response>,
         joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
         sapling_shielded_data: &Option<sapling::ShieldedData<sapling::PerSpendAnchor>>,
     ) -> Result<AsyncChecks, TransactionError> {
@@ -284,22 +459,21 @@ where
 
         let shielded_sighash = tx.sighash(upgrade, HashType::ALL, None);
 
-        Ok(
-            Self::verify_transparent_inputs_and_outputs(
-                &request,
-                network,
-                inputs,
-                script_verifier,
-            )?
-            .and(Self::verify_sprout_shielded_data(
-                joinsplit_data,
-                &shielded_sighash,
-            ))
-            .and(Self::verify_sapling_shielded_data(
-                sapling_shielded_data,
-                &shielded_sighash,
-            )?),
-        )
+        Ok(Self::verify_transparent_inputs_and_outputs(
+            request,
+            network,
+            script_verifier,
+            cached_ffi_transaction,
+            utxo_sender,
+        )?
+        .and(Self::verify_sprout_shielded_data(
+            joinsplit_data,
+            &shielded_sighash,
+        )?)
+        .and(Self::verify_sapling_shielded_data(
+            sapling_shielded_data,
+            &shielded_sighash,
+        )?))
     }
 
     /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
@@ -348,14 +522,15 @@ where
     ///   for more information)
     /// - the `network` to consider when verifying
     /// - the `script_verifier` to use for verifying the transparent transfers
-    /// - the transparent `inputs` in the transaction
+    /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the sapling shielded data of the transaction, if any
     /// - the orchard shielded data of the transaction, if any
     fn verify_v5_transaction(
-        request: Request,
+        request: &Request,
         network: Network,
         script_verifier: script::Verifier<ZS>,
-        inputs: &[transparent::Input],
+        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        utxo_sender: mpsc::UnboundedSender<script::Response>,
         sapling_shielded_data: &Option<sapling::ShieldedData<sapling::SharedAnchor>>,
         orchard_shielded_data: &Option<orchard::ShieldedData>,
     ) -> Result<AsyncChecks, TransactionError> {
@@ -366,11 +541,12 @@ where
 
         let shielded_sighash = transaction.sighash(upgrade, HashType::ALL, None);
 
-        let _async_checks = Self::verify_transparent_inputs_and_outputs(
-            &request,
+        Ok(Self::verify_transparent_inputs_and_outputs(
+            request,
             network,
-            inputs,
             script_verifier,
+            cached_ffi_transaction,
+            utxo_sender,
         )?
         .and(Self::verify_sapling_shielded_data(
             sapling_shielded_data,
@@ -379,16 +555,11 @@ where
         .and(Self::verify_orchard_shielded_data(
             orchard_shielded_data,
             &shielded_sighash,
-        )?);
+        )?))
 
         // TODO:
         // - verify orchard shielded pool (ZIP-224) (#2105)
-        // - ZIP-216 (#1798)
-        // - ZIP-244 (#1874)
-        // - remaining consensus rules (#2379)
-        // - remove `should_panic` from tests
-
-        unimplemented!("V5 transaction validation is not yet complete");
+        // - shielded input and output limits? (#2379)
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -419,13 +590,16 @@ where
         }
     }
 
-    /// Verifies if a transaction's transparent `inputs` are valid using the provided
-    /// `script_verifier`.
+    /// Verifies if a transaction's transparent inputs are valid using the provided
+    /// `script_verifier` and `cached_ffi_transaction`.
+    ///
+    /// Returns script verification responses via the `utxo_sender`.
     fn verify_transparent_inputs_and_outputs(
         request: &Request,
         network: Network,
-        inputs: &[transparent::Input],
         script_verifier: script::Verifier<ZS>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        utxo_sender: mpsc::UnboundedSender<script::Response>,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
 
@@ -434,15 +608,17 @@ where
             // Coinbase transactions don't have any PrevOut inputs.
             Ok(AsyncChecks::new())
         } else {
-            // feed all of the inputs to the script and shielded verifiers
+            // feed all of the inputs to the script verifier
             // the script_verifier also checks transparent sighashes, using its own implementation
-            let cached_ffi_transaction = Arc::new(CachedFfiTransaction::new(transaction));
+            let inputs = transaction.inputs();
             let known_utxos = request.known_utxos();
             let upgrade = request.upgrade(network);
 
             let script_checks = (0..inputs.len())
                 .into_iter()
                 .map(move |input_index| {
+                    let utxo_sender = utxo_sender.clone();
+
                     let request = script::Request {
                         upgrade,
                         known_utxos: known_utxos.clone(),
@@ -450,7 +626,9 @@ where
                         input_index,
                     };
 
-                    script_verifier.clone().oneshot(request)
+                    script_verifier.clone().oneshot(request).map_ok(move |rsp| {
+                        utxo_sender.send(rsp).expect("receiver is not dropped");
+                    })
                 })
                 .collect();
 
@@ -462,16 +640,25 @@ where
     fn verify_sprout_shielded_data(
         joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
         shielded_sighash: &SigHash,
-    ) -> AsyncChecks {
+    ) -> Result<AsyncChecks, TransactionError> {
         let mut checks = AsyncChecks::new();
 
         if let Some(joinsplit_data) = joinsplit_data {
-            // XXX create a method on JoinSplitData
-            // that prepares groth16::Items with the correct proofs
-            // and proof inputs, handling interstitial treestates
-            // correctly.
-
-            // Then, pass those items to self.joinsplit to verify them.
+            for joinsplit in joinsplit_data.joinsplits() {
+                // Consensus rule: The proof π_ZKSpend MUST be valid given a
+                // primary input formed from the relevant other fields and h_{Sig}
+                //
+                // Queue the verification of the Groth16 spend proof
+                // for each JoinSplit description while adding the
+                // resulting future to our collection of async
+                // checks that (at a minimum) must pass for the
+                // transaction to verify.
+                //
+                // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+                checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
+                    DescriptionWrapper(&(joinsplit, &joinsplit_data.pub_key)).try_into()?,
+                ));
+            }
 
             // Consensus rule: The joinSplitSig MUST represent a
             // valid signature, under joinSplitPubKey, of the
@@ -491,7 +678,7 @@ where
             checks.push(ed25519_verifier.oneshot(ed25519_item));
         }
 
-        checks
+        Ok(checks)
     }
 
     /// Verifies a transaction's Sapling shielded data.
@@ -507,13 +694,6 @@ where
 
         if let Some(sapling_shielded_data) = sapling_shielded_data {
             for spend in sapling_shielded_data.spends_per_anchor() {
-                // Consensus rule: cv and rk MUST NOT be of small
-                // order, i.e. [h_J]cv MUST NOT be 𝒪_J and [h_J]rk
-                // MUST NOT be 𝒪_J.
-                //
-                // https://zips.z.cash/protocol/protocol.pdf#spenddesc
-                check::spend_cv_rk_not_small_order(&spend)?;
-
                 // Consensus rule: The proof π_ZKSpend MUST be valid
                 // given a primary input formed from the other
                 // fields except spendAuthSig.
@@ -526,7 +706,7 @@ where
                 async_checks.push(
                     primitives::groth16::SPEND_VERIFIER
                         .clone()
-                        .oneshot(primitives::groth16::ItemWrapper::from(&spend).into()),
+                        .oneshot(DescriptionWrapper(&spend).try_into()?),
                 );
 
                 // Consensus rule: The spend authorization signature
@@ -541,18 +721,11 @@ where
                 async_checks.push(
                     primitives::redjubjub::VERIFIER
                         .clone()
-                        .oneshot((spend.rk, spend.spend_auth_sig, shielded_sighash).into()),
+                        .oneshot((spend.rk.into(), spend.spend_auth_sig, shielded_sighash).into()),
                 );
             }
 
             for output in sapling_shielded_data.outputs() {
-                // Consensus rule: cv and wpk MUST NOT be of small
-                // order, i.e. [h_J]cv MUST NOT be 𝒪_J and [h_J]wpk
-                // MUST NOT be 𝒪_J.
-                //
-                // https://zips.z.cash/protocol/protocol.pdf#outputdesc
-                check::output_cv_epk_not_small_order(output)?;
-
                 // Consensus rule: The proof π_ZKOutput MUST be
                 // valid given a primary input formed from the other
                 // fields except C^enc and C^out.
@@ -565,7 +738,7 @@ where
                 async_checks.push(
                     primitives::groth16::OUTPUT_VERIFIER
                         .clone()
-                        .oneshot(primitives::groth16::ItemWrapper::from(output).into()),
+                        .oneshot(DescriptionWrapper(output).try_into()?),
                 );
             }
 
@@ -591,6 +764,22 @@ where
         if let Some(orchard_shielded_data) = orchard_shielded_data {
             for authorized_action in orchard_shielded_data.actions.iter().cloned() {
                 let (action, spend_auth_sig) = authorized_action.into_parts();
+
+                // Consensus rule: The proof 𝜋 MUST be valid given a primary
+                // input (cv, rtOrchard, nf, rk, cm𝑥, enableSpends, enableOutputs)
+                //
+                // https://zips.z.cash/protocol/protocol.pdf#actiondesc
+                //
+                // Queue the verification of the Halo2 proof for each Action
+                // description while adding the resulting future to our
+                // collection of async checks that (at a minimum) must pass for
+                // the transaction to verify.
+                async_checks.push(
+                    primitives::halo2::VERIFIER
+                        .clone()
+                        .oneshot(primitives::halo2::Item::from(orchard_shielded_data)),
+                );
+
                 // Consensus rule: The spend authorization signature
                 // MUST be a valid SpendAuthSig signature over
                 // SigHash using rk as the validating key.
@@ -609,6 +798,13 @@ where
 
             let bvk = orchard_shielded_data.binding_verification_key();
 
+            // # Consensus
+            //
+            // > The Spend transfers and Action transfers of a transaction MUST be
+            // > consistent with its vbalanceSapling value as specified in § 4.13
+            // > ‘Balance and Binding Signature (Sapling)’ on p. 49.
+            //
+            // <https://zips.z.cash/protocol/protocol.pdf#spendsandoutputs>
             async_checks.push(
                 primitives::redpallas::VERIFIER
                     .clone()

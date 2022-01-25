@@ -17,24 +17,21 @@ use zebra_chain::{
     history_tree::HistoryTree,
     orchard,
     parameters::Network,
-    sapling,
+    sapling, sprout,
     transaction::{self, Transaction},
     transparent,
 };
-
-#[cfg(test)]
-use zebra_chain::sprout;
 
 use crate::{
     request::ContextuallyValidBlock, FinalizedBlock, HashOrHeight, PreparedBlock,
     ValidateContextError,
 };
 
-use self::chain::Chain;
+pub(crate) use self::chain::Chain;
 
 use super::{check, finalized_state::FinalizedState};
 
-/// The state of the chains in memory, incuding queued blocks.
+/// The state of the chains in memory, including queued blocks.
 #[derive(Debug, Clone)]
 pub struct NonFinalizedState {
     /// Verified, non-finalized chains, in ascending order.
@@ -83,6 +80,10 @@ impl NonFinalizedState {
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizedBlock {
+        // Chain::cmp uses the partial cumulative work, and the hash of the tip block.
+        // Neither of these fields has interior mutability.
+        // (And when the tip block is dropped for a chain, the chain is also dropped.)
+        #[allow(clippy::mutable_key_type)]
         let chains = mem::take(&mut self.chain_set);
         let mut chains = chains.into_iter();
 
@@ -121,6 +122,7 @@ impl NonFinalizedState {
     /// Commit block to the non-finalized state, on top of:
     /// - an existing chain's tip, or
     /// - a newly forked chain.
+    #[tracing::instrument(level = "debug", skip(self, finalized_state, prepared))]
     pub fn commit_block(
         &mut self,
         prepared: PreparedBlock,
@@ -131,6 +133,7 @@ impl NonFinalizedState {
 
         let parent_chain = self.parent_chain(
             parent_hash,
+            finalized_state.sprout_note_commitment_tree(),
             finalized_state.sapling_note_commitment_tree(),
             finalized_state.orchard_note_commitment_tree(),
             finalized_state.history_tree(),
@@ -160,6 +163,7 @@ impl NonFinalizedState {
 
     /// Commit block to the non-finalized state as a new chain where its parent
     /// is the finalized tip.
+    #[tracing::instrument(level = "debug", skip(self, finalized_state, prepared))]
     pub fn commit_new_chain(
         &mut self,
         prepared: PreparedBlock,
@@ -167,6 +171,7 @@ impl NonFinalizedState {
     ) -> Result<(), ValidateContextError> {
         let chain = Chain::new(
             self.network,
+            finalized_state.sprout_note_commitment_tree(),
             finalized_state.sapling_note_commitment_tree(),
             finalized_state.orchard_note_commitment_tree(),
             finalized_state.history_tree(),
@@ -183,6 +188,7 @@ impl NonFinalizedState {
 
     /// Contextually validate `prepared` using `finalized_state`.
     /// If validation succeeds, push `prepared` onto `parent_chain`.
+    #[tracing::instrument(level = "debug", skip(self, finalized_state, parent_chain))]
     fn validate_and_commit(
         &self,
         parent_chain: Chain,
@@ -195,10 +201,17 @@ impl NonFinalizedState {
             &parent_chain.spent_utxos,
             finalized_state,
         )?;
+
         check::prepared_block_commitment_is_valid_for_chain_history(
             &prepared,
             self.network,
             &parent_chain.history_tree,
+        )?;
+
+        check::anchors::anchors_refer_to_earlier_treestates(
+            finalized_state,
+            &parent_chain,
+            &prepared,
         )?;
 
         let contextual = ContextuallyValidBlock::with_block_and_spent_utxos(
@@ -240,6 +253,9 @@ impl NonFinalizedState {
     where
         F: Fn(&Chain) -> bool,
     {
+        // Chain::cmp uses the partial cumulative work, and the hash of the tip block.
+        // Neither of these fields has interior mutability.
+        #[allow(clippy::mutable_key_type)]
         let chains = mem::take(&mut self.chain_set);
         let mut best_chain_iter = chains.into_iter().rev();
 
@@ -390,6 +406,7 @@ impl NonFinalizedState {
     fn parent_chain(
         &mut self,
         parent_hash: block::Hash,
+        sprout_note_commitment_tree: sprout::tree::NoteCommitmentTree,
         sapling_note_commitment_tree: sapling::tree::NoteCommitmentTree,
         orchard_note_commitment_tree: orchard::tree::NoteCommitmentTree,
         history_tree: HistoryTree,
@@ -405,6 +422,7 @@ impl NonFinalizedState {
                         chain
                             .fork(
                                 parent_hash,
+                                sprout_note_commitment_tree.clone(),
                                 sapling_note_commitment_tree.clone(),
                                 orchard_note_commitment_tree.clone(),
                                 history_tree.clone(),
@@ -412,7 +430,7 @@ impl NonFinalizedState {
                             .transpose()
                     })
                     .expect(
-                        "commit_block is only called with blocks that are ready to be commited",
+                        "commit_block is only called with blocks that are ready to be committed",
                     )?,
             )),
         }

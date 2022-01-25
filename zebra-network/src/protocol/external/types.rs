@@ -38,8 +38,13 @@ impl From<Network> for Magic {
 
 /// A protocol version number.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Version(pub u32);
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.to_string())
+    }
+}
 
 impl Version {
     /// Returns the minimum remote node network protocol version for `network` and
@@ -74,7 +79,12 @@ impl Version {
     /// - after Zebra restarts, and
     /// - after Zebra's local network is slow or shut down.
     fn initial_min_for_network(network: Network) -> Version {
-        Version::min_specified_for_upgrade(network, constants::INITIAL_MIN_NETWORK_PROTOCOL_VERSION)
+        Version::min_specified_for_upgrade(
+            network,
+            *constants::INITIAL_MIN_NETWORK_PROTOCOL_VERSION
+                .get(&network)
+                .expect("We always have a value for testnet or mainnet"),
+        )
     }
 
     /// Returns the minimum specified network protocol version for `network` and
@@ -88,7 +98,10 @@ impl Version {
 
     /// Returns the minimum specified network protocol version for `network` and
     /// `network_upgrade`.
-    fn min_specified_for_upgrade(network: Network, network_upgrade: NetworkUpgrade) -> Version {
+    pub(crate) fn min_specified_for_upgrade(
+        network: Network,
+        network_upgrade: NetworkUpgrade,
+    ) -> Version {
         // TODO: Should we reject earlier protocol versions during our initial
         //       sync? zcashd accepts 170_002 or later during its initial sync.
         Version(match (network, network_upgrade) {
@@ -102,8 +115,8 @@ impl Version {
             (Mainnet, Heartwood) => 170_011,
             (Testnet, Canopy) => 170_012,
             (Mainnet, Canopy) => 170_013,
-            (Testnet, Nu5) => 170_014,
-            (Mainnet, Nu5) => 170_015,
+            (Testnet, Nu5) => 170_015,
+            (Mainnet, Nu5) => unreachable!("Nu5 Mainnet protocol version not yet defined"),
         })
     }
 }

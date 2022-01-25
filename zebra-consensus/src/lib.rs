@@ -33,12 +33,6 @@
 #![doc(html_favicon_url = "https://www.zfnd.org/images/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://www.zfnd.org/images/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_consensus")]
-// Standard lints
-// Warn on missing docs for all modules after cleaning the API surface
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
 
 mod block;
 mod checkpoint;
@@ -53,9 +47,11 @@ pub mod chain;
 #[allow(missing_docs)]
 pub mod error;
 
-pub use checkpoint::MAX_CHECKPOINT_BYTE_COUNT;
-pub use checkpoint::MAX_CHECKPOINT_HEIGHT_GAP;
+pub use block::VerifyBlockError;
+pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 pub use config::Config;
+pub use error::BlockError;
+pub use primitives::groth16;
 
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

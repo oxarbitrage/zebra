@@ -221,7 +221,17 @@ pub struct NoteCommitmentTree {
     /// It consists of nodes along the rightmost (newer) branch of the tree that
     /// has non-empty nodes. Upper (near root) empty nodes of the branch are not
     /// stored.
+    ///
+    /// # Consensus
+    ///
+    /// > [NU5 onward] A block MUST NOT add Orchard note commitments that would result in the Orchard note
+    /// > commitment tree exceeding its capacity of 2^(MerkleDepth^Orchard) leaf nodes.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#merkletree>
+    ///
+    /// Note: MerkleDepth^Orchard = MERKLE_DEPTH = 32.
     inner: bridgetree::Frontier<Node, { MERKLE_DEPTH as u8 }>,
+
     /// A cached root of the tree.
     ///
     /// Every time the root is computed by [`Self::root`] it is cached here,
@@ -294,16 +304,14 @@ impl NoteCommitmentTree {
     ///
     /// For Orchard, the tree is capped at 2^32.
     pub fn count(&self) -> u64 {
-        self.inner
-            .position()
-            .map_or(0, |pos| usize::from(pos) as u64 + 1)
+        self.inner.position().map_or(0, |pos| u64::from(pos) + 1)
     }
 }
 
 impl Default for NoteCommitmentTree {
     fn default() -> Self {
         Self {
-            inner: bridgetree::Frontier::new(),
+            inner: bridgetree::Frontier::empty(),
             cached_root: Default::default(),
         }
     }

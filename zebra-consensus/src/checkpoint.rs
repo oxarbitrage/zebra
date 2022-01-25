@@ -601,7 +601,7 @@ where
             .expect("the current checkpoint range has continuous Vec<QueuedBlock>s");
         assert!(
             !qblocks.is_empty(),
-            "the current checkpoint range has continous Blocks"
+            "the current checkpoint range has continuous Blocks"
         );
 
         // Check interim checkpoints
@@ -836,6 +836,7 @@ where
 }
 
 #[derive(Debug, Error)]
+#[allow(missing_docs)]
 pub enum VerifyCheckpointError {
     #[error("checkpoint request after the final checkpoint has been verified")]
     Finished,
@@ -1006,7 +1007,7 @@ where
                 result.expect("commit_finalized_block should not panic")
             };
             if result.is_err() {
-                // If there was an error comitting the block, then this verifier
+                // If there was an error committing the block, then this verifier
                 // will be out of sync with the state. In that case, reset
                 // its progress back to the state tip.
                 let tip = match state_service

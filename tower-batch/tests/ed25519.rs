@@ -1,9 +1,3 @@
-// Standard lints
-#![warn(missing_docs)]
-#![allow(clippy::try_err)]
-#![deny(clippy::await_holding_lock)]
-#![forbid(unsafe_code)]
-
 use std::{
     future::Future,
     mem,
@@ -112,7 +106,7 @@ where
             sk.sign(&msg[..])
         };
 
-        verifier.ready_and().await?;
+        verifier.ready().await?;
         results.push(span.in_scope(|| verifier.call((vk_bytes, sig, msg).into())))
     }
 

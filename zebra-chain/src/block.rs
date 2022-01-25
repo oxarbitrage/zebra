@@ -11,7 +11,7 @@ pub mod merkle;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub mod arbitrary;
-#[cfg(any(test, feature = "bench"))]
+#[cfg(any(test, feature = "bench", feature = "proptest-impl"))]
 pub mod tests;
 
 use std::{collections::HashMap, convert::TryInto, fmt, ops::Neg};
@@ -55,11 +55,14 @@ pub struct Block {
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = f.debug_struct("Block");
+
         if let Some(height) = self.coinbase_height() {
             fmter.field("height", &height);
         }
+        fmter.field("transactions", &self.transactions.len());
+        fmter.field("hash", &DisplayToDebug(self.hash()));
 
-        fmter.field("hash", &DisplayToDebug(self.hash())).finish()
+        fmter.finish()
     }
 }
 
@@ -102,7 +105,7 @@ impl Block {
     /// # Consensus rule:
     ///
     ///  The nConsensusBranchId field MUST match the consensus branch ID used for
-    ///  SIGHASH transaction hashes, as specifed in [ZIP-244] ([7.1]).
+    ///  SIGHASH transaction hashes, as specified in [ZIP-244] ([7.1]).
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
     /// [7.1]: https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus
@@ -129,24 +132,21 @@ impl Block {
     pub fn sprout_nullifiers(&self) -> impl Iterator<Item = &sprout::Nullifier> {
         self.transactions
             .iter()
-            .map(|transaction| transaction.sprout_nullifiers())
-            .flatten()
+            .flat_map(|transaction| transaction.sprout_nullifiers())
     }
 
     /// Access the [`sapling::Nullifier`]s from all transactions in this block.
     pub fn sapling_nullifiers(&self) -> impl Iterator<Item = &sapling::Nullifier> {
         self.transactions
             .iter()
-            .map(|transaction| transaction.sapling_nullifiers())
-            .flatten()
+            .flat_map(|transaction| transaction.sapling_nullifiers())
     }
 
     /// Access the [`orchard::Nullifier`]s from all transactions in this block.
     pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
         self.transactions
             .iter()
-            .map(|transaction| transaction.orchard_nullifiers())
-            .flatten()
+            .flat_map(|transaction| transaction.orchard_nullifiers())
     }
 
     /// Count how many Sapling transactions exist in a block,
