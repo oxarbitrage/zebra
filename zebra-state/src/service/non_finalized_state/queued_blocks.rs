@@ -9,7 +9,7 @@ use zebra_chain::{block, transparent};
 use crate::service::QueuedBlock;
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct QueuedBlocks {
     /// Blocks awaiting their parent blocks for contextual verification.
     blocks: HashMap<block::Hash, QueuedBlock>,
@@ -144,7 +144,7 @@ impl QueuedBlocks {
             }
         }
 
-        tracing::trace!(num_blocks = %self.blocks.len(), "Finished pruning blocks at or beneath the finalized tip height",);
+        tracing::trace!(num_blocks = %self.blocks.len(), "Finished pruning blocks at or beneath the finalized tip height");
         self.update_metrics();
     }
 

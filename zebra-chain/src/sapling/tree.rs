@@ -10,10 +10,14 @@
 //!
 //! A root of a note commitment tree is associated with each treestate.
 
-#![allow(clippy::unit_arg)]
 #![allow(dead_code)]
 
-use std::{cell::Cell, fmt};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    io,
+    ops::Deref,
+};
 
 use bitvec::prelude::*;
 use incrementalmerkletree::{bridgetree, Frontier};
@@ -22,6 +26,9 @@ use thiserror::Error;
 
 use super::commitment::pedersen_hashes::pedersen_hash;
 
+use crate::serialization::{
+    serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
+};
 pub(super) const MERKLE_DEPTH: usize = 32;
 
 /// MerkleCRH^Sapling Hash Function
@@ -81,36 +88,68 @@ pub struct Position(pub(crate) u64);
 /// commitment tree corresponding to the final Sapling treestate of
 /// this block. A root of a note commitment tree is associated with
 /// each treestate.
-#[derive(Clone, Copy, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct Root(pub [u8; 32]);
+#[derive(Clone, Copy, Default, Eq, Serialize, Deserialize)]
+pub struct Root(#[serde(with = "serde_helpers::Fq")] pub(crate) jubjub::Base);
 
 impl fmt::Debug for Root {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("Root").field(&hex::encode(&self.0)).finish()
-    }
-}
-
-impl From<[u8; 32]> for Root {
-    fn from(bytes: [u8; 32]) -> Root {
-        Self(bytes)
+        f.debug_tuple("Root")
+            .field(&hex::encode(&self.0.to_bytes()))
+            .finish()
     }
 }
 
 impl From<Root> for [u8; 32] {
     fn from(root: Root) -> Self {
-        root.0
-    }
-}
-
-impl From<&[u8; 32]> for Root {
-    fn from(bytes: &[u8; 32]) -> Root {
-        (*bytes).into()
+        root.0.to_bytes()
     }
 }
 
 impl From<&Root> for [u8; 32] {
     fn from(root: &Root) -> Self {
         (*root).into()
+    }
+}
+
+impl PartialEq for Root {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Hash for Root {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bytes().hash(state)
+    }
+}
+
+impl TryFrom<[u8; 32]> for Root {
+    type Error = SerializationError;
+
+    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
+        let possible_point = jubjub::Base::from_bytes(&bytes);
+
+        if possible_point.is_some().into() {
+            Ok(Self(possible_point.unwrap()))
+        } else {
+            Err(SerializationError::Parse(
+                "Invalid jubjub::Base value for Sapling note commitment tree root",
+            ))
+        }
+    }
+}
+
+impl ZcashSerialize for Root {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_all(&<[u8; 32]>::from(*self)[..])?;
+
+        Ok(())
+    }
+}
+
+impl ZcashDeserialize for Root {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        Self::try_from(reader.read_32_bytes()?)
     }
 }
 
@@ -176,7 +215,7 @@ pub enum NoteCommitmentTreeError {
 }
 
 /// Sapling Incremental Note Commitment Tree.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NoteCommitmentTree {
     /// The tree represented as a Frontier.
     ///
@@ -207,12 +246,9 @@ pub struct NoteCommitmentTree {
     /// serialized with the tree). This is particularly important since we decided
     /// to instantiate the trees from the genesis block, for simplicity.
     ///
-    /// [`Cell`] offers interior mutability (it works even with a non-mutable
-    /// reference to the tree) but it prevents the tree (and anything that uses it)
-    /// from being shared between threads. If this ever becomes an issue we can
-    /// leave caching to the callers (which requires much more code), or replace
-    /// `Cell` with `Arc<Mutex<_>>` (and be careful of deadlocks and async code.)
-    cached_root: Cell<Option<Root>>,
+    /// We use a [`RwLock`] for this cache, because it is only written once per tree update.
+    /// Each tree has its own cached root, a new lock is created for each clone.
+    cached_root: std::sync::RwLock<Option<Root>>,
 }
 
 impl NoteCommitmentTree {
@@ -226,7 +262,13 @@ impl NoteCommitmentTree {
     pub fn append(&mut self, cm_u: jubjub::Fq) -> Result<(), NoteCommitmentTreeError> {
         if self.inner.append(&cm_u.into()) {
             // Invalidate cached root
-            self.cached_root.replace(None);
+            let cached_root = self
+                .cached_root
+                .get_mut()
+                .expect("a thread that previously held exclusive lock access panicked");
+
+            *cached_root = None;
+
             Ok(())
         } else {
             Err(NoteCommitmentTreeError::FullTree)
@@ -236,13 +278,28 @@ impl NoteCommitmentTree {
     /// Returns the current root of the tree, used as an anchor in Sapling
     /// shielded transactions.
     pub fn root(&self) -> Root {
-        match self.cached_root.get() {
-            // Return cached root
-            Some(root) => root,
+        if let Some(root) = self
+            .cached_root
+            .read()
+            .expect("a thread that previously held exclusive lock access panicked")
+            .deref()
+        {
+            // Return cached root.
+            return *root;
+        }
+
+        // Get exclusive access, compute the root, and cache it.
+        let mut write_root = self
+            .cached_root
+            .write()
+            .expect("a thread that previously held exclusive lock access panicked");
+        match write_root.deref() {
+            // Another thread got write access first, return cached root.
+            Some(root) => *root,
             None => {
-                // Compute root and cache it
-                let root = Root(self.inner.root().0);
-                self.cached_root.replace(Some(root));
+                // Compute root and cache it.
+                let root = Root::try_from(self.inner.root().0).unwrap();
+                *write_root = Some(root);
                 root
             }
         }
@@ -268,6 +325,21 @@ impl NoteCommitmentTree {
     /// For Sapling, the tree is capped at 2^32.
     pub fn count(&self) -> u64 {
         self.inner.position().map_or(0, |pos| u64::from(pos) + 1)
+    }
+}
+
+impl Clone for NoteCommitmentTree {
+    /// Clones the inner tree, and creates a new `RwLock` with the cloned root data.
+    fn clone(&self) -> Self {
+        let cached_root = *self
+            .cached_root
+            .read()
+            .expect("a thread that previously held exclusive lock access panicked");
+
+        Self {
+            inner: self.inner.clone(),
+            cached_root: std::sync::RwLock::new(cached_root),
+        }
     }
 }
 

@@ -5,10 +5,16 @@ on:
   push:
     branches:
       - main
-    path:
+    paths:
+      # doc source files
       - 'book/**'
       - '**/firebase.json'
       - 'katex-header.html'
+      # rustdoc source files
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      # workflow definitions
       - '.github/workflows/docs.yml'
 
 jobs:
@@ -18,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout the source code
-      uses: actions/checkout@v2.4.0
+      uses: actions/checkout@v3.0.0
       with:
         persist-credentials: false
 

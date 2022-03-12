@@ -9,7 +9,7 @@ use zebra_chain::{
 
 use crate::{
     constants::MIN_TRANSPARENT_COINBASE_MATURITY,
-    service::finalized_state::FinalizedState,
+    service::finalized_state::ZebraDb,
     PreparedBlock,
     ValidateContextError::{
         self, DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
@@ -39,7 +39,7 @@ pub fn transparent_spend(
     prepared: &PreparedBlock,
     non_finalized_chain_unspent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     non_finalized_chain_spent_utxos: &HashSet<transparent::OutPoint>,
-    finalized_state: &FinalizedState,
+    finalized_state: &ZebraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::Utxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
 
@@ -117,7 +117,7 @@ fn transparent_spend_chain_order(
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     non_finalized_chain_unspent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     non_finalized_chain_spent_utxos: &HashSet<transparent::OutPoint>,
-    finalized_state: &FinalizedState,
+    finalized_state: &ZebraDb,
 ) -> Result<transparent::Utxo, ValidateContextError> {
     if let Some(output) = block_new_outputs.get(&spend) {
         // reject the spend if it uses an output from this block,
@@ -168,16 +168,19 @@ fn transparent_spend_chain_order(
 
 /// Check that `utxo` is spendable, based on the coinbase `spend_restriction`.
 ///
-/// "A transaction with one or more transparent inputs from coinbase transactions
-/// MUST have no transparent outputs (i.e.tx_out_count MUST be 0)."
+/// # Consensus
 ///
-/// "A transaction MUST NOT spend a transparent output of a coinbase transaction
-/// from a block less than 100 blocks prior to the spend.
+/// > A transaction with one or more transparent inputs from coinbase transactions
+/// > MUST have no transparent outputs (i.e. tx_out_count MUST be 0).
+/// > Inputs from coinbase transactions include Founders’ Reward outputs and
+/// > funding stream outputs.
 ///
-/// Note that transparent outputs of coinbase transactions include Founders’
-/// Reward outputs and transparent funding stream outputs."
+/// > A transaction MUST NOT spend a transparent output of a coinbase transaction
+/// > from a block less than 100 blocks prior to the spend.
+/// > Note that transparent outputs of coinbase transactions include
+/// > Founders’ Reward outputs and transparent funding stream outputs.
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+/// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
 pub fn transparent_coinbase_spend(
     outpoint: transparent::OutPoint,
     spend_restriction: transparent::CoinbaseSpendRestriction,
@@ -190,7 +193,6 @@ pub fn transparent_coinbase_spend(
     match spend_restriction {
         OnlyShieldedOutputs { spend_height } => {
             let min_spend_height = utxo.height + block::Height(MIN_TRANSPARENT_COINBASE_MATURITY);
-            // TODO: allow full u32 range of block heights (#1113)
             let min_spend_height =
                 min_spend_height.expect("valid UTXOs have coinbase heights far below Height::MAX");
             if spend_height >= min_spend_height {

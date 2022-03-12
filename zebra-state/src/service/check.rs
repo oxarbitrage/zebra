@@ -12,11 +12,10 @@ use zebra_chain::{
     work::difficulty::CompactDifficulty,
 };
 
-use crate::{FinalizedBlock, PreparedBlock, ValidateContextError};
+use crate::{constants, BoxError, FinalizedBlock, PreparedBlock, ValidateContextError};
 
+// use self as check
 use super::check;
-
-use difficulty::{AdjustedDifficulty, POW_MEDIAN_BLOCK_SPAN};
 
 pub(crate) mod anchors;
 pub(crate) mod difficulty;
@@ -25,6 +24,8 @@ pub(crate) mod utxo;
 
 #[cfg(test)]
 mod tests;
+
+use difficulty::{AdjustedDifficulty, POW_MEDIAN_BLOCK_SPAN};
 
 /// Check that the `prepared` block is contextually valid for `network`, based
 /// on the `finalized_tip_height` and `relevant_chain`.
@@ -132,10 +133,30 @@ fn block_commitment_is_valid_for_chain_history(
         block::Commitment::PreSaplingReserved(_)
         | block::Commitment::FinalSaplingRoot(_)
         | block::Commitment::ChainHistoryActivationReserved => {
-            // No contextual checks needed for those.
+            // # Consensus
+            //
+            // > [Sapling and Blossom only, pre-Heartwood] hashLightClientRoot MUST
+            // > be LEBS2OSP_{256}(rt^{Sapling}) where rt^{Sapling} is the root of
+            // > the Sapling note commitment tree for the final Sapling treestate of
+            // > this block .
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#blockheader
+            //
+            // We don't need to validate this rule since we checkpoint on Canopy.
+            //
+            // We also don't need to do anything in the other cases.
             Ok(())
         }
         block::Commitment::ChainHistoryRoot(actual_history_tree_root) => {
+            // # Consensus
+            //
+            // > [Heartwood and Canopy only, pre-NU5] hashLightClientRoot MUST be set to the
+            // > hashChainHistoryRoot for this block , as specified in [ZIP-221].
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#blockheader
+            //
+            // The network is checked by [`Block::commitment`] above; it will only
+            // return the chain history root if it's Heartwood or Canopy.
             let history_tree_root = history_tree
                 .hash()
                 .expect("the history tree of the previous block must exist since the current block has a ChainHistoryRoot");
@@ -151,6 +172,13 @@ fn block_commitment_is_valid_for_chain_history(
             }
         }
         block::Commitment::ChainHistoryBlockTxAuthCommitment(actual_hash_block_commitments) => {
+            // # Consensus
+            //
+            // > [NU5 onward] hashBlockCommitments MUST be set to the value of
+            // > hashBlockCommitments for this block, as specified in [ZIP-244].
+            //
+            // The network is checked by [`Block::commitment`] above; it will only
+            // return the block commitments if it's NU5 onward.
             let history_tree_root = history_tree
                 .hash()
                 .expect("the history tree of the previous block must exist since the current block has a ChainHistoryBlockTxAuthCommitment");
@@ -274,6 +302,57 @@ fn difficulty_threshold_is_valid(
             difficulty_threshold,
             expected_difficulty,
         })?
+    }
+
+    Ok(())
+}
+
+/// Check if zebra is following a legacy chain and return an error if so.
+pub(crate) fn legacy_chain<I>(
+    nu5_activation_height: block::Height,
+    ancestors: I,
+    network: Network,
+) -> Result<(), BoxError>
+where
+    I: Iterator<Item = Arc<Block>>,
+{
+    for (count, block) in ancestors.enumerate() {
+        // Stop checking if the chain reaches Canopy. We won't find any more V5 transactions,
+        // so the rest of our checks are useless.
+        //
+        // If the cached tip is close to NU5 activation, but there aren't any V5 transactions in the
+        // chain yet, we could reach MAX_BLOCKS_TO_CHECK in Canopy, and incorrectly return an error.
+        if block
+            .coinbase_height()
+            .expect("valid blocks have coinbase heights")
+            < nu5_activation_height
+        {
+            return Ok(());
+        }
+
+        // If we are past our NU5 activation height, but there are no V5 transactions in recent blocks,
+        // the Zebra instance that verified those blocks had no NU5 activation height.
+        if count >= constants::MAX_LEGACY_CHAIN_BLOCKS {
+            return Err("giving up after checking too many blocks".into());
+        }
+
+        // If a transaction `network_upgrade` field is different from the network upgrade calculated
+        // using our activation heights, the Zebra instance that verified those blocks had different
+        // network upgrade heights.
+        block
+            .check_transaction_network_upgrade_consistency(network)
+            .map_err(|_| "inconsistent network upgrade found in transaction")?;
+
+        // If we find at least one transaction with a valid `network_upgrade` field, the Zebra instance that
+        // verified those blocks used the same network upgrade heights. (Up to this point in the chain.)
+        let has_network_upgrade = block
+            .transactions
+            .iter()
+            .find_map(|trans| trans.network_upgrade())
+            .is_some();
+        if has_network_upgrade {
+            return Ok(());
+        }
     }
 
     Ok(())

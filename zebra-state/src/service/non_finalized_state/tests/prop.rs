@@ -1,3 +1,5 @@
+//! Randomised property tests for the non-finalized state.
+
 use std::{collections::BTreeMap, env, sync::Arc};
 
 use zebra_test::prelude::*;
@@ -419,7 +421,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
             .iter()
             .skip(finalized_count)
             .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
-                full_chain = full_chain.push(block.clone())?;
+                full_chain= full_chain.push(block.clone())?;
             }
 
         for _ in 0..finalized_count {
@@ -466,7 +468,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
         let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
-        finalized_state.set_current_value_pool(fake_value_pool);
+        finalized_state.set_finalized_value_pool(fake_value_pool);
 
         // use `valid_count` as the number of valid blocks before an invalid block
         let valid_tip_height = chain[valid_count - 1].height;

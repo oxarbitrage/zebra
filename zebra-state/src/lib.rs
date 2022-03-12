@@ -12,6 +12,9 @@
 #![doc(html_logo_url = "https://www.zfnd.org/images/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_state")]
 
+#[macro_use]
+extern crate tracing;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 mod config;
@@ -37,6 +40,7 @@ pub use service::{
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{
+    arbitrary::populated_state,
     chain_tip::{ChainTipBlock, ChainTipSender},
     init_test,
 };

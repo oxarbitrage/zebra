@@ -6,7 +6,7 @@ use std::{
     ops::Deref,
 };
 
-use multiset::HashMultiSet;
+use mset::MultiSet;
 use tracing::instrument;
 
 use zebra_chain::{
@@ -60,7 +60,7 @@ pub struct Chain {
     pub(crate) history_tree: HistoryTree,
 
     /// The Sprout anchors created by `blocks`.
-    pub(crate) sprout_anchors: HashMultiSet<sprout::tree::Root>,
+    pub(crate) sprout_anchors: MultiSet<sprout::tree::Root>,
     /// The Sprout anchors created by each block in `blocks`.
     pub(crate) sprout_anchors_by_height: BTreeMap<block::Height, sprout::tree::Root>,
     /// The Sprout note commitment tree for each anchor.
@@ -68,11 +68,11 @@ pub struct Chain {
     pub(crate) sprout_trees_by_anchor:
         HashMap<sprout::tree::Root, sprout::tree::NoteCommitmentTree>,
     /// The Sapling anchors created by `blocks`.
-    pub(crate) sapling_anchors: HashMultiSet<sapling::tree::Root>,
+    pub(crate) sapling_anchors: MultiSet<sapling::tree::Root>,
     /// The Sapling anchors created by each block in `blocks`.
     pub(crate) sapling_anchors_by_height: BTreeMap<block::Height, sapling::tree::Root>,
     /// The Orchard anchors created by `blocks`.
-    pub(crate) orchard_anchors: HashMultiSet<orchard::tree::Root>,
+    pub(crate) orchard_anchors: MultiSet<orchard::tree::Root>,
     /// The Orchard anchors created by each block in `blocks`.
     pub(crate) orchard_anchors_by_height: BTreeMap<block::Height, orchard::tree::Root>,
 
@@ -119,12 +119,12 @@ impl Chain {
             sapling_note_commitment_tree,
             orchard_note_commitment_tree,
             spent_utxos: Default::default(),
-            sprout_anchors: HashMultiSet::new(),
+            sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
-            sapling_anchors: HashMultiSet::new(),
+            sapling_anchors: MultiSet::new(),
             sapling_anchors_by_height: Default::default(),
-            orchard_anchors: HashMultiSet::new(),
+            orchard_anchors: MultiSet::new(),
             orchard_anchors_by_height: Default::default(),
             sprout_nullifiers: Default::default(),
             sapling_nullifiers: Default::default(),
@@ -189,7 +189,7 @@ impl Chain {
 
     /// Push a contextually valid non-finalized block into this chain as the new tip.
     ///
-    /// If the block is invalid, drop this chain and return an error.
+    /// If the block is invalid, drops this chain, and returns an error.
     ///
     /// Note: a [`ContextuallyValidBlock`] isn't actually contextually valid until
     /// [`update_chain_state_with`] returns success.
@@ -197,6 +197,7 @@ impl Chain {
     pub fn push(mut self, block: ContextuallyValidBlock) -> Result<Chain, ValidateContextError> {
         // update cumulative data members
         self.update_chain_tip_with(&block)?;
+
         tracing::debug!(block = %block.block, "adding block to chain");
         self.blocks.insert(block.height, block);
 
@@ -308,12 +309,30 @@ impl Chain {
         Ok(Some(forked))
     }
 
+    /// Returns the block hash of the tip block.
     pub fn non_finalized_tip_hash(&self) -> block::Hash {
         self.blocks
             .values()
             .next_back()
             .expect("only called while blocks is populated")
             .hash
+    }
+
+    /// Returns the block hash of the non-finalized root block.
+    pub fn non_finalized_root_hash(&self) -> block::Hash {
+        self.blocks
+            .values()
+            .next()
+            .expect("only called while blocks is populated")
+            .hash
+    }
+
+    /// Returns the block hash of the `n`th block from the non-finalized root.
+    ///
+    /// This is the block at `lowest_height() + n`.
+    #[allow(dead_code)]
+    pub fn non_finalized_nth_hash(&self, n: usize) -> Option<block::Hash> {
+        self.blocks.values().nth(n).map(|block| block.hash)
     }
 
     /// Remove the highest height block of the non-finalized portion of a chain.
@@ -350,8 +369,21 @@ impl Chain {
         self.blocks.keys().next_back().cloned()
     }
 
+    /// Return the non-finalized tip block for this chain,
+    /// or `None` if `self.blocks` is empty.
+    pub fn tip_block(&self) -> Option<&ContextuallyValidBlock> {
+        self.blocks.values().next_back()
+    }
+
+    /// Returns true if the non-finalized part of this chain is empty.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    /// Returns the non-finalized length of this chain.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
     }
 
     /// Returns the unspent transaction outputs (UTXOs) in this non-finalized chain.

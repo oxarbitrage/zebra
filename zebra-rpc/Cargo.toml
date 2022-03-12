@@ -8,3 +8,34 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+zebra-chain = { path = "../zebra-chain" }
+zebra-network = { path = "../zebra-network" }
+zebra-node-services = { path = "../zebra-node-services" }
+zebra-state = { path = "../zebra-state" }
+
+futures = "0.3.21"
+
+# lightwalletd sends JSON-RPC requests over HTTP 1.1
+hyper = { version = "0.14.17", features = ["http1", "server"] }
+
+jsonrpc-core = "18.0.0"
+jsonrpc-derive = "18.0.0"
+jsonrpc-http-server = "18.0.0"
+
+tokio = { version = "1.17.0", features = ["time", "rt-multi-thread", "macros", "tracing"] }
+tower = "0.4.12"
+
+tracing = "0.1.31"
+tracing-futures = "0.2.5"
+
+hex = { version = "0.4.3", features = ["serde"] }
+serde = { version = "1.0.136", features = ["serde_derive"] }
+
+[dev-dependencies]
+proptest = "0.10.1"
+thiserror = "1.0.30"
+tokio = { version = "1.16.1", features = ["full", "test-util"] }
+
+zebra-chain = { path = "../zebra-chain", features = ["proptest-impl"] }
+zebra-state = { path = "../zebra-state", features = ["proptest-impl"] }
+zebra-test = { path = "../zebra-test/" }

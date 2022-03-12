@@ -5,10 +5,13 @@ on:
     branches:
       - "**"
       - "!main"
-    path:
+    paths:
+      # code and tests
       - '**/*.rs'
+      # dependencies
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      # workflow definitions
       - 'clippy.toml'
       - '.cargo/config.toml'
       - '.github/workflows/lint.yml'
@@ -16,6 +19,8 @@ on:
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: full
+  RUST_LIB_BACKTRACE: full
+  COLORBT_SHOW_HIDDEN: '1'
 
 jobs:
   clippy:
@@ -28,13 +33,32 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run clippy
+      - name: Check workflow permissions
+        id: check_permissions
+        uses: scherermichael-oss/action-has-permission@1.0.6
+        with:
+          required-permission: write
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run clippy action to produce annotations
         uses: actions-rs/clippy-check@v1.0.7
+        if: ${{ steps.check_permissions.outputs.has-permission }}
         with:
           # GitHub displays the clippy job and its results as separate entries
           name: Clippy (stable) Results
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --all-features --all-targets -- -D warnings
+
+      - uses: actions-rs/toolchain@v1.0.1
+        if: ${{ !steps.check_permissions.outputs.has-permission }}
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Run clippy manually without annotations
+        if: ${{ !steps.check_permissions.outputs.has-permission }}
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt
@@ -46,7 +70,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rs/toolchain@v1
+      - uses: actions-rs/toolchain@v1.0.1
         with:
           toolchain: stable
           components: rustfmt
