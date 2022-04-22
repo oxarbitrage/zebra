@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 210
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
@@ -123,7 +123,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.regenerate-disks != 'true' }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
@@ -146,7 +146,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.regenerate-disks != 'true' }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
@@ -167,7 +167,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.regenerate-disks != 'true' }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
@@ -185,7 +185,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.regenerate-disks != 'true' }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
@@ -206,7 +206,7 @@ jobs:
     outputs:
       any_changed: ${{ steps.changed-files-specific.outputs.any_changed }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
           fetch-depth: '2'
@@ -345,7 +345,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ build, regenerate-stateful-disks]
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v3.0.2
         with:
           persist-credentials: false
 
