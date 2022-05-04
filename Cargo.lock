@@ -803,45 +803,18 @@ dependencies = [
 
 [[package]]
 name = "color-eyre"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f1885697ee8a177096d42f158922251a41973117f6d8a234cee94b9509157b7"
-dependencies = [
- "backtrace",
- "color-spantrace 0.1.6",
- "eyre",
- "indenter",
- "once_cell",
- "owo-colors 1.3.0",
- "tracing-error 0.1.2",
- "url",
-]
-
-[[package]]
-name = "color-eyre"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ebf286c900a6d5867aeff75cfee3192857bb7f24b547d4f0df2ed6baa812c90"
 dependencies = [
  "backtrace",
- "color-spantrace 0.2.0",
+ "color-spantrace",
  "eyre",
  "indenter",
  "once_cell",
- "owo-colors 3.4.0",
+ "owo-colors",
  "tracing-error 0.2.0",
-]
-
-[[package]]
-name = "color-spantrace"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6eee477a4a8a72f4addd4de416eb56d54bc307b284d6601bafdee1f4ea462d1"
-dependencies = [
- "once_cell",
- "owo-colors 1.3.0",
- "tracing-core",
- "tracing-error 0.1.2",
+ "url",
 ]
 
 [[package]]
@@ -851,7 +824,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ba75b3d9449ecdccb27ecbc479fdc0b87fa2dd43d2f8298f9bf0e59aacc8dce"
 dependencies = [
  "once_cell",
- "owo-colors 3.4.0",
+ "owo-colors",
  "tracing-core",
  "tracing-error 0.2.0",
 ]
@@ -2925,12 +2898,6 @@ checksum = "6ff55baddef9e4ad00f88b6c743a2a8062d4c6ade126c2a528644b8e444d52ce"
 dependencies = [
  "stable_deref_trait",
 ]
-
-[[package]]
-name = "owo-colors"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2386b4ebe91c2f7f51082d4cefa145d030e33a1842a96b12e4885cc3c01f7a55"
 
 [[package]]
 name = "owo-colors"
@@ -5219,7 +5186,7 @@ dependencies = [
 name = "tower-batch"
 version = "0.2.23"
 dependencies = [
- "color-eyre 0.6.1",
+ "color-eyre",
  "ed25519-zebra",
  "futures",
  "futures-core",
@@ -6060,7 +6027,7 @@ dependencies = [
  "bs58",
  "byteorder",
  "chrono",
- "color-eyre 0.6.1",
+ "color-eyre",
  "criterion",
  "displaydoc",
  "ed25519-zebra",
@@ -6113,7 +6080,7 @@ dependencies = [
  "blake2b_simd 1.0.0",
  "bls12_381",
  "chrono",
- "color-eyre 0.6.1",
+ "color-eyre",
  "dirs",
  "displaydoc",
  "futures",
@@ -6236,7 +6203,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "bincode",
  "chrono",
- "color-eyre 0.6.1",
+ "color-eyre",
  "dirs",
  "displaydoc",
  "futures",
@@ -6269,14 +6236,14 @@ dependencies = [
 name = "zebra-test"
 version = "1.0.0-beta.8"
 dependencies = [
- "color-eyre 0.5.11",
+ "color-eyre",
  "futures",
  "hex",
  "indexmap",
  "insta",
  "lazy_static",
  "once_cell",
- "owo-colors 3.4.0",
+ "owo-colors",
  "proptest",
  "rand 0.8.5",
  "regex",
@@ -6294,7 +6261,7 @@ dependencies = [
 name = "zebra-utils"
 version = "1.0.0-beta.8"
 dependencies = [
- "color-eyre 0.6.1",
+ "color-eyre",
  "hex",
  "serde_json",
  "structopt",
@@ -6312,7 +6279,7 @@ dependencies = [
  "abscissa_core",
  "atty",
  "chrono",
- "color-eyre 0.5.11",
+ "color-eyre",
  "dirs",
  "futures",
  "gumdrop",
