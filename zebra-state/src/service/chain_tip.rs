@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
-use tracing::instrument;
+use tracing::{field, instrument};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -23,7 +23,9 @@ use zebra_chain::{
     transaction,
 };
 
-use crate::{request::ContextuallyValidBlock, FinalizedBlock};
+use crate::{
+    request::ContextuallyValidBlock, service::watch_receiver::WatchReceiver, FinalizedBlock,
+};
 
 use TipAction::*;
 
@@ -74,10 +76,10 @@ impl From<ContextuallyValidBlock> for ChainTipBlock {
             block,
             hash,
             height,
-            new_outputs: _,
             transaction_hashes,
-            chain_value_pool_change: _,
+            ..
         } = contextually_valid;
+
         Self {
             hash,
             height,
@@ -94,8 +96,8 @@ impl From<FinalizedBlock> for ChainTipBlock {
             block,
             hash,
             height,
-            new_outputs: _,
             transaction_hashes,
+            ..
         } = finalized;
         Self {
             hash,
@@ -118,10 +120,6 @@ pub struct ChainTipSender {
 
     /// The sender channel for chain tip data.
     sender: watch::Sender<ChainTipData>,
-
-    /// A copy of the data in `sender`.
-    // TODO: Replace with calls to `watch::Sender::borrow` once Tokio is updated to 1.0.0 (#2573)
-    active_value: ChainTipData,
 }
 
 impl ChainTipSender {
@@ -133,14 +131,13 @@ impl ChainTipSender {
         network: Network,
     ) -> (Self, LatestChainTip, ChainTipChange) {
         let initial_tip = initial_tip.into();
-        ChainTipSender::record_new_tip(&initial_tip);
+        Self::record_new_tip(&initial_tip);
 
         let (sender, receiver) = watch::channel(None);
 
         let mut sender = ChainTipSender {
             use_non_finalized_tip: false,
             sender,
-            active_value: None,
         };
 
         let current = LatestChainTip::new(receiver);
@@ -156,16 +153,11 @@ impl ChainTipSender {
     /// May trigger an update to the best tip.
     #[instrument(
         skip(self, new_tip),
-        fields(
-            old_use_non_finalized_tip = ?self.use_non_finalized_tip,
-            old_height = ?self.active_value.as_ref().map(|block| block.height),
-            old_hash = ?self.active_value.as_ref().map(|block| block.hash),
-            new_height,
-            new_hash,
-        ))]
+        fields(old_use_non_finalized_tip, old_height, old_hash, new_height, new_hash)
+    )]
     pub fn set_finalized_tip(&mut self, new_tip: impl Into<Option<ChainTipBlock>> + Clone) {
         let new_tip = new_tip.into();
-        ChainTipSender::record_new_tip(&new_tip);
+        self.record_fields(&new_tip);
 
         if !self.use_non_finalized_tip {
             self.update(new_tip);
@@ -177,19 +169,14 @@ impl ChainTipSender {
     /// May trigger an update to the best tip.
     #[instrument(
         skip(self, new_tip),
-        fields(
-            old_use_non_finalized_tip = ?self.use_non_finalized_tip,
-            old_height = ?self.active_value.as_ref().map(|block| block.height),
-            old_hash = ?self.active_value.as_ref().map(|block| block.hash),
-            new_height,
-            new_hash,
-        ))]
+        fields(old_use_non_finalized_tip, old_height, old_hash, new_height, new_hash)
+    )]
     pub fn set_best_non_finalized_tip(
         &mut self,
         new_tip: impl Into<Option<ChainTipBlock>> + Clone,
     ) {
         let new_tip = new_tip.into();
-        ChainTipSender::record_new_tip(&new_tip);
+        self.record_fields(&new_tip);
 
         // once the non-finalized state becomes active, it is always populated
         // but ignoring `None`s makes the tests easier
@@ -204,7 +191,11 @@ impl ChainTipSender {
     /// An update is only sent if the current best tip is different from the last best tip
     /// that was sent.
     fn update(&mut self, new_tip: Option<ChainTipBlock>) {
-        let needs_update = match (new_tip.as_ref(), self.active_value.as_ref()) {
+        // Correctness: the `self.sender.borrow()` must not be placed in a `let` binding to prevent
+        // a read-lock being created and living beyond the `self.sender.send(..)` call. If that
+        // happens, the `send` method will attempt to obtain a write-lock and will dead-lock.
+        // Without the binding, the guard is dropped at the end of the expression.
+        let needs_update = match (new_tip.as_ref(), self.sender.borrow().as_ref()) {
             // since the blocks have been contextually validated,
             // we know their hashes cover all the block data
             (Some(new_tip), Some(active_value)) => new_tip.hash != active_value.hash,
@@ -213,8 +204,7 @@ impl ChainTipSender {
         };
 
         if needs_update {
-            let _ = self.sender.send(new_tip.clone());
-            self.active_value = new_tip;
+            let _ = self.sender.send(new_tip);
         }
     }
 
@@ -222,13 +212,43 @@ impl ChainTipSender {
     ///
     /// Callers should create a new span with empty `new_height` and `new_hash` fields.
     fn record_new_tip(new_tip: &Option<ChainTipBlock>) {
+        Self::record_tip(&tracing::Span::current(), "new", new_tip);
+    }
+
+    /// Record `new_tip` and the fields from `self` in the current span.
+    ///
+    /// The fields recorded are:
+    ///
+    /// - `new_height`
+    /// - `new_hash`
+    /// - `old_height`
+    /// - `old_hash`
+    /// - `old_use_non_finalized_tip`
+    ///
+    /// Callers should create a new span with the empty fields described above.
+    fn record_fields(&self, new_tip: &Option<ChainTipBlock>) {
         let span = tracing::Span::current();
 
-        let new_height = new_tip.as_ref().map(|block| block.height);
-        let new_hash = new_tip.as_ref().map(|block| block.hash);
+        let old_tip = &*self.sender.borrow();
 
-        span.record("new_height", &tracing::field::debug(new_height));
-        span.record("new_hash", &tracing::field::debug(new_hash));
+        Self::record_tip(&span, "new", new_tip);
+        Self::record_tip(&span, "old", old_tip);
+
+        span.record(
+            "old_use_non_finalized_tip",
+            &field::debug(self.use_non_finalized_tip),
+        );
+    }
+
+    /// Record `tip` into `span` using the `prefix` to name the fields.
+    ///
+    /// Callers should create a new span with empty `{prefix}_height` and `{prefix}_hash` fields.
+    fn record_tip(span: &tracing::Span, prefix: &str, tip: &Option<ChainTipBlock>) {
+        let height = tip.as_ref().map(|block| block.height);
+        let hash = tip.as_ref().map(|block| block.hash);
+
+        span.record(format!("{}_height", prefix).as_str(), &field::debug(height));
+        span.record(format!("{}_hash", prefix).as_str(), &field::debug(hash));
     }
 }
 
@@ -250,65 +270,67 @@ impl ChainTipSender {
 #[derive(Clone, Debug)]
 pub struct LatestChainTip {
     /// The receiver for the current chain tip's data.
-    receiver: watch::Receiver<ChainTipData>,
+    receiver: WatchReceiver<ChainTipData>,
 }
 
 impl LatestChainTip {
     /// Create a new [`LatestChainTip`] from a watch channel receiver.
     fn new(receiver: watch::Receiver<ChainTipData>) -> Self {
-        Self { receiver }
+        Self {
+            receiver: WatchReceiver::new(receiver),
+        }
     }
 
-    /// Retrieve a result `R` from the current [`ChainTipBlock`], if it's available.
+    /// Maps the current data `ChainTipData` to `Option<U>`
+    /// by applying a function to the watched value,
+    /// while holding the receiver lock as briefly as possible.
     ///
     /// This helper method is a shorter way to borrow the value from the [`watch::Receiver`] and
     /// extract some information from it, while also adding the current chain tip block's fields as
     /// records to the current span.
     ///
-    /// A single read lock is kept during the execution of the method, and it is dropped at the end
-    /// of it.
+    /// A single read lock is acquired to clone `T`, and then released after the clone.
+    /// See the performance note on [`WatchReceiver::with_watch_data`].
     ///
     /// # Correctness
     ///
-    /// To prevent deadlocks:
-    ///
-    /// - `receiver.borrow()` should not be called before this method while in the same scope.
-    /// - `receiver.borrow()` should not be called inside the `action` closure.
-    ///
-    /// It is important to avoid calling `borrow` more than once in the same scope, which
-    /// effectively tries to acquire two read locks to the shared data in the watch channel. If
-    /// that is done, there's a chance that the [`watch::Sender`] tries to send a value, which
-    /// starts acquiring a write-lock, and prevents further read-locks from being acquired until
-    /// the update is finished.
-    ///
-    /// What can happen in that scenario is:
-    ///
-    /// 1. The receiver manages to acquire a read-lock for the first `borrow`
-    /// 2. The sender starts acquiring the write-lock
-    /// 3. The receiver fails to acquire a read-lock for the second `borrow`
-    ///
-    /// Now both the sender and the receivers hang, because the sender won't release the lock until
-    /// it can update the value, and the receiver won't release its first read-lock until it
-    /// acquires the second read-lock and finishes what it's doing.
-    fn with_chain_tip_block<R>(&self, action: impl FnOnce(&ChainTipBlock) -> R) -> Option<R> {
+    /// To avoid deadlocks, see the correctness note on [`WatchReceiver::with_watch_data`].
+    fn with_chain_tip_block<U, F>(&self, f: F) -> Option<U>
+    where
+        F: FnOnce(&ChainTipBlock) -> U,
+    {
         let span = tracing::Span::current();
-        let borrow_guard = self.receiver.borrow();
-        let chain_tip_block = borrow_guard.as_ref();
 
-        span.record(
-            "height",
-            &tracing::field::debug(chain_tip_block.map(|block| block.height)),
-        );
-        span.record(
-            "hash",
-            &tracing::field::debug(chain_tip_block.map(|block| block.hash)),
-        );
-        span.record(
-            "transaction_count",
-            &tracing::field::debug(chain_tip_block.map(|block| block.transaction_hashes.len())),
-        );
+        let register_span_fields = |chain_tip_block: Option<&ChainTipBlock>| {
+            span.record(
+                "height",
+                &tracing::field::debug(chain_tip_block.map(|block| block.height)),
+            );
+            span.record(
+                "hash",
+                &tracing::field::debug(chain_tip_block.map(|block| block.hash)),
+            );
+            span.record(
+                "time",
+                &tracing::field::debug(chain_tip_block.map(|block| block.time)),
+            );
+            span.record(
+                "previous_hash",
+                &tracing::field::debug(chain_tip_block.map(|block| block.previous_block_hash)),
+            );
+            span.record(
+                "transaction_count",
+                &tracing::field::debug(chain_tip_block.map(|block| block.transaction_hashes.len())),
+            );
+        };
 
-        chain_tip_block.map(action)
+        self.receiver.with_watch_data(|chain_tip_block| {
+            // TODO: replace with Option::inspect when it stabilises
+            //       https://github.com/rust-lang/rust/issues/91345
+            register_span_fields(chain_tip_block.as_ref());
+
+            chain_tip_block.as_ref().map(f)
+        })
     }
 }
 
@@ -321,6 +343,11 @@ impl ChainTip for LatestChainTip {
     #[instrument(skip(self))]
     fn best_tip_hash(&self) -> Option<block::Hash> {
         self.with_chain_tip_block(|block| block.hash)
+    }
+
+    #[instrument(skip(self))]
+    fn best_tip_height_and_hash(&self) -> Option<(block::Height, block::Hash)> {
+        self.with_chain_tip_block(|block| (block.height, block.hash))
     }
 
     #[instrument(skip(self))]

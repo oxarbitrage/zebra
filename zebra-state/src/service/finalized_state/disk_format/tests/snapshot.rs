@@ -9,8 +9,11 @@
 //!
 //! # Fixing Test Failures
 //!
-//! If this test fails, run `cargo insta review` to update the test snapshots,
-//! then commit the `test_*.snap` files using git.
+//! If this test fails, run:
+//! ```sh
+//! cargo insta test --review --delete-unreferenced-snapshots
+//! ```
+//! to update the test snapshots, then commit the `test_*.snap` files using git.
 //!
 //! # Snapshot Format
 //!
@@ -120,7 +123,8 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
             .cf_handle(cf_name)
             .expect("RocksDB API provides correct names");
 
-        let mut cf_iter = db.forward_iterator(cf_handle);
+        // Correctness: Multi-key iteration causes hangs in concurrent code, but seems ok in tests.
+        let mut cf_iter = db.full_iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
 
         // The default raw data serialization is very verbose, so we hex-encode the bytes.
         let cf_data: Vec<KV> = cf_iter
@@ -134,6 +138,9 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
             // distinguish column family names from empty column families
             empty_column_families.push(format!("{}: no entries", cf_name));
         } else {
+            // The note commitment tree snapshots will change if the trees do not have cached roots.
+            // But we expect them to always have cached roots,
+            // because those roots are used to populate the anchor column families.
             insta::assert_ron_snapshot!(format!("{}_raw_data", cf_name), cf_data);
         }
 

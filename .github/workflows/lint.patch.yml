@@ -1,17 +1,16 @@
-name: Lint Rust files
+name: Lint
 
 on:
-  push:
+  pull_request:
     branches:
-      - "**"
-      - "!main"
+      - 'main'
     paths-ignore:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'clippy.toml'
       - '.cargo/config.toml'
-      - '.github/workflows/lint.yml'
+      - '.github/workflows/*.yml'
 
 jobs:
   clippy:
@@ -22,6 +21,12 @@ jobs:
 
   fmt:
     name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  actionlint:
+    name: Actionlint
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'
