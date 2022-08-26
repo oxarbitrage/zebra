@@ -1,6 +1,6 @@
 //! Tests for block verification
 
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Utc;
 use color_eyre::eyre::{eyre, Report};
@@ -53,7 +53,7 @@ static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<
         .checked_add_signed(chrono::Duration::hours(3))
         .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
         .unwrap();
-    block.header.time = three_hours_in_the_future;
+    Arc::make_mut(&mut block.header).time = three_hours_in_the_future;
 
     vec![(Arc::new(block), Err(ExpectedTranscriptError::Any))]
 });
@@ -65,7 +65,7 @@ static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
         Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
 
     // Change nonce to something invalid
-    block.header.nonce = [0; 32];
+    Arc::make_mut(&mut block.header).nonce = [0; 32];
 
     vec![(Arc::new(block), Err(ExpectedTranscriptError::Any))]
 });
@@ -77,7 +77,7 @@ static INVALID_COINBASE_TRANSCRIPT: Lazy<
 
     // Test 1: Empty transaction
     let block1 = Block {
-        header,
+        header: header.into(),
         transactions: Vec::new(),
     };
 
@@ -88,7 +88,7 @@ static INVALID_COINBASE_TRANSCRIPT: Lazy<
         .unwrap();
     transactions.push(tx);
     let block2 = Block {
-        header,
+        header: header.into(),
         transactions,
     };
 
@@ -122,7 +122,7 @@ async fn check_transcripts_test() -> Result<(), Report> {
 #[allow(dead_code)]
 #[spandoc::spandoc]
 async fn check_transcripts() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let network = Network::Mainnet;
     let state_service = zebra_state::init_test(network);
@@ -148,7 +148,7 @@ async fn check_transcripts() -> Result<(), Report> {
 
 #[test]
 fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let block_iter = zebra_test::vectors::BLOCKS.iter();
 
@@ -166,7 +166,7 @@ fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
 
 #[test]
 fn difficulty_is_valid_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     difficulty_is_valid_for_network(Network::Mainnet)?;
     difficulty_is_valid_for_network(Network::Testnet)?;
@@ -194,7 +194,7 @@ fn difficulty_is_valid_for_network(network: Network) -> Result<(), Report> {
 
 #[test]
 fn difficulty_validation_failure() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // Get a block in the mainnet, and mangle its difficulty field
     let block =
@@ -205,7 +205,7 @@ fn difficulty_validation_failure() -> Result<(), Report> {
     let hash = block.hash();
 
     // Set the difficulty field to an invalid value
-    block.header.difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
+    Arc::make_mut(&mut block.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
 
     // Validate the block
     let result =
@@ -255,7 +255,7 @@ fn difficulty_validation_failure() -> Result<(), Report> {
 
 #[test]
 fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let block_iter = zebra_test::vectors::BLOCKS.iter();
 
@@ -273,7 +273,7 @@ fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
 
 #[test]
 fn subsidy_is_valid_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     subsidy_is_valid_for_network(Network::Mainnet)?;
     subsidy_is_valid_for_network(Network::Testnet)?;
@@ -307,7 +307,7 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
 
 #[test]
 fn coinbase_validation_failure() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
 
     // Get a block in the mainnet that is inside the funding stream period,
@@ -378,7 +378,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
 
 #[test]
 fn funding_stream_validation() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     funding_stream_validation_for_network(Network::Mainnet)?;
     funding_stream_validation_for_network(Network::Testnet)?;
@@ -411,7 +411,7 @@ fn funding_stream_validation_for_network(network: Network) -> Result<(), Report>
 
 #[test]
 fn funding_stream_validation_failure() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
 
     // Get a block in the mainnet that is inside the funding stream period.
@@ -440,7 +440,7 @@ fn funding_stream_validation_failure() -> Result<(), Report> {
     // Build new block
     let transactions: Vec<Arc<zebra_chain::transaction::Transaction>> = vec![Arc::new(tx)];
     let block = Block {
-        header: block.header,
+        header: block.header.clone(),
         transactions,
     };
 
@@ -456,7 +456,7 @@ fn funding_stream_validation_failure() -> Result<(), Report> {
 
 #[test]
 fn miner_fees_validation_success() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     miner_fees_validation_for_network(Network::Mainnet)?;
     miner_fees_validation_for_network(Network::Testnet)?;
@@ -488,7 +488,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
 
 #[test]
 fn miner_fees_validation_failure() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
 
     let block =
@@ -511,7 +511,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 
 #[test]
 fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let block_iter = zebra_test::vectors::BLOCKS.iter();
     let now = Utc::now();
@@ -540,7 +540,7 @@ fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
 
 #[test]
 fn merkle_root_is_valid() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // test all original blocks available, all blocks validate
     merkle_root_is_valid_for_network(Network::Mainnet)?;
@@ -618,7 +618,7 @@ fn merkle_root_fake_v5_for_network(network: Network) -> Result<(), Report> {
         // Replace the merkle root so that it matches the modified transactions.
         // This test provides some transaction id and merkle root coverage,
         // but we also need to test against zcashd test vectors.
-        block.header.merkle_root = transaction_hashes.iter().cloned().collect();
+        Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
 
         check::merkle_root_validity(network, &block, &transaction_hashes)
             .expect("merkle root should be valid for this block");
@@ -629,7 +629,7 @@ fn merkle_root_fake_v5_for_network(network: Network) -> Result<(), Report> {
 
 #[test]
 fn legacy_sigops_count_for_large_generated_blocks() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // We can't test sigops using the transaction verifier, because it looks up UTXOs.
 
@@ -660,7 +660,7 @@ fn legacy_sigops_count_for_large_generated_blocks() {
 
 #[test]
 fn legacy_sigops_count_for_historic_blocks() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // We can't test sigops using the transaction verifier, because it looks up UTXOs.
 
@@ -684,7 +684,7 @@ fn legacy_sigops_count_for_historic_blocks() {
 
 #[test]
 fn transaction_expiration_height_validation() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     transaction_expiration_height_for_network(Network::Mainnet)?;
     transaction_expiration_height_for_network(Network::Testnet)?;

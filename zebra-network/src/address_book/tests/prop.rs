@@ -6,7 +6,7 @@ use chrono::Utc;
 use proptest::{collection::vec, prelude::*};
 use tracing::Span;
 
-use zebra_chain::serialization::Duration32;
+use zebra_chain::{parameters::Network::*, serialization::Duration32};
 
 use crate::{
     constants::{MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_ACTIVE_FOR_GOSSIP},
@@ -24,11 +24,12 @@ proptest! {
         local_listener in any::<SocketAddr>(),
         addresses in vec(any::<MetaAddr>(), 0..MAX_META_ADDR),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
         let chrono_now = Utc::now();
 
         let address_book = AddressBook::new_with_addrs(
             local_listener,
+            Mainnet,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             addresses
@@ -51,12 +52,13 @@ proptest! {
         local_listener in any::<SocketAddr>(),
         addresses in vec(any::<MetaAddr>(), 0..MAX_META_ADDR),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
         let instant_now = Instant::now();
         let chrono_now = Utc::now();
 
         let address_book = AddressBook::new_with_addrs(
             local_listener,
+            Mainnet,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             addresses
@@ -78,7 +80,7 @@ proptest! {
         addr_limit in 0..=MAX_ADDR_CHANGE,
         pre_fill in any::<bool>(),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let initial_addrs = if pre_fill {
             addr_changes_lists
@@ -94,6 +96,7 @@ proptest! {
 
         let mut address_book = AddressBook::new_with_addrs(
             local_listener,
+            Mainnet,
             addr_limit,
             Span::none(),
             initial_addrs.clone(),
@@ -115,6 +118,7 @@ proptest! {
 
         let mut address_book = AddressBook::new_with_addrs(
             local_listener,
+            Mainnet,
             addr_limit,
             Span::none(),
             initial_addrs,

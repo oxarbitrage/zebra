@@ -6,9 +6,12 @@ use bytes::BytesMut;
 use proptest::{collection::vec, prelude::*};
 use tokio_util::codec::{Decoder, Encoder};
 
-use zebra_chain::serialization::{
-    SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-    MAX_PROTOCOL_MESSAGE_LEN,
+use zebra_chain::{
+    parameters::Network::*,
+    serialization::{
+        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        MAX_PROTOCOL_MESSAGE_LEN,
+    },
 };
 
 use crate::{
@@ -104,11 +107,11 @@ proptest! {
     /// Test round-trip AddrV1 serialization for all MetaAddr variants after sanitization
     #[test]
     fn addr_v1_sanitized_roundtrip(addr in any::<MetaAddr>()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         // We require sanitization before serialization,
         // but we also need the original address for this test
-        let sanitized_addr = addr.sanitize();
+        let sanitized_addr = addr.sanitize(Mainnet);
         prop_assume!(sanitized_addr.is_some());
         let sanitized_addr = sanitized_addr.unwrap();
 
@@ -177,11 +180,11 @@ proptest! {
     /// Test round-trip AddrV2 serialization for all MetaAddr variants after sanitization
     #[test]
     fn addr_v2_sanitized_roundtrip(addr in any::<MetaAddr>()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         // We require sanitization before serialization,
         // but we also need the original address for this test
-        let sanitized_addr = addr.sanitize();
+        let sanitized_addr = addr.sanitize(Mainnet);
         prop_assume!(sanitized_addr.is_some());
         let sanitized_addr = sanitized_addr.unwrap();
 

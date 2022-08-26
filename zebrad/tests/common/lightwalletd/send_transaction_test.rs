@@ -1,10 +1,12 @@
 //! Test sending transactions using a lightwalletd instance connected to a zebrad instance.
 //!
 //! This test requires a cached chain state that is partially synchronized, i.e., it should be a
-//! few blocks below the network chain tip height.
+//! few blocks below the network chain tip height. We open this state during the test, but we don't
+//! add any blocks to it.
 //!
 //! The transactions to use to send are obtained from the blocks synchronized by a temporary zebrad
-//! instance that are higher than the chain tip of the cached state.
+//! instance that are higher than the chain tip of the cached state. This instance uses a copy of
+//! the state.
 //!
 //! The zebrad instance connected to lightwalletd uses the cached state and does not connect to any
 //! external peers, which prevents it from downloading the blocks from where the test transactions
@@ -12,70 +14,111 @@
 //! already been seen in a block.
 
 use std::{
-    env,
+    cmp::min,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use color_eyre::eyre::{eyre, Result};
 use futures::TryFutureExt;
-use tempfile::TempDir;
 use tower::{Service, ServiceExt};
 
 use zebra_chain::{
     block, chain_tip::ChainTip, parameters::Network, serialization::ZcashSerialize,
     transaction::Transaction,
 };
+use zebra_rpc::queue::CHANNEL_AND_QUEUE_CAPACITY;
 use zebra_state::HashOrHeight;
+use zebrad::components::mempool::downloads::MAX_INBOUND_CONCURRENCY;
 
 use crate::common::{
-    cached_state::{
-        copy_state_directory, load_tip_height_from_state_directory,
-        start_state_service_with_cache_dir, ZEBRA_CACHED_STATE_DIR_VAR,
-    },
+    cached_state::{load_tip_height_from_state_directory, start_state_service_with_cache_dir},
     launch::spawn_zebrad_for_rpc_without_initial_peers,
     lightwalletd::{
         wallet_grpc::{self, connect_to_lightwalletd, spawn_lightwalletd_with_rpc_server},
-        zebra_skip_lightwalletd_tests, LIGHTWALLETD_TEST_TIMEOUT,
+        zebra_skip_lightwalletd_tests,
+        LightwalletdTestType::*,
     },
     sync::perform_full_sync_starting_from,
 };
 
 /// The test entry point.
 pub async fn run() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
+
+    if zebra_test::net::zebra_skip_network_tests() {
+        return Ok(());
+    }
 
     // Skip the test unless the user specifically asked for it
     if zebra_skip_lightwalletd_tests() {
         return Ok(());
     }
 
-    let cached_state_path = match env::var_os(ZEBRA_CACHED_STATE_DIR_VAR) {
-        Some(argument) => PathBuf::from(argument),
-        None => {
-            tracing::info!(
-                "skipped send transactions using lightwalletd test, \
-                 set the {ZEBRA_CACHED_STATE_DIR_VAR:?} environment variable to run the test",
-            );
-            return Ok(());
-        }
+    // We want a zebra state dir and a lightwalletd data dir in place,
+    // so `UpdateCachedState` can be used as our test type
+    let test_type = UpdateCachedState;
+
+    let zebrad_state_path = test_type.zebrad_state_path("send_transaction_tests".to_string());
+    let zebrad_state_path = match zebrad_state_path {
+        Some(zebrad_state_path) => zebrad_state_path,
+        None => return Ok(()),
     };
+
+    let lightwalletd_state_path =
+        test_type.lightwalletd_state_path("send_transaction_tests".to_string());
+    if lightwalletd_state_path.is_none() {
+        return Ok(());
+    }
 
     let network = Network::Mainnet;
 
-    let (transactions, partial_sync_path) =
-        load_transactions_from_a_future_block(network, cached_state_path).await?;
+    tracing::info!(
+        ?network,
+        ?test_type,
+        ?zebrad_state_path,
+        ?lightwalletd_state_path,
+        "running gRPC send transaction test using lightwalletd & zebrad",
+    );
 
-    let (_zebrad, zebra_rpc_address) = spawn_zebrad_for_rpc_without_initial_peers(
-        Network::Mainnet,
-        partial_sync_path,
-        LIGHTWALLETD_TEST_TIMEOUT,
+    let mut transactions =
+        load_transactions_from_a_future_block(network, zebrad_state_path.clone()).await?;
+
+    tracing::info!(
+        transaction_count = ?transactions.len(),
+        partial_sync_path = ?zebrad_state_path,
+        "got transactions to send",
+    );
+
+    let (_zebrad, zebra_rpc_address) =
+        spawn_zebrad_for_rpc_without_initial_peers(Network::Mainnet, zebrad_state_path, test_type)?;
+
+    tracing::info!(
+        ?zebra_rpc_address,
+        "spawned disconnected zebrad with shorter chain",
+    );
+
+    let (_lightwalletd, lightwalletd_rpc_port) = spawn_lightwalletd_with_rpc_server(
+        zebra_rpc_address,
+        lightwalletd_state_path,
+        test_type,
+        true,
     )?;
 
-    let (_lightwalletd, lightwalletd_rpc_port) =
-        spawn_lightwalletd_with_rpc_server(zebra_rpc_address, true)?;
+    tracing::info!(
+        ?lightwalletd_rpc_port,
+        "spawned lightwalletd connected to zebrad",
+    );
 
     let mut rpc_client = connect_to_lightwalletd(lightwalletd_rpc_port).await?;
+
+    // To avoid filling the mempool queue, limit the transactions to be sent to the RPC and mempool queue limits
+    transactions.truncate(min(CHANNEL_AND_QUEUE_CAPACITY, MAX_INBOUND_CONCURRENCY) - 1);
+
+    tracing::info!(
+        transaction_count = ?transactions.len(),
+        "connected gRPC client to lightwalletd, sending transactions...",
+    );
 
     for transaction in transactions {
         let expected_response = wallet_grpc::SendResponse {
@@ -95,46 +138,36 @@ pub async fn run() -> Result<()> {
 
 /// Loads transactions from a block that's after the chain tip of the cached state.
 ///
-/// This copies the cached state into a temporary directory when it is needed to avoid overwriting
-/// anything. Two copies are made of the cached state.
+/// We copy the cached state to avoid modifying `zebrad_state_path`.
+/// This copy is used to launch a `zebrad` instance connected to the network,
+/// which finishes synchronizing the chain.
+/// Then we load transactions from this updated state.
 ///
-/// The first copy is used by a zebrad instance connected to the network that finishes
-/// synchronizing the chain. The transactions are loaded from this updated state.
-///
-/// The second copy of the state is returned together with the transactions. This means that the
-/// returned tuple contains the temporary directory with the partially synchronized chain, and a
-/// list of valid transactions that are not in any of the blocks present in that partially
-/// synchronized chain.
+/// Returns a list of valid transactions that are not in any of the blocks present in the
+/// original `zebrad_state_path`.
 async fn load_transactions_from_a_future_block(
     network: Network,
-    cached_state_path: PathBuf,
-) -> Result<(Vec<Arc<Transaction>>, TempDir)> {
-    let (partial_sync_path, partial_sync_height) =
-        prepare_partial_sync(network, cached_state_path).await?;
+    zebrad_state_path: PathBuf,
+) -> Result<Vec<Arc<Transaction>>> {
+    let partial_sync_height =
+        load_tip_height_from_state_directory(network, zebrad_state_path.as_ref()).await?;
+
+    tracing::info!(
+        ?partial_sync_height,
+        partial_sync_path = ?zebrad_state_path,
+        "performing full sync...",
+    );
 
     let full_sync_path =
-        perform_full_sync_starting_from(network, partial_sync_path.as_ref()).await?;
+        perform_full_sync_starting_from(network, zebrad_state_path.as_ref()).await?;
+
+    tracing::info!(?full_sync_path, "loading transactions...");
 
     let transactions =
         load_transactions_from_block_after(partial_sync_height, network, full_sync_path.as_ref())
             .await?;
 
-    Ok((transactions, partial_sync_path))
-}
-
-/// Prepares the temporary directory of the partially synchronized chain.
-///
-/// Returns a temporary directory that can be used by a Zebra instance, as well as the chain tip
-/// height of the partially synchronized chain.
-async fn prepare_partial_sync(
-    network: Network,
-    cached_zebra_state: PathBuf,
-) -> Result<(TempDir, block::Height)> {
-    let partial_sync_path = copy_state_directory(cached_zebra_state).await?;
-    let partial_sync_state_dir = partial_sync_path.as_ref().join("state");
-    let tip_height = load_tip_height_from_state_directory(network, &partial_sync_state_dir).await?;
-
-    Ok((partial_sync_path, tip_height))
+    Ok(transactions)
 }
 
 /// Loads transactions from a block that's after the specified `height`.
@@ -144,15 +177,15 @@ async fn prepare_partial_sync(
 ///
 /// # Panics
 ///
-/// If the specified `state_path` contains a chain state that's not synchronized to a tip that's
+/// If the specified `zebrad_state_path` contains a chain state that's not synchronized to a tip that's
 /// after `height`.
 async fn load_transactions_from_block_after(
     height: block::Height,
     network: Network,
-    state_path: &Path,
+    zebrad_state_path: &Path,
 ) -> Result<Vec<Arc<Transaction>>> {
     let (_read_write_state_service, mut state, latest_chain_tip, _chain_tip_change) =
-        start_state_service_with_cache_dir(network, state_path.join("state")).await?;
+        start_state_service_with_cache_dir(network, zebrad_state_path).await?;
 
     let tip_height = latest_chain_tip
         .best_tip_height()

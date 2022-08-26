@@ -1,8 +1,7 @@
 //! Asynchronous verification of transactions.
-//!
+
 use std::{
     collections::HashMap,
-    convert::TryInto,
     future::Future,
     iter::FromIterator,
     pin::Pin,
@@ -51,7 +50,7 @@ mod tests;
 ///     to download, because a peer sent Zebra a bad list of block hashes. (The
 ///     UTXO verification failure will restart the sync, and re-download the
 ///     chain in the correct order.)
-const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
 
 /// Asynchronous transaction verification.
 ///
@@ -124,18 +123,21 @@ pub enum Response {
     Block {
         /// The witnessed transaction ID for this transaction.
         ///
-        /// [`Block`] responses can be uniquely identified by [`UnminedTxId::mined_id`],
-        /// because the block's authorizing data root will be checked during contextual validation.
+        /// [`Response::Block`] responses can be uniquely identified by
+        /// [`UnminedTxId::mined_id`], because the block's authorizing data root
+        /// will be checked during contextual validation.
         tx_id: UnminedTxId,
 
         /// The miner fee for this transaction.
+        ///
         /// `None` for coinbase transactions.
         ///
-        /// Consensus rule:
+        /// # Consensus
+        ///
         /// > The remaining value in the transparent transaction value pool
         /// > of a coinbase transaction is destroyed.
         ///
-        /// https://zips.z.cash/protocol/protocol.pdf#transactions
+        /// <https://zips.z.cash/protocol/protocol.pdf#transactions>
         miner_fee: Option<Amount<NonNegative>>,
 
         /// The number of legacy signature operations in this transaction's
@@ -151,8 +153,8 @@ pub enum Response {
         /// Mempool transactions always have a transaction fee,
         /// because coinbase transactions are rejected from the mempool.
         ///
-        /// [`Mempool`] responses are uniquely identified by the [`UnminedTxId`]
-        /// variant for their transaction version.
+        /// [`Response::Mempool`] responses are uniquely identified by the
+        /// [`UnminedTxId`] variant for their transaction version.
         transaction: VerifiedUnminedTx,
     },
 }
@@ -906,25 +908,25 @@ where
         let mut async_checks = AsyncChecks::new();
 
         if let Some(orchard_shielded_data) = orchard_shielded_data {
+            // # Consensus
+            //
+            // > The proof 𝜋 MUST be valid given a primary input (cv, rt^{Orchard},
+            // > nf, rk, cm_x, enableSpends, enableOutputs)
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#actiondesc
+            //
+            // Unlike Sapling, Orchard shielded transactions have a single
+            // aggregated Halo2 proof per transaction, even with multiple
+            // Actions in one transaction. So we queue it for verification
+            // only once instead of queuing it up for every Action description.
+            async_checks.push(
+                primitives::halo2::VERIFIER
+                    .clone()
+                    .oneshot(primitives::halo2::Item::from(orchard_shielded_data)),
+            );
+
             for authorized_action in orchard_shielded_data.actions.iter().cloned() {
                 let (action, spend_auth_sig) = authorized_action.into_parts();
-
-                // # Consensus
-                //
-                // > The proof 𝜋 MUST be valid given a primary input (cv, rt^{Orchard},
-                // > nf, rk, cm_x, enableSpends, enableOutputs)
-                //
-                // https://zips.z.cash/protocol/protocol.pdf#actiondesc
-                //
-                // Queue the verification of the Halo2 proof for each Action
-                // description while adding the resulting future to our
-                // collection of async checks that (at a minimum) must pass for
-                // the transaction to verify.
-                async_checks.push(
-                    primitives::halo2::VERIFIER
-                        .clone()
-                        .oneshot(primitives::halo2::Item::from(orchard_shielded_data)),
-                );
 
                 // # Consensus
                 //

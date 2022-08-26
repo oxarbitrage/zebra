@@ -167,7 +167,7 @@ impl ValueBalance<NegativeAllowed> {
 impl ValueBalance<NonNegative> {
     /// Returns the sum of this value balance, and the chain value pool changes in `block`.
     ///
-    /// `utxos` must contain the [`Utxo`]s of every input in this block,
+    /// `utxos` must contain the [`transparent::Utxo`]s of every input in this block,
     /// including UTXOs created by earlier transactions in this block.
     ///
     /// Note: the chain value pool has the opposite sign to the transaction
@@ -221,7 +221,7 @@ impl ValueBalance<NonNegative> {
 
     /// Returns the sum of this value balance, and the chain value pool changes in `transaction`.
     ///
-    /// `outputs` must contain the [`Output`]s of every input in this transaction,
+    /// `outputs` must contain the [`transparent::Output`]s of every input in this transaction,
     /// including UTXOs created by earlier transactions in its block.
     ///
     /// Note: the chain value pool has the opposite sign to the transaction
@@ -263,7 +263,7 @@ impl ValueBalance<NonNegative> {
 
     /// Returns the sum of this value balance, and the chain value pool change in `input`.
     ///
-    /// `outputs` must contain the [`Output`] spent by `input`,
+    /// `outputs` must contain the [`transparent::Output`] spent by `input`,
     /// (including UTXOs created by earlier transactions in its block).
     ///
     /// Note: the chain value pool has the opposite sign to the transaction
@@ -294,6 +294,7 @@ impl ValueBalance<NonNegative> {
     /// value pool.
     ///
     /// See `add_block` for details.
+    #[allow(clippy::unwrap_in_result)]
     pub fn add_chain_value_pool_change(
         self,
         chain_value_pool_change: ValueBalance<NegativeAllowed>,
@@ -345,6 +346,7 @@ impl ValueBalance<NonNegative> {
     }
 
     /// From byte array
+    #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: [u8; 32]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
         let transparent = Amount::from_bytes(
             bytes[0..8]

@@ -278,7 +278,8 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// If any spent [`Output`] is missing from `outpoints`.
+    /// If any spent [`transparent::Output`] is missing from
+    /// [`transparent::OutPoint`]s.
     //
     // TODO: take some extra arbitrary flags, which select between zero and non-zero
     //       remaining value in each chain value pool
@@ -420,7 +421,8 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// If any spent [`Output`] is missing from `outpoints`.
+    /// If any spent [`transparent::Output`] is missing from
+    /// [`transparent::OutPoint`]s.
     //
     // TODO: split this method up, after we've implemented chain value balance adjustments
     //
@@ -957,7 +959,7 @@ pub fn fake_v5_transactions_for_network<'b>(
             .transactions
             .into_iter()
             .map(move |transaction| {
-                transaction_to_fake_v5(&*transaction, network, block::Height(*height))
+                transaction_to_fake_v5(&transaction, network, block::Height(*height))
             })
             .map(Transaction::from)
     })

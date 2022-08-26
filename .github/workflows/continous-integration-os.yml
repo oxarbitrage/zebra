@@ -1,0 +1,233 @@
+name: CI OSes
+
+on:
+  workflow_dispatch:
+  # we build Rust and Zcash parameter caches on main,
+  # so they can be shared by all branches:
+  # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache
+  push:
+    branches:
+      - main
+    paths:
+      # production code and test code
+      - '**/*.rs'
+      # hard-coded checkpoints
+      # TODO: skip proptest regressions
+      - '**/*.txt'
+      # dependencies
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      # workflow definitions
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      # code and tests
+      - '**/*.rs'
+      # hard-coded checkpoints and proptest regressions
+      - '**/*.txt'
+      # test data snapshots
+      - '**/*.snap'
+      # dependencies
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/deny.toml'
+      # workflow definitions
+      - '.github/workflows/continous-integration-os.yml'
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_LOG: info
+  RUST_BACKTRACE: full
+  RUST_LIB_BACKTRACE: full
+  COLORBT_SHOW_HIDDEN: '1'
+
+jobs:
+  test:
+    name: Test ${{ matrix.rust }} on ${{ matrix.os }}
+    # The large timeout is to accommodate:
+    # - Windows builds (75 minutes, typically 30-50 minutes), and
+    # - parameter downloads (an extra 90 minutes, but only when the cache expires)
+    timeout-minutes: 165
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: Windows was removed for now, see https://github.com/ZcashFoundation/zebra/issues/3801
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+        exclude:
+        # TODO: re-enable beta Rust tests on ubuntu (#4929)
+          - os: ubuntu-latest
+            rust: beta
+        # We're excluding macOS for the following reasons:
+        # - the concurrent macOS runner limit is much lower than the Linux limit
+        # - macOS is slower than Linux, and shouldn't have a build or test difference with Linux
+        # - macOS is a second-tier Zebra support platform
+          - os: macos-latest
+            rust: beta
+
+    steps:
+      - uses: actions/checkout@v3.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: cargo fetch
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: fetch
+
+      - name: Install LLVM on Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install llvm -y
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Skip network tests on Ubuntu and Windows
+        # Ubuntu runners don't have reliable network or DNS during test steps.
+        # Windows runners have an unreliable network.
+        shell: bash
+        if: matrix.os != 'macos-latest'
+        run: echo "ZEBRA_SKIP_NETWORK_TESTS=1" >> $GITHUB_ENV
+
+      - name: Minimise proptest cases on macOS and Windows
+        # We set cases to 1, because some tests already run 1 case by default.
+        # We keep maximum shrink iterations at the default value, because it only happens on failure.
+        #
+        # Windows compilation and tests are slower than other platforms.
+        # macOS runners do extra network tests, so they take longer.
+        shell: bash
+        if: matrix.os != 'ubuntu-latest'
+        run: |
+          echo "PROPTEST_CASES=1" >> $GITHUB_ENV
+          echo "PROPTEST_MAX_SHRINK_ITERS=1024" >> $GITHUB_ENV
+
+      - name: Change target output directory on Windows
+        # Windows doesn't have enough space on the D: drive, so we redirect the build output to the
+        # larger C: drive.
+        # TODO: Remove this workaround once the build is more efficient (#3005).
+        if: matrix.os == 'windows-latest'
+        run: |
+          mkdir C:\zebra-target
+          echo "CARGO_TARGET_DIR=C:\zebra-target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Modified from:
+      # https://github.com/zcash/librustzcash/blob/c48bb4def2e122289843ddb3cb2984c325c03ca0/.github/workflows/ci.yml#L20-L33
+      #
+      # TODO: split get-params-path and download-params examples into their own crate,
+      #       to speed up compilation
+      #       compile examples in release mode, to speed up downloads
+      - name: Fetch path to Zcash parameters
+        working-directory: ./zebra-consensus
+        shell: bash
+        run: echo "ZCASH_PARAMS=$(cargo run --example get-params-path)" >> $GITHUB_ENV
+      - name: Cache Zcash parameters
+        id: cache-params
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.ZCASH_PARAMS }}
+          key: ${{ runner.os }}-sprout-and-sapling-params
+      - name: Fetch Zcash parameters
+        if: steps.cache-params.outputs.cache-hit != 'true'
+        working-directory: ./zebra-consensus
+        run: cargo run --example download-params
+
+      - name: Run tests
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: test
+          args: --verbose --workspace -- --nocapture
+
+      # Explicitly run any tests that are usually #[ignored]
+
+      - name: Run zebrad large sync tests
+        # Skip the entire step on Ubuntu and Windows, because the test would be skipped anyway due to ZEBRA_SKIP_NETWORK_TESTS
+        if: matrix.os == 'macos-latest'
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: test
+          # Note: this only runs the zebrad acceptance tests, because re-running all the test binaries is slow on Windows
+          args: --verbose --package zebrad --test acceptance -- --nocapture --include-ignored sync_large_checkpoints_
+
+  # Install Zebra with lockfile dependencies, with no caching and default features
+  install-from-lockfile-no-cache:
+    name: Install zebrad from lockfile without cache on ubuntu-latest
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Install
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: install
+          args: --locked --path ./zebrad/ zebrad
+
+  # Check that Cargo.lock includes any Cargo.toml changes.
+  # This check makes sure the `cargo-deny` crate dependency checks are accurate.
+  check-cargo-lock:
+    name: Check Cargo.lock is up to date
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Check Cargo.lock is up to date
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: check
+          args: --locked --all-features --all-targets
+
+  cargo-deny:
+    name: Check deny.toml ${{ matrix.checks }} ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        checks:
+          - bans
+          - sources
+        features: ['', '--all-features', '--no-default-features']
+
+    # Prevent sudden announcement of a new advisory from failing ci:
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+
+    steps:
+      - uses: actions/checkout@v3.0.2
+        with:
+          persist-credentials: false
+
+      # this check also runs with optional features off
+      # so we expect some warnings about "skip tree root was not found"
+      - name: Check ${{ matrix.checks }} with features ${{ matrix.features }}
+        uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          command: check ${{ matrix.checks }}
+          args: --workspace with features ${{ matrix.features }}

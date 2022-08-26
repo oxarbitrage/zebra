@@ -1,10 +1,12 @@
-use std::usize;
+//! The block header.
+
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 
 use crate::{
-    serialization::{CompactSizeMessage, TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 
@@ -51,9 +53,9 @@ pub struct Header {
     /// Zcash blocks contain different kinds of commitments to their contents,
     /// depending on the network and height.
     ///
-    /// The interpretation of this field has been changed multiple times, without
-    /// incrementing the block [`version`]. Therefore, this field cannot be
-    /// parsed without the network and height. Use
+    /// The interpretation of this field has been changed multiple times,
+    /// without incrementing the block [`version`](Self::version). Therefore,
+    /// this field cannot be parsed without the network and height. Use
     /// [`Block::commitment`](super::Block::commitment) to get the parsed
     /// [`Commitment`](super::Commitment).
     pub commitment_bytes: [u8; 32],
@@ -83,7 +85,7 @@ pub struct Header {
 
 /// TODO: Use this error as the source for zebra_consensus::error::BlockError::Time,
 /// and make `BlockError::Time` add additional context.
-/// See https://github.com/ZcashFoundation/zebra/issues/1021 for more details.
+/// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
 #[allow(missing_docs)]
 #[derive(Error, Debug)]
 pub enum BlockTimeError {
@@ -98,7 +100,8 @@ pub enum BlockTimeError {
 
 impl Header {
     /// TODO: Inline this function into zebra_consensus::block::check::time_is_valid_at.
-    /// See https://github.com/ZcashFoundation/zebra/issues/1021 for more details.
+    /// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
+    #[allow(clippy::unwrap_in_result)]
     pub fn time_is_valid_at(
         &self,
         now: DateTime<Utc>,
@@ -122,18 +125,14 @@ impl Header {
 }
 
 /// A header with a count of the number of transactions in its block.
-///
 /// This structure is used in the Bitcoin network protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The transaction count field is always zero, so we don't store it in the struct.
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct CountedHeader {
     /// The header for a block
-    pub header: Header,
-
-    /// The number of transactions that come after the header
-    ///
-    /// TODO: should this always be zero? (#1924)
-    pub transaction_count: CompactSizeMessage,
+    pub header: Arc<Header>,
 }
 
 /// The serialized size of a Zcash block header.

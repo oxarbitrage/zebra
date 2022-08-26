@@ -1,4 +1,9 @@
 //! Utility functions for tests that used cached Zebra state.
+//!
+//! Note: we allow dead code in this module, because it is mainly used by the gRPC tests,
+//! which are optional.
+
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +18,7 @@ use zebra_state::{ChainTipChange, LatestChainTip};
 use crate::common::config::testdir;
 
 /// Path to a directory containing a cached Zebra state.
-pub const ZEBRA_CACHED_STATE_DIR_VAR: &str = "ZEBRA_CACHED_STATE_DIR";
+pub const ZEBRA_CACHED_STATE_DIR: &str = "ZEBRA_CACHED_STATE_DIR";
 
 /// Type alias for a boxed state service.
 pub type BoxStateService =
@@ -58,13 +63,19 @@ pub async fn load_tip_height_from_state_directory(
 
 /// Recursively copy a chain state directory into a new temporary directory.
 pub async fn copy_state_directory(source: impl AsRef<Path>) -> Result<TempDir> {
+    let source = source.as_ref();
     let destination = testdir()?;
 
-    let mut remaining_directories = vec![PathBuf::from(source.as_ref())];
+    tracing::info!(
+        ?source,
+        ?destination,
+        "copying cached state files (this may take some time)...",
+    );
+
+    let mut remaining_directories = vec![PathBuf::from(source)];
 
     while let Some(directory) = remaining_directories.pop() {
-        let sub_directories =
-            copy_directory(&directory, source.as_ref(), destination.as_ref()).await?;
+        let sub_directories = copy_directory(&directory, source, destination.as_ref()).await?;
 
         remaining_directories.extend(sub_directories);
     }

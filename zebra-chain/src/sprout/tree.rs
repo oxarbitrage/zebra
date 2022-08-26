@@ -37,7 +37,7 @@ pub(super) const MERKLE_DEPTH: usize = 29;
 /// Note: the implementation of MerkleCRH^Sprout does not use the `layer`
 /// argument from the definition above since the argument does not affect the output.
 ///
-/// [MerkleCRH^Sprout]: https://zips.z.cash/protocol/protocol.pdf#merklecrh.
+/// [MerkleCRH^Sprout]: https://zips.z.cash/protocol/protocol.pdf#merklecrh
 fn merkle_crh_sprout(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     let mut other_block = [0u8; 64];
     other_block[..32].copy_from_slice(&left[..]);
@@ -83,7 +83,7 @@ lazy_static! {
 /// The index of a note's commitment at the leafmost layer of its Note
 /// Commitment Tree.
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#merkletree
+/// <https://zips.z.cash/protocol/protocol.pdf#merkletree>
 pub struct Position(pub(crate) u64);
 
 /// Sprout note commitment tree root node hash.
@@ -180,8 +180,8 @@ impl<'de> serde::Deserialize<'de> for Node {
     }
 }
 
-#[allow(dead_code, missing_docs)]
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[derive(Error, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[allow(missing_docs)]
 pub enum NoteCommitmentTreeError {
     #[error("the note commitment tree is full")]
     FullTree,
@@ -230,8 +230,9 @@ pub struct NoteCommitmentTree {
     /// the tree). This is particularly important since we decided to
     /// instantiate the trees from the genesis block, for simplicity.
     ///
-    /// We use a [`RwLock`] for this cache, because it is only written once per tree update.
-    /// Each tree has its own cached root, a new lock is created for each clone.
+    /// We use a [`RwLock`](std::sync::RwLock) for this cache, because it is
+    /// only written once per tree update. Each tree has its own cached root, a
+    /// new lock is created for each clone.
     cached_root: std::sync::RwLock<Option<Root>>,
 }
 
@@ -239,6 +240,7 @@ impl NoteCommitmentTree {
     /// Appends a note commitment to the leafmost layer of the tree.
     ///
     /// Returns an error if the tree is full.
+    #[allow(clippy::unwrap_in_result)]
     pub fn append(&mut self, cm: NoteCommitment) -> Result<(), NoteCommitmentTreeError> {
         if self.inner.append(&cm.into()) {
             // Invalidate cached root
@@ -273,9 +275,10 @@ impl NoteCommitmentTree {
             .cached_root
             .write()
             .expect("a thread that previously held exclusive lock access panicked");
-        match write_root.deref() {
+        let read_root = write_root.as_ref().cloned();
+        match read_root {
             // Another thread got write access first, return cached root.
-            Some(root) => *root,
+            Some(root) => root,
             None => {
                 // Compute root and cache it.
                 let root = Root(self.inner.root().0);
@@ -292,7 +295,7 @@ impl NoteCommitmentTree {
 
     /// Returns an as-yet unused leaf node value of a Sprout note commitment tree.
     ///
-    /// Uncommitted^Sprout = [0]^(l^[Sprout_Merkle]).
+    /// Uncommitted^Sprout = \[0\]^(l^[Sprout_Merkle]).
     ///
     /// [Sprout_Merkle]: https://zips.z.cash/protocol/protocol.pdf#constants
     pub fn uncommitted() -> [u8; 32] {

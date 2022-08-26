@@ -53,7 +53,7 @@ use zebra_chain::{
 ///
 /// Since the inbound peer limit is higher than the outbound peer limit,
 /// Zebra can be connected to a majority of peers
-/// that it has *not* chosen from its [`AddressBook`].
+/// that it has *not* chosen from its [`crate::AddressBook`].
 ///
 /// Inbound peer connections are initiated by the remote peer,
 /// so inbound peer selection is not controlled by the local node.
@@ -110,8 +110,8 @@ pub const INVENTORY_ROTATION_INTERVAL: Duration = Duration::from_secs(53);
 
 /// The default peer address crawler interval.
 ///
-/// This should be at least [`HANDSHAKE_TIMEOUT`](constants::HANDSHAKE_TIMEOUT)
-/// lower than all other crawler intervals.
+/// This should be at least [`HANDSHAKE_TIMEOUT`] lower than all other crawler
+/// intervals.
 ///
 /// This makes the following sequence of events more likely:
 /// 1. a peer address crawl,
@@ -149,25 +149,28 @@ pub const MAX_RECENT_PEER_AGE: Duration32 = Duration32::from_days(3);
 /// Using a prime number makes sure that heartbeats don't synchronise with crawls.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 
-/// The minimum time between successive calls to [`CandidateSet::next()`][Self::next].
+/// The minimum time between successive calls to
+/// [`CandidateSet::next`][crate::peer_set::CandidateSet::next].
 ///
 /// ## Security
 ///
 /// Zebra resists distributed denial of service attacks by making sure that new peer connections
-/// are initiated at least `MIN_PEER_CONNECTION_INTERVAL` apart.
+/// are initiated at least [`MIN_PEER_CONNECTION_INTERVAL`] apart.
 pub const MIN_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The minimum time between successive calls to [`CandidateSet::update()`][Self::update].
+/// The minimum time between successive calls to
+/// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
 ///
 /// Using a prime number makes sure that peer address crawls don't synchronise with other crawls.
 ///
 /// ## Security
 ///
 /// Zebra resists distributed denial of service attacks by making sure that requests for more
-/// peer addresses are sent at least `MIN_PEER_GET_ADDR_INTERVAL` apart.
+/// peer addresses are sent at least [`MIN_PEER_GET_ADDR_INTERVAL`] apart.
 pub const MIN_PEER_GET_ADDR_INTERVAL: Duration = Duration::from_secs(31);
 
-/// The combined timeout for all the requests in [`CandidateSet::update()`][Self::update].
+/// The combined timeout for all the requests in
+/// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
 ///
 /// `zcashd` doesn't respond to most `getaddr` requests,
 /// so this timeout needs to be short.
@@ -194,13 +197,13 @@ pub const GET_ADDR_FANOUT: usize = 1;
 /// `addr`:
 /// > The number of IP address entries up to a maximum of 1,000.
 ///
-/// https://developer.bitcoin.org/reference/p2p_networking.html#addr
+/// <https://developer.bitcoin.org/reference/p2p_networking.html#addr>
 ///
 /// `addrv2`:
 /// > One message can contain up to 1,000 addresses.
 /// > Clients MUST reject messages with more addresses.
 ///
-/// https://zips.z.cash/zip-0155#specification
+/// <https://zips.z.cash/zip-0155#specification>
 pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 
 /// The fraction of addresses Zebra sends in response to a `Peers` request.
@@ -239,7 +242,7 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 //
 // TODO: generate this from crate metadata (#2375)
-pub const USER_AGENT: &str = "/Zebra:1.0.0-beta.8/";
+pub const USER_AGENT: &str = "/Zebra:1.0.0-beta.13/";
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
@@ -249,9 +252,7 @@ pub const USER_AGENT: &str = "/Zebra:1.0.0-beta.8/";
 ///
 /// The current protocol version typically changes before Mainnet and Testnet
 /// network upgrades.
-//
-// TODO: update to Nu5 mainnet (#4115)
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_050);
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_100);
 
 /// The default RTT estimate for peer responses.
 ///
@@ -283,23 +284,13 @@ lazy_static! {
     ///
     /// If peer versions are too old, we will disconnect from them.
     ///
-    /// The minimum network protocol version typically changes after Mainnet and/or
+    /// The minimum network protocol version typically changes after Mainnet and
     /// Testnet network upgrades.
     pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<Network, Version> = {
         let mut hash_map = HashMap::new();
 
-        // TODO: update to Nu5 when there are enough Nu5 mainnet nodes deployed (#4117)
-        hash_map.insert(Mainnet, Version::min_specified_for_upgrade(Mainnet, Canopy));
-
-        // This is the `zcashd` network protocol version:
-        // - after the first NU5 testnet activation, and
-        // - after updating to the second NU5 testnet activation consensus rules,
-        // - but before setting the second NU5 testnet activation height.
-        //
-        // TODO: update to:
-        // Version::min_specified_for_upgrade(Mainnet, Nu5)
-        // when there are enough Nu5 testnet nodes deployed (#4116)
-        hash_map.insert(Testnet, Version(170_040));
+        hash_map.insert(Mainnet, Version::min_specified_for_upgrade(Mainnet, Nu5));
+        hash_map.insert(Testnet, Version::min_specified_for_upgrade(Testnet, Nu5));
 
         hash_map
     };
@@ -318,8 +309,8 @@ lazy_static! {
 /// [6.1.3.3 Efficient Resource Usage] from [RFC 1123: Requirements for Internet Hosts]
 /// suggest no less than 5 seconds for resolving timeout.
 ///
-/// [RFC 1123: Requirements for Internet Hosts] https://tools.ietf.org/rfcmarkup?doc=1123
-/// [6.1.3.3  Efficient Resource Usage] https://tools.ietf.org/rfcmarkup?doc=1123#page-77
+/// [RFC 1123: Requirements for Internet Hosts] <https://tools.ietf.org/rfcmarkup?doc=1123>
+/// [6.1.3.3  Efficient Resource Usage] <https://tools.ietf.org/rfcmarkup?doc=1123#page-77>
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Magic numbers used to identify different Zcash networks.
@@ -341,11 +332,11 @@ mod tests {
     use super::*;
 
     /// This assures that the `Duration` value we are computing for
-    /// MIN_PEER_RECONNECTION_DELAY actually matches the other const values it
-    /// relies on.
+    /// [`MIN_PEER_RECONNECTION_DELAY`] actually matches the other const values
+    /// it relies on.
     #[test]
     fn ensure_live_peer_duration_value_matches_others() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let constructed_live_peer_duration =
             HEARTBEAT_INTERVAL + REQUEST_TIMEOUT + REQUEST_TIMEOUT + REQUEST_TIMEOUT;
@@ -356,7 +347,7 @@ mod tests {
     /// Make sure that the timeout values are consistent with each other.
     #[test]
     fn ensure_timeouts_consistent() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         assert!(HANDSHAKE_TIMEOUT <= REQUEST_TIMEOUT,
                 "Handshakes are requests, so the handshake timeout can't be longer than the timeout for all requests.");
@@ -391,7 +382,7 @@ mod tests {
     /// Make sure that peer age limits are consistent with each other.
     #[test]
     fn ensure_peer_age_limits_consistent() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         assert!(
             MAX_PEER_ACTIVE_FOR_GOSSIP <= MAX_RECENT_PEER_AGE,
@@ -406,7 +397,7 @@ mod tests {
         // Zebra 1.0.0-beta.2 address book metrics in December 2021.
         const TYPICAL_MAINNET_ADDRESS_BOOK_SIZE: usize = 4_500;
 
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         assert!(
             MAX_ADDRS_IN_ADDRESS_BOOK >= GET_ADDR_FANOUT * MAX_ADDRS_IN_MESSAGE,
@@ -427,7 +418,7 @@ mod tests {
     /// Make sure inventory registry rotation is consistent with the target block interval.
     #[test]
     fn ensure_inventory_rotation_consistent() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         assert!(
             INVENTORY_ROTATION_INTERVAL

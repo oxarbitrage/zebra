@@ -4,13 +4,6 @@ on:
   pull_request:
     branches:
       - 'main'
-    paths-ignore:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'clippy.toml'
-      - '.cargo/config.toml'
-      - '.github/workflows/*.yml'
 
 jobs:
   clippy:
@@ -25,8 +18,8 @@ jobs:
     steps:
       - run: 'echo "No build required"'
 
-  actionlint:
-    name: Actionlint
+  docs:
+    name: Rust doc
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'

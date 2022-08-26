@@ -1,4 +1,7 @@
+//! Fixed test cases for batch worker tasks.
+
 use std::time::Duration;
+
 use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
 use tower::{Service, ServiceExt};
 use tower_batch::{error, Batch};
@@ -6,11 +9,11 @@ use tower_test::mock;
 
 #[tokio::test]
 async fn wakes_pending_waiters_on_close() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let (service, mut handle) = mock::pair::<_, ()>();
 
-    let (mut service, worker) = Batch::pair(service, 1, Duration::from_secs(1));
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1));
     let mut worker = task::spawn(worker.run());
 
     // // keep the request in the worker
@@ -37,39 +40,39 @@ async fn wakes_pending_waiters_on_close() {
     assert!(
         err.is::<error::Closed>(),
         "response should fail with a Closed, got: {:?}",
-        err
+        err,
     );
 
     assert!(
         ready1.is_woken(),
-        "dropping worker should wake ready task 1"
+        "dropping worker should wake ready task 1",
     );
     let err = assert_ready_err!(ready1.poll());
     assert!(
-        err.is::<error::Closed>(),
-        "ready 1 should fail with a Closed, got: {:?}",
-        err
+        err.is::<error::ServiceError>(),
+        "ready 1 should fail with a ServiceError {{ Closed }}, got: {:?}",
+        err,
     );
 
     assert!(
         ready2.is_woken(),
-        "dropping worker should wake ready task 2"
+        "dropping worker should wake ready task 2",
     );
     let err = assert_ready_err!(ready1.poll());
     assert!(
-        err.is::<error::Closed>(),
-        "ready 2 should fail with a Closed, got: {:?}",
-        err
+        err.is::<error::ServiceError>(),
+        "ready 2 should fail with a ServiceError {{ Closed }}, got: {:?}",
+        err,
     );
 }
 
 #[tokio::test]
 async fn wakes_pending_waiters_on_failure() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let (service, mut handle) = mock::pair::<_, ()>();
 
-    let (mut service, worker) = Batch::pair(service, 1, Duration::from_secs(1));
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1));
     let mut worker = task::spawn(worker.run());
 
     // keep the request in the worker

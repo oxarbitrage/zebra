@@ -37,7 +37,7 @@ mod prop;
 
 #[test]
 fn v5_fake_transactions() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let networks = vec![
         (Network::Mainnet, zebra_test::vectors::MAINNET_BLOCKS.iter()),
@@ -278,64 +278,64 @@ async fn v5_transaction_is_rejected_before_nu5_activation() {
     }
 }
 
-#[tokio::test]
-// TODO: Remove `should_panic` once the NU5 activation height for mainnet has been
-// defined.
-#[should_panic]
-async fn v5_transaction_is_accepted_after_nu5_activation_mainnet() {
-    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Mainnet).await
+#[test]
+fn v5_transaction_is_accepted_after_nu5_activation_mainnet() {
+    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Mainnet)
 }
 
-#[tokio::test]
-async fn v5_transaction_is_accepted_after_nu5_activation_testnet() {
-    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Testnet).await
+#[test]
+fn v5_transaction_is_accepted_after_nu5_activation_testnet() {
+    v5_transaction_is_accepted_after_nu5_activation_for_network(Network::Testnet)
 }
 
-async fn v5_transaction_is_accepted_after_nu5_activation_for_network(network: Network) {
-    let nu5 = NetworkUpgrade::Nu5;
-    let nu5_activation_height = nu5
-        .activation_height(network)
-        .expect("NU5 activation height is specified");
+fn v5_transaction_is_accepted_after_nu5_activation_for_network(network: Network) {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let nu5 = NetworkUpgrade::Nu5;
+        let nu5_activation_height = nu5
+            .activation_height(network)
+            .expect("NU5 activation height is specified");
 
-    let blocks = match network {
-        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
-        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
-    };
+        let blocks = match network {
+            Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
+            Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
+        };
 
-    let state_service = service_fn(|_| async { unreachable!("Service should not be called") });
-    let verifier = Verifier::new(network, state_service);
+        let state_service = service_fn(|_| async { unreachable!("Service should not be called") });
+        let verifier = Verifier::new(network, state_service);
 
-    let mut transaction = fake_v5_transactions_for_network(network, blocks)
-        .rev()
-        .next()
-        .expect("At least one fake V5 transaction in the test vectors");
-    if transaction
-        .expiry_height()
-        .expect("V5 must have expiry_height")
-        < nu5_activation_height
-    {
-        let expiry_height = transaction.expiry_height_mut();
-        *expiry_height = nu5_activation_height;
-    }
+        let mut transaction = fake_v5_transactions_for_network(network, blocks)
+            .rev()
+            .next()
+            .expect("At least one fake V5 transaction in the test vectors");
+        if transaction
+            .expiry_height()
+            .expect("V5 must have expiry_height")
+            < nu5_activation_height
+        {
+            let expiry_height = transaction.expiry_height_mut();
+            *expiry_height = nu5_activation_height;
+        }
 
-    let expected_hash = transaction.unmined_id();
-    let expiry_height = transaction
-        .expiry_height()
-        .expect("V5 must have expiry_height");
+        let expected_hash = transaction.unmined_id();
+        let expiry_height = transaction
+            .expiry_height()
+            .expect("V5 must have expiry_height");
 
-    let result = verifier
-        .oneshot(Request::Block {
-            transaction: Arc::new(transaction),
-            known_utxos: Arc::new(HashMap::new()),
-            height: expiry_height,
-            time: chrono::MAX_DATETIME,
-        })
-        .await;
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(HashMap::new()),
+                height: expiry_height,
+                time: chrono::MAX_DATETIME,
+            })
+            .await;
 
-    assert_eq!(
-        result.expect("unexpected error response").tx_id(),
-        expected_hash
-    );
+        assert_eq!(
+            result.expect("unexpected error response").tx_id(),
+            expected_hash
+        );
+    })
 }
 
 /// Test if V4 transaction with transparent funds is accepted.
@@ -571,7 +571,15 @@ async fn v4_coinbase_transaction_with_exceeding_expiry_height() {
         service_fn(|_| async { unreachable!("State service should not be called") });
     let verifier = Verifier::new(Network::Mainnet, state_service);
 
-    let block_height = block::Height::MAX;
+    // Use an arbitrary pre-NU5 block height.
+    // It can't be NU5-onward because the expiry height limit is not enforced
+    // for coinbase transactions (it needs to match the block height instead),
+    // which is what is used in this test.
+    let block_height = (NetworkUpgrade::Nu5
+        .activation_height(Network::Mainnet)
+        .expect("NU5 height must be set")
+        - 1)
+    .expect("will not underflow");
 
     let (input, output) = mock_coinbase_transparent_output(block_height);
 
@@ -761,8 +769,8 @@ async fn v4_transaction_with_conflicting_transparent_spend_is_rejected() {
 /// Test if V4 transaction with a joinsplit that has duplicate nullifiers is rejected.
 #[test]
 fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
         let network_upgrade = NetworkUpgrade::Canopy;
 
@@ -826,8 +834,8 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
 /// Test if V4 transaction with duplicate nullifiers across joinsplits is rejected.
 #[test]
 fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejected() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
         let network_upgrade = NetworkUpgrade::Canopy;
 
@@ -1059,6 +1067,7 @@ async fn v5_coinbase_transaction_expiry_height() {
     *new_transaction.expiry_height_mut() = new_expiry_height;
 
     let result = verifier
+        .clone()
         .oneshot(Request::Block {
             transaction: Arc::new(new_transaction.clone()),
             known_utxos: Arc::new(HashMap::new()),
@@ -1074,6 +1083,29 @@ async fn v5_coinbase_transaction_expiry_height() {
             block_height,
             transaction_hash: new_transaction.hash(),
         })
+    );
+
+    // Test with matching heights again, but using a very high value
+    // that is greater than the limit for non-coinbase transactions,
+    // to ensure the limit is not being enforced for coinbase transactions.
+    let new_expiry_height = Height::MAX;
+    let mut new_transaction = transaction.clone();
+
+    *new_transaction.expiry_height_mut() = new_expiry_height;
+
+    let result = verifier
+        .clone()
+        .oneshot(Request::Block {
+            transaction: Arc::new(new_transaction.clone()),
+            known_utxos: Arc::new(HashMap::new()),
+            height: new_expiry_height,
+            time: chrono::MAX_DATETIME,
+        })
+        .await;
+
+    assert_eq!(
+        result.expect("unexpected error response").tx_id(),
+        new_transaction.unmined_id()
     );
 }
 
@@ -1164,52 +1196,6 @@ async fn v5_transaction_with_exceeding_expiry_height() {
         Err(TransactionError::MaximumExpiryHeight {
             expiry_height,
             is_coinbase: false,
-            block_height,
-            transaction_hash: transaction.hash(),
-        })
-    );
-}
-
-/// Tests if a coinbase V5 transaction with an expiry height exceeding the
-/// maximum is rejected.
-#[tokio::test]
-async fn v5_coinbase_transaction_with_exceeding_expiry_height() {
-    let state_service =
-        service_fn(|_| async { unreachable!("State service should not be called") });
-    let verifier = Verifier::new(Network::Mainnet, state_service);
-
-    let block_height = block::Height::MAX;
-
-    let (input, output) = mock_coinbase_transparent_output(block_height);
-
-    // This expiry height exceeds the maximum defined by the specification.
-    let expiry_height = block::Height(500_000_000);
-
-    // Create a coinbase V4 tx.
-    let transaction = Transaction::V5 {
-        inputs: vec![input],
-        outputs: vec![output],
-        lock_time: LockTime::unlocked(),
-        expiry_height,
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        network_upgrade: NetworkUpgrade::Nu5,
-    };
-
-    let result = verifier
-        .oneshot(Request::Block {
-            transaction: Arc::new(transaction.clone()),
-            known_utxos: Arc::new(HashMap::new()),
-            height: block_height,
-            time: chrono::MAX_DATETIME,
-        })
-        .await;
-
-    assert_eq!(
-        result,
-        Err(TransactionError::MaximumExpiryHeight {
-            expiry_height,
-            is_coinbase: true,
             block_height,
             transaction_hash: transaction.hash(),
         })
@@ -1374,13 +1360,12 @@ async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
 }
 
 /// Test if signed V4 transaction with a dummy [`sprout::JoinSplit`] is accepted.
-/// - Test if an unsigned V4 transaction with a dummy [`sprout::JoinSplit`] is rejected.
 ///
 /// This test verifies if the transaction verifier correctly accepts a signed transaction.
 #[test]
 fn v4_with_signed_sprout_transfer_is_accepted() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         let (height, transaction) = test_transactions(network)
@@ -1413,7 +1398,7 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
             result.expect("unexpected error response").tx_id(),
             expected_hash
         );
-    });
+    })
 }
 
 /// Test if an V4 transaction with a modified [`sprout::JoinSplit`] is rejected.
@@ -1422,8 +1407,8 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
 /// invalid JoinSplit.
 #[test]
 fn v4_with_modified_joinsplit_is_rejected() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         v4_with_joinsplit_is_rejected_for_modification(
             JoinSplitModification::CorruptSignature,
             // TODO: Fix error downcast
@@ -1434,17 +1419,19 @@ fn v4_with_modified_joinsplit_is_rejected() {
             ),
         )
         .await;
+
         v4_with_joinsplit_is_rejected_for_modification(
             JoinSplitModification::CorruptProof,
             TransactionError::Groth16("proof verification failed".to_string()),
         )
         .await;
+
         v4_with_joinsplit_is_rejected_for_modification(
             JoinSplitModification::ZeroProof,
             TransactionError::MalformedGroth16("invalid G1".to_string()),
         )
         .await;
-    });
+    })
 }
 
 async fn v4_with_joinsplit_is_rejected_for_modification(
@@ -1486,8 +1473,8 @@ async fn v4_with_joinsplit_is_rejected_for_modification(
 /// Test if a V4 transaction with Sapling spends is accepted by the verifier.
 #[test]
 fn v4_with_sapling_spends() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         let (height, transaction) = test_transactions(network)
@@ -1526,8 +1513,8 @@ fn v4_with_sapling_spends() {
 /// Test if a V4 transaction with a duplicate Sapling spend is rejected by the verifier.
 #[test]
 fn v4_with_duplicate_sapling_spends() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         let (height, mut transaction) = test_transactions(network)
@@ -1571,8 +1558,8 @@ fn v4_with_duplicate_sapling_spends() {
 /// Test if a V4 transaction with Sapling outputs but no spends is accepted by the verifier.
 #[test]
 fn v4_with_sapling_outputs_and_no_spends() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         let (height, transaction) = test_transactions(network)
@@ -1608,22 +1595,27 @@ fn v4_with_sapling_outputs_and_no_spends() {
             result.expect("unexpected error response").tx_id(),
             expected_hash
         );
-    });
+    })
 }
 
 /// Test if a V5 transaction with Sapling spends is accepted by the verifier.
 #[test]
-// TODO: Remove `should_panic` once V5 transaction verification is complete.
+// TODO: add NU5 mainnet test vectors with Sapling spends, then remove should_panic
 #[should_panic]
 fn v5_with_sapling_spends() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
+        let nu5_activation = NetworkUpgrade::Nu5.activation_height(network);
 
         let transaction =
             fake_v5_transactions_for_network(network, zebra_test::vectors::MAINNET_BLOCKS.iter())
                 .rev()
-                .filter(|transaction| !transaction.is_coinbase() && transaction.inputs().is_empty())
+                .filter(|transaction| {
+                    !transaction.is_coinbase()
+                        && transaction.inputs().is_empty()
+                        && transaction.expiry_height() >= nu5_activation
+                })
                 .find(|transaction| transaction.sapling_spends_per_anchor().next().is_some())
                 .expect("No transaction found with Sapling spends");
 
@@ -1658,8 +1650,8 @@ fn v5_with_sapling_spends() {
 /// Test if a V5 transaction with a duplicate Sapling spend is rejected by the verifier.
 #[test]
 fn v5_with_duplicate_sapling_spends() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         let mut transaction =
@@ -1704,8 +1696,8 @@ fn v5_with_duplicate_sapling_spends() {
 /// Test if a V5 transaction with a duplicate Orchard action is rejected by the verifier.
 #[test]
 fn v5_with_duplicate_orchard_action() {
-    zebra_test::init();
-    zebra_test::RUNTIME.block_on(async {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
 
         // Find a transaction with no inputs or outputs to use as base
@@ -2026,7 +2018,7 @@ fn duplicate_sapling_spend_in_shielded_data<A: sapling::AnchorVariant + Clone>(
 
 #[test]
 fn add_to_sprout_pool_after_nu() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // get a block that we know it haves a transaction with `vpub_old` field greater than 0.
     let block: Arc<_> = zebra_chain::block::Block::zcash_deserialize(
@@ -2084,7 +2076,7 @@ fn add_to_sprout_pool_after_nu() {
 
 #[test]
 fn coinbase_outputs_are_decryptable_for_historical_blocks() -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     coinbase_outputs_are_decryptable_for_historical_blocks_for_network(Network::Mainnet)?;
     coinbase_outputs_are_decryptable_for_historical_blocks_for_network(Network::Testnet)?;

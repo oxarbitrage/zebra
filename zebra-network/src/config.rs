@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexSet;
 use serde::{de, Deserialize, Deserializer};
 
 use zebra_chain::parameters::Network;
@@ -39,7 +40,7 @@ pub struct Config {
     ///
     /// If a specific listener address is configured, Zebra will advertise
     /// it to other nodes. But by default, Zebra uses an unspecified address
-    /// ("0.0.0.0" or "[::]"), which is not advertised to other nodes.
+    /// ("0.0.0.0" or "\[::\]"), which is not advertised to other nodes.
     ///
     /// Zebra does not currently support:
     /// - [Advertising a different external IP address #1890](https://github.com/ZcashFoundation/zebra/issues/1890), or
@@ -55,11 +56,11 @@ pub struct Config {
 
     /// A list of initial peers for the peerset when operating on
     /// mainnet.
-    pub initial_mainnet_peers: HashSet<String>,
+    pub initial_mainnet_peers: IndexSet<String>,
 
     /// A list of initial peers for the peerset when operating on
     /// testnet.
-    pub initial_testnet_peers: HashSet<String>,
+    pub initial_testnet_peers: IndexSet<String>,
 
     /// The initial target size for the peer set.
     ///
@@ -77,9 +78,7 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
-    //
-    // Note: Durations become a TOML table, so they must be the final item in the config
-    //       We'll replace them with a more user-friendly format in #2847
+    #[serde(with = "humantime_serde")]
     pub crawl_new_peer_interval: Duration,
 }
 
@@ -129,7 +128,7 @@ impl Config {
     }
 
     /// Returns the initial seed peer hostnames for the configured network.
-    pub fn initial_peer_hostnames(&self) -> &HashSet<String> {
+    pub fn initial_peer_hostnames(&self) -> &IndexSet<String> {
         match self.network {
             Network::Mainnet => &self.initial_mainnet_peers,
             Network::Testnet => &self.initial_testnet_peers,
@@ -138,7 +137,7 @@ impl Config {
 
     /// Resolve initial seed peer IP addresses, based on the configured network.
     pub async fn initial_peers(&self) -> HashSet<SocketAddr> {
-        Config::resolve_peers(self.initial_peer_hostnames()).await
+        Config::resolve_peers(&self.initial_peer_hostnames().iter().cloned().collect()).await
     }
 
     /// Concurrently resolves `peers` into zero or more IP addresses, with a
@@ -298,10 +297,10 @@ impl<'de> Deserialize<'de> for Config {
         struct DConfig {
             listen_addr: String,
             network: Network,
-            initial_mainnet_peers: HashSet<String>,
-            initial_testnet_peers: HashSet<String>,
+            initial_mainnet_peers: IndexSet<String>,
+            initial_testnet_peers: IndexSet<String>,
             peerset_initial_target_size: usize,
-            #[serde(alias = "new_peer_interval")]
+            #[serde(alias = "new_peer_interval", with = "humantime_serde")]
             crawl_new_peer_interval: Duration,
         }
 

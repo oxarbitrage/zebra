@@ -2,14 +2,14 @@
 # This image is for caching Zcash Sprout and Sapling parameters
 FROM rust:bullseye as chef
 RUN cargo install cargo-chef --locked
-WORKDIR /app
+WORKDIR /opt/zebrad
 
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
+FROM chef AS release
+COPY --from=planner /opt/zebrad/recipe.json recipe.json
 
 # Install zebra build deps
 RUN apt-get -qq update && \
@@ -18,14 +18,12 @@ RUN apt-get -qq update && \
     libclang-dev \
     clang \
     ca-certificates \
-    cmake \
-    protobuf-compiler \
     ; \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
-ENV CARGO_HOME /app/.cargo/
+ENV CARGO_HOME /opt/zebrad/.cargo/
 # Build dependencies - this is the caching Docker layer!
-RUN cargo chef cook --release --features enable-sentry --recipe-path recipe.json
+RUN cargo chef cook --release --features sentry --package zebrad --recipe-path recipe.json
 
 ARG RUST_BACKTRACE=0
 ENV RUST_BACKTRACE ${RUST_BACKTRACE}
@@ -38,4 +36,4 @@ ENV COLORBT_SHOW_HIDDEN ${COLORBT_SHOW_HIDDEN}
 
 COPY . .
 # Pre-download Zcash Sprout and Sapling parameters
-RUN cargo run --locked --release --features enable-sentry --bin zebrad download
+RUN cargo run --locked --release --features sentry --package zebrad --bin zebrad download

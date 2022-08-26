@@ -20,16 +20,14 @@ use super::{RevertPosition, UpdateWith};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {
     /// The partial chain balance for a transparent address.
-    ///
-    /// TODO:
-    /// - to avoid [`ReadStateService`] response inconsistencies when a block has just been finalized,
-    ///   revert UTXO receives and spends that are at a height less than or equal to the finalized tip.
     balance: Amount<NegativeAllowed>,
 
     /// The partial list of transactions that spent or received UTXOs to a transparent address.
     ///
-    /// Since transactions can only be added to this set, it does not need special handling
-    /// for [`ReadStateService`] response inconsistencies.
+    /// Since transactions can only be added to this set, it does not need
+    /// special handling for
+    /// [`ReadStateService`](crate::service::ReadStateService) response
+    /// inconsistencies.
     ///
     /// The `getaddresstxids` RPC needs these transaction IDs to be sorted in chain order.
     tx_ids: MultiSet<transaction::Hash>,
@@ -39,11 +37,7 @@ pub struct TransparentTransfers {
     /// The `getaddressutxos` RPC doesn't need these transaction IDs to be sorted in chain order,
     /// but it might in future. So Zebra does it anyway.
     ///
-    /// TODO:
-    /// - to avoid [`ReadStateService`] response inconsistencies when a block has just been finalized,
-    ///   combine the created UTXOs, combine the spent UTXOs, and then remove spent from created
-    ///
-    /// Optional:
+    /// Optional TODOs:
     /// - store `Utxo`s in the chain, and just store the created locations for this address
     /// - if we add an OutputLocation to UTXO, remove this OutputLocation,
     ///   and use the inner OutputLocation to sort Utxos in chain order
@@ -72,12 +66,19 @@ impl
         &transparent::OrderedUtxo,
     )> for TransparentTransfers
 {
+    #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with(
         &mut self,
         &(outpoint, created_utxo): &(&transparent::OutPoint, &transparent::OrderedUtxo),
     ) -> Result<(), ValidateContextError> {
-        self.balance =
-            (self.balance + created_utxo.utxo.output.value().constrain().unwrap()).unwrap();
+        self.balance = (self.balance
+            + created_utxo
+                .utxo
+                .output
+                .value()
+                .constrain()
+                .expect("NonNegative values are always valid NegativeAllowed values"))
+        .expect("total UTXO value has already been checked");
 
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
@@ -100,8 +101,14 @@ impl
         &(outpoint, created_utxo): &(&transparent::OutPoint, &transparent::OrderedUtxo),
         _position: RevertPosition,
     ) {
-        self.balance =
-            (self.balance - created_utxo.utxo.output.value().constrain().unwrap()).unwrap();
+        self.balance = (self.balance
+            - created_utxo
+                .utxo
+                .output
+                .value()
+                .constrain()
+                .expect("NonNegative values are always valid NegativeAllowed values"))
+        .expect("reversing previous balance changes is always valid");
 
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
@@ -129,12 +136,14 @@ impl
         // The transparent input data
         &transparent::Input,
         // The hash of the transaction the input is from
+        // (not the transaction the spent output was created by)
         &transaction::Hash,
         // The output spent by the input
         // Includes the location of the transaction that created the output
         &transparent::OrderedUtxo,
     )> for TransparentTransfers
 {
+    #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with(
         &mut self,
         &(spending_input, spending_tx_hash, spent_output): &(
@@ -144,8 +153,14 @@ impl
         ),
     ) -> Result<(), ValidateContextError> {
         // Spending a UTXO subtracts value from the balance
-        self.balance =
-            (self.balance - spent_output.utxo.output.value().constrain().unwrap()).unwrap();
+        self.balance = (self.balance
+            - spent_output
+                .utxo
+                .output
+                .value()
+                .constrain()
+                .expect("NonNegative values are always valid NegativeAllowed values"))
+        .expect("total UTXO value has already been checked");
 
         let spent_outpoint = spending_input.outpoint().expect("checked by caller");
 
@@ -171,8 +186,14 @@ impl
         ),
         _position: RevertPosition,
     ) {
-        self.balance =
-            (self.balance + spent_output.utxo.output.value().constrain().unwrap()).unwrap();
+        self.balance = (self.balance
+            + spent_output
+                .utxo
+                .output
+                .value()
+                .constrain()
+                .expect("NonNegative values are always valid NegativeAllowed values"))
+        .expect("reversing previous balance changes is always valid");
 
         let spent_outpoint = spending_input.outpoint().expect("checked by caller");
 
@@ -209,25 +230,30 @@ impl TransparentTransfers {
         self.balance
     }
 
-    /// Returns the [`transaction::Hash`]es of the transactions that sent or received
-    /// transparent transfers to this address, in this partial chain, filtered by `query_height_range`.
+    /// Returns the [`transaction::Hash`]es of the transactions that sent or
+    /// received transparent transfers to this address, in this partial chain,
+    /// filtered by `query_height_range`.
     ///
     /// The transactions are returned in chain order.
     ///
-    /// `chain_tx_by_hash` should be the `tx_by_hash` field from the [`Chain`] containing this index.
+    /// `chain_tx_loc_by_hash` should be the `tx_loc_by_hash` field from the
+    /// [`Chain`][1] containing this index.
     ///
     /// # Panics
     ///
-    /// If `chain_tx_by_hash` is missing some transaction hashes from this index.
+    /// If `chain_tx_loc_by_hash` is missing some transaction hashes from this
+    /// index.
+    ///
+    /// [1]: super::super::Chain
     pub fn tx_ids(
         &self,
-        chain_tx_by_hash: &HashMap<transaction::Hash, TransactionLocation>,
+        chain_tx_loc_by_hash: &HashMap<transaction::Hash, TransactionLocation>,
         query_height_range: RangeInclusive<Height>,
     ) -> BTreeMap<TransactionLocation, transaction::Hash> {
         self.tx_ids
             .distinct_elements()
             .filter_map(|tx_hash| {
-                let tx_loc = *chain_tx_by_hash
+                let tx_loc = *chain_tx_loc_by_hash
                     .get(tx_hash)
                     .expect("all hashes are indexed");
 
@@ -269,7 +295,7 @@ impl Default for TransparentTransfers {
     }
 }
 
-/// Returns the transaction location for an [`OrderedUtxo`].
+/// Returns the transaction location for an [`transparent::OrderedUtxo`].
 pub fn transaction_location(ordered_utxo: &transparent::OrderedUtxo) -> TransactionLocation {
     TransactionLocation::from_usize(ordered_utxo.utxo.height, ordered_utxo.tx_index_in_block)
 }

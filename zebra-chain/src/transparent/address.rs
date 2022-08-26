@@ -40,7 +40,7 @@ mod magics {
 /// imply that a transparent Zcash address can be parsed identically
 /// to a Bitcoin address just by removing the "t".)
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#transparentaddrencoding
+/// <https://zips.z.cash/protocol/protocol.pdf#transparentaddrencoding>
 #[derive(
     Copy, Clone, Eq, PartialEq, Hash, serde_with::SerializeDisplay, serde_with::DeserializeFromStr,
 )]
@@ -241,7 +241,7 @@ impl Address {
     ///
     /// The resulting hash in both of these cases is always exactly 20
     /// bytes.
-    /// https://en.bitcoin.it/Base58Check_encoding#Encoding_a_Bitcoin_address
+    /// <https://en.bitcoin.it/Base58Check_encoding#Encoding_a_Bitcoin_address>
     fn hash_payload(bytes: &[u8]) -> [u8; 20] {
         let sha_hash = Sha256::digest(bytes);
         let ripe_hash = Ripemd160::digest(&sha_hash);
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn pubkey_mainnet() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let pub_key = PublicKey::from_slice(&[
             3, 23, 183, 225, 206, 31, 159, 148, 195, 42, 67, 115, 146, 41, 248, 140, 11, 3, 51, 41,
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn pubkey_testnet() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let pub_key = PublicKey::from_slice(&[
             3, 23, 183, 225, 206, 31, 159, 148, 195, 42, 67, 115, 146, 41, 248, 140, 11, 3, 51, 41,
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn empty_script_mainnet() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let script = Script::new(&[0u8; 20]);
 
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn empty_script_testnet() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let script = Script::new(&[0; 20]);
 
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let t_addr: Address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".parse().unwrap();
 
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn debug() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let t_addr: Address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".parse().unwrap();
 
@@ -337,7 +337,7 @@ proptest! {
 
     #[test]
     fn transparent_address_roundtrip(taddr in any::<Address>()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let mut data = Vec::new();
 

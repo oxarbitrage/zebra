@@ -1,0 +1,100 @@
+name: CI Docker
+
+# These jobs *don't* depend on cached Google Cloud state disks,
+# so they can be skipped when the modified files make the actual workflow run.
+on:
+  pull_request:
+    paths-ignore:
+      # code and tests
+      - '**/*.rs'
+      # hard-coded checkpoints and proptest regressions
+      - '**/*.txt'
+      # test data snapshots
+      - '**/*.snap'
+      # dependencies
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      # workflow definitions
+      - 'docker/**'
+      - '.github/workflows/continous-integration-docker.yml'
+      - '.github/workflows/deploy-gcp-tests.yml'
+      - '.github/workflows/build-docker-image.yml'
+
+jobs:
+  get-available-disks:
+    name: Find available cached state disks
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  build:
+    name: Build / Build images
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-all:
+    name: Test all
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-fake-activation-heights:
+    name: Test with fake activation heights
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-empty-sync:
+    name: Test checkpoint sync from empty state
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-lightwalletd-integration:
+    name: Test integration with lightwalletd
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-stateful-sync:
+    name: Zebra checkpoint update / Run sync-past-checkpoint test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-update-sync:
+    name: Zebra tip update / Run update-to-tip test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  lightwalletd-rpc-test:
+    name: Zebra tip JSON-RPC / Run fully-synced-rpc test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  lightwalletd-transactions-test:
+    name: lightwalletd tip send / Run lwd-send-transactions test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  lightwalletd-full-sync:
+    name: lightwalletd tip / Run lwd-full-sync test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  lightwalletd-update-sync:
+    name: lightwalletd tip update / Run lwd-update-sync test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  lightwalletd-grpc-test:
+    name: lightwalletd GRPC tests / Run lwd-grpc-wallet test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'

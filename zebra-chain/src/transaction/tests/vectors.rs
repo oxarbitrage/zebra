@@ -1,4 +1,4 @@
-use std::convert::{TryFrom, TryInto};
+//! Fixed test vectors for transactions.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use color_eyre::eyre::Result;
@@ -44,7 +44,7 @@ fn mock_pre_v5_output_list(output: transparent::Output, index: usize) -> Vec<tra
 
 #[test]
 fn transactionhash_struct_from_str_roundtrip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let hash: Hash = "3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf"
         .parse()
@@ -62,7 +62,7 @@ fn transactionhash_struct_from_str_roundtrip() {
 
 #[test]
 fn auth_digest_struct_from_str_roundtrip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let digest: AuthDigest = "3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf"
         .parse()
@@ -80,7 +80,7 @@ fn auth_digest_struct_from_str_roundtrip() {
 
 #[test]
 fn wtx_id_struct_from_str_roundtrip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let wtx_id: WtxId = "3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf0000000000000000000000000000000000000000000000000000000000000001"
         .parse()
@@ -98,7 +98,7 @@ fn wtx_id_struct_from_str_roundtrip() {
 
 #[test]
 fn librustzcash_tx_deserialize_and_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let tx = Transaction::zcash_deserialize(&zebra_test::vectors::GENERIC_TESTNET_TX[..])
         .expect("transaction test vector from librustzcash should deserialize");
@@ -111,7 +111,7 @@ fn librustzcash_tx_deserialize_and_round_trip() {
 
 #[test]
 fn librustzcash_tx_hash() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let tx = Transaction::zcash_deserialize(&zebra_test::vectors::GENERIC_TESTNET_TX[..])
         .expect("transaction test vector from librustzcash should deserialize");
@@ -127,7 +127,7 @@ fn librustzcash_tx_hash() {
 
 #[test]
 fn doesnt_deserialize_transaction_with_invalid_value_balance() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let dummy_transaction = Transaction::V4 {
         inputs: vec![],
@@ -158,7 +158,7 @@ fn doesnt_deserialize_transaction_with_invalid_value_balance() {
 
 #[test]
 fn zip143_deserialize_and_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let tx1 = Transaction::zcash_deserialize(&zebra_test::vectors::ZIP143_1[..])
         .expect("transaction test vector from ZIP143 should deserialize");
@@ -181,7 +181,7 @@ fn zip143_deserialize_and_round_trip() {
 
 #[test]
 fn zip243_deserialize_and_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let tx1 = Transaction::zcash_deserialize(&zebra_test::vectors::ZIP243_1[..])
         .expect("transaction test vector from ZIP243 should deserialize");
@@ -213,7 +213,7 @@ fn zip243_deserialize_and_round_trip() {
 
 #[test]
 fn deserialize_large_transaction() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // Create a dummy input and output.
     let input =
@@ -273,9 +273,9 @@ fn deserialize_large_transaction() {
 /// zebra_consensus::transaction::Verifier
 #[test]
 fn empty_v5_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
-    let tx: &Transaction = &*EMPTY_V5_TX;
+    let tx: &Transaction = &EMPTY_V5_TX;
 
     let data = tx.zcash_serialize_to_vec().expect("tx should serialize");
     let tx2: &Transaction = &data
@@ -297,7 +297,7 @@ fn empty_v5_round_trip() {
 /// zebra_consensus::transaction::Verifier
 #[test]
 fn empty_v4_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let tx = Transaction::V4 {
         inputs: Vec::new(),
@@ -325,9 +325,9 @@ fn empty_v4_round_trip() {
 /// Check if an empty V5 transaction can be deserialized by librustzcash too.
 #[test]
 fn empty_v5_librustzcash_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
-    let tx: &Transaction = &*EMPTY_V5_TX;
+    let tx: &Transaction = &EMPTY_V5_TX;
     let _alt_tx: zcash_primitives::transaction::Transaction = tx.try_into().expect(
         "librustzcash deserialization might work for empty zebra serialized transactions. \
         Hint: if empty transactions fail, but other transactions work, delete this test",
@@ -341,7 +341,7 @@ fn empty_v5_librustzcash_round_trip() {
 /// transactions.
 #[test]
 fn fake_v5_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     fake_v5_round_trip_for_network(Network::Mainnet);
     fake_v5_round_trip_for_network(Network::Testnet);
@@ -463,7 +463,7 @@ fn fake_v5_round_trip_for_network(network: Network) {
 
 #[test]
 fn invalid_orchard_nullifier() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     use std::convert::TryFrom;
 
@@ -492,7 +492,7 @@ fn invalid_orchard_nullifier() {
 /// Makes sure that zebra-serialized transactions can be deserialized by librustzcash.
 #[test]
 fn fake_v5_librustzcash_round_trip() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     fake_v5_librustzcash_round_trip_for_network(Network::Mainnet);
     fake_v5_librustzcash_round_trip_for_network(Network::Testnet);
@@ -565,13 +565,15 @@ fn fake_v5_librustzcash_round_trip_for_network(network: Network) {
 
 #[test]
 fn zip244_round_trip() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
         let reencoded = transaction.zcash_serialize_to_vec()?;
         assert_eq!(test.tx, reencoded);
 
+        // The borrow is actually needed to call the correct trait impl
+        #[allow(clippy::needless_borrow)]
         let _alt_tx: zcash_primitives::transaction::Transaction = (&transaction)
             .try_into()
             .expect("librustzcash deserialization must work for zebra serialized transactions");
@@ -582,7 +584,7 @@ fn zip244_round_trip() -> Result<()> {
 
 #[test]
 fn zip244_txid() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
@@ -596,7 +598,7 @@ fn zip244_txid() -> Result<()> {
 
 #[test]
 fn zip244_auth_digest() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
@@ -614,7 +616,7 @@ fn zip244_auth_digest() -> Result<()> {
 
 #[test]
 fn test_vec143_1() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let transaction = ZIP143_1.zcash_deserialize_into::<Transaction>()?;
 
@@ -643,7 +645,7 @@ fn test_vec143_1() -> Result<()> {
 
 #[test]
 fn test_vec143_2() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let transaction = ZIP143_2.zcash_deserialize_into::<Transaction>()?;
 
@@ -679,7 +681,7 @@ fn test_vec143_2() -> Result<()> {
 
 #[test]
 fn test_vec243_1() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let transaction = ZIP243_1.zcash_deserialize_into::<Transaction>()?;
 
@@ -718,7 +720,7 @@ fn test_vec243_1() -> Result<()> {
 
 #[test]
 fn test_vec243_2() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let transaction = ZIP243_2.zcash_deserialize_into::<Transaction>()?;
 
@@ -768,7 +770,7 @@ fn test_vec243_2() -> Result<()> {
 
 #[test]
 fn test_vec243_3() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
 
@@ -820,7 +822,7 @@ fn test_vec243_3() -> Result<()> {
 
 #[test]
 fn zip143_sighash() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for (i, test) in zip0143::TEST_VECTORS.iter().enumerate() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
@@ -856,7 +858,7 @@ fn zip143_sighash() -> Result<()> {
 
 #[test]
 fn zip243_sighash() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for (i, test) in zip0243::TEST_VECTORS.iter().enumerate() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
@@ -892,7 +894,7 @@ fn zip243_sighash() -> Result<()> {
 
 #[test]
 fn zip244_sighash() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for (i, test) in zip0244::TEST_VECTORS.iter().enumerate() {
         let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
@@ -933,7 +935,7 @@ fn zip244_sighash() -> Result<()> {
 
 #[test]
 fn binding_signatures() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     binding_signatures_for_network(Network::Mainnet);
     binding_signatures_for_network(Network::Testnet);

@@ -152,6 +152,7 @@ impl CachedFfiTransaction {
     /// Verify if the script in the input at `input_index` of a transaction correctly
     /// spends the matching [`transparent::Output`] it refers to, with the [`ConsensusBranchId`]
     /// of the block containing the transaction.
+    #[allow(clippy::unwrap_in_result)]
     pub fn is_valid(&self, branch_id: ConsensusBranchId, input_index: usize) -> Result<(), Error> {
         let previous_output = self
             .all_previous_outputs
@@ -210,6 +211,7 @@ impl CachedFfiTransaction {
 
     /// Returns the number of transparent signature operations in the
     /// transparent inputs and outputs of this transaction.
+    #[allow(clippy::unwrap_in_result)]
     pub fn legacy_sigop_count(&self) -> Result<u64, Error> {
         let mut err = 0;
 
@@ -314,7 +316,7 @@ mod tests {
 
     #[test]
     fn verify_valid_script_v4() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         verify_valid_script(
             Blossom.branch_id().unwrap(),
@@ -326,7 +328,7 @@ mod tests {
 
     #[test]
     fn count_legacy_sigops() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let transaction =
             SCRIPT_TX.zcash_deserialize_into::<Arc<zebra_chain::transaction::Transaction>>()?;
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn fail_invalid_script() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let transaction =
             SCRIPT_TX.zcash_deserialize_into::<Arc<zebra_chain::transaction::Transaction>>()?;
@@ -362,7 +364,7 @@ mod tests {
 
     #[test]
     fn reuse_script_verifier_pass_pass() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let coin = u64::pow(10, 8);
         let transaction =
@@ -389,7 +391,7 @@ mod tests {
 
     #[test]
     fn reuse_script_verifier_pass_fail() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let coin = u64::pow(10, 8);
         let amount = 212 * coin;
@@ -416,7 +418,7 @@ mod tests {
 
     #[test]
     fn reuse_script_verifier_fail_pass() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let coin = u64::pow(10, 8);
         let amount = 212 * coin;
@@ -443,7 +445,7 @@ mod tests {
 
     #[test]
     fn reuse_script_verifier_fail_fail() -> Result<()> {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let coin = u64::pow(10, 8);
         let amount = 212 * coin;

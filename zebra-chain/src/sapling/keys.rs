@@ -8,6 +8,7 @@
 //! [ps]: https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
 //! [3.1]: https://zips.z.cash/protocol/protocol.pdf#addressesandkeys
 #![allow(clippy::unit_arg)]
+#![allow(clippy::fallible_impl_from)]
 #![allow(dead_code)]
 
 #[cfg(test)]
@@ -52,7 +53,7 @@ pub(super) const RANDOMNESS_BEACON_URS: &[u8; 64] =
 ///
 /// PRF^expand(sk, t) := BLAKE2b-512("Zcash_ExpandSeed", sk || t)
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#concreteprfs
+/// <https://zips.z.cash/protocol/protocol.pdf#concreteprfs>
 fn prf_expand(sk: [u8; 32], t: &[u8]) -> [u8; 64] {
     let hash = blake2b_simd::Params::new()
         .hash_length(64)
@@ -69,7 +70,7 @@ fn prf_expand(sk: [u8; 32], t: &[u8]) -> [u8; 64] {
 ///
 /// PRF^ock(ovk, cv, cm_u, ephemeralKey) := BLAKE2b-256(“Zcash_Derive_ock”, ovk || cv || cm_u || ephemeralKey)
 ///
-/// https://zips.z.cash/protocol/nu5.pdf#concreteprfs
+/// <https://zips.z.cash/protocol/nu5.pdf#concreteprfs>
 fn prf_ock(ovk: [u8; 32], cv: [u8; 32], cm_u: [u8; 32], ephemeral_key: [u8; 32]) -> [u8; 32] {
     let hash = blake2b_simd::Params::new()
         .hash_length(32)
@@ -89,7 +90,7 @@ fn prf_ock(ovk: [u8; 32], cv: [u8; 32], cm_u: [u8; 32], ephemeral_key: [u8; 32])
 ///
 /// _CRH^ivk(ak, nk) := BLAKE2s-256("Zcashivk", ak || nk)_
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#concretecrhivk
+/// <https://zips.z.cash/protocol/protocol.pdf#concretecrhivk>
 fn crh_ivk(ak: [u8; 32], nk: [u8; 32]) -> [u8; 32] {
     let hash = blake2s_simd::Params::new()
         .hash_length(32)
@@ -112,7 +113,7 @@ fn crh_ivk(ak: [u8; 32], nk: [u8; 32]) -> [u8; 32] {
 /// input.
 ///
 /// [0]: https://github.com/zcash/librustzcash/blob/master/zcash_primitives/src/group_hash.rs#L15
-/// https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub
+/// <https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub>
 fn jubjub_group_hash(d: [u8; 8], m: &[u8]) -> Option<jubjub::ExtendedPoint> {
     let hash = blake2s_simd::Params::new()
         .hash_length(32)
@@ -143,7 +144,7 @@ fn jubjub_group_hash(d: [u8; 8], m: &[u8]) -> Option<jubjub::ExtendedPoint> {
 /// input.
 ///
 /// [0]: https://github.com/zcash/librustzcash/blob/master/zcash_primitives/src/jubjub/mod.rs#L409
-/// https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub
+/// <https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub>
 // TODO: move common functions like these out of the keys module into
 // a more appropriate location
 pub(super) fn find_group_hash(d: [u8; 8], m: &[u8]) -> jubjub::ExtendedPoint {
@@ -167,14 +168,14 @@ pub(super) fn find_group_hash(d: [u8; 8], m: &[u8]) -> jubjub::ExtendedPoint {
 /// Instance of FindGroupHash for JubJub, using personalized by
 /// BLAKE2s for picking the proof generation key base point.
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
+/// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
 fn zcash_h() -> jubjub::ExtendedPoint {
     find_group_hash(*b"Zcash_H_", b"")
 }
 
 /// Used to derive a diversified base point from a diversifier value.
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#concretediversifyhash
+/// <https://zips.z.cash/protocol/protocol.pdf#concretediversifyhash>
 fn diversify_hash(d: [u8; 11]) -> Option<jubjub::ExtendedPoint> {
     jubjub_group_hash(*b"Zcash_gd", &d)
 }
@@ -253,23 +254,27 @@ impl From<[u8; 32]> for SpendingKey {
 }
 
 impl fmt::Display for SpendingKey {
+    #[allow(clippy::unwrap_in_result)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let hrp = match self.network {
             Network::Mainnet => sk_hrp::MAINNET,
             _ => sk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32(), Variant::Bech32).unwrap()
+        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32(), Variant::Bech32)
+            .expect("hrp is valid")
     }
 }
 
 impl FromStr for SpendingKey {
     type Err = SerializationError;
 
+    #[allow(clippy::unwrap_in_result)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
             Ok((hrp, bytes, Variant::Bech32)) => {
-                let decoded = Vec::<u8>::from_base32(&bytes).unwrap();
+                let decoded =
+                    Vec::<u8>::from_base32(&bytes).expect("bech32::decode guarantees valid base32");
 
                 let mut decoded_bytes = [0u8; 32];
                 decoded_bytes[..].copy_from_slice(&decoded[0..32]);
@@ -331,8 +336,8 @@ impl From<SpendingKey> for SpendAuthorizingKey {
     /// Invokes Blake2b-512 as _PRF^expand_, t=0, to derive a
     /// SpendAuthorizingKey from a SpendingKey.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concreteprfs
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concreteprfs>
     fn from(spending_key: SpendingKey) -> SpendAuthorizingKey {
         let hash_bytes = prf_expand(spending_key.bytes, &[0]);
 
@@ -388,8 +393,8 @@ impl From<ProofAuthorizingKey> for [u8; 32] {
 impl From<SpendingKey> for ProofAuthorizingKey {
     /// For this invocation of Blake2b-512 as _PRF^expand_, t=1.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concreteprfs
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concreteprfs>
     fn from(spending_key: SpendingKey) -> ProofAuthorizingKey {
         let hash_bytes = prf_expand(spending_key.bytes, &[1]);
 
@@ -442,8 +447,8 @@ impl From<OutgoingViewingKey> for [u8; 32] {
 impl From<SpendingKey> for OutgoingViewingKey {
     /// For this invocation of Blake2b-512 as _PRF^expand_, t=2.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concreteprfs
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concreteprfs>
     fn from(spending_key: SpendingKey) -> OutgoingViewingKey {
         let hash_bytes = prf_expand(spending_key.bytes, &[2]);
 
@@ -507,7 +512,9 @@ impl From<AuthorizingKey> for [u8; 32] {
 
 impl From<SpendAuthorizingKey> for AuthorizingKey {
     fn from(ask: SpendAuthorizingKey) -> Self {
-        let sk = redjubjub::SigningKey::<SpendAuth>::try_from(<[u8; 32]>::from(ask)).unwrap();
+        let sk = redjubjub::SigningKey::<SpendAuth>::try_from(<[u8; 32]>::from(ask)).expect(
+            "a scalar converted to byte array and then converted back to a scalar should not fail",
+        );
         Self(redjubjub::VerificationKey::from(&sk))
     }
 }
@@ -575,9 +582,9 @@ impl From<ProofAuthorizingKey> for NullifierDerivingKey {
     /// the resulting generator point to scalar multiply the
     /// ProofAuthorizingKey into the new NullifierDerivingKey
     ///
-    /// https://github.com/zcash/librustzcash/blob/master/zcash_primitives/src/group_hash.rs
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub
+    /// <https://github.com/zcash/librustzcash/blob/master/zcash_primitives/src/group_hash.rs>
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concretegrouphashjubjub>
     fn from(nsk: ProofAuthorizingKey) -> Self {
         // Should this point, when generated, be fixed for the rest of
         // the protocol instance? Since this is kind of hash-and-pray, it
@@ -634,13 +641,15 @@ impl fmt::Debug for IncomingViewingKey {
 }
 
 impl fmt::Display for IncomingViewingKey {
+    #[allow(clippy::unwrap_in_result)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let hrp = match self.network {
             Network::Mainnet => ivk_hrp::MAINNET,
             _ => ivk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, &self.scalar.to_bytes().to_base32(), Variant::Bech32).unwrap()
+        bech32::encode_to_fmt(f, hrp, &self.scalar.to_bytes().to_base32(), Variant::Bech32)
+            .expect("hrp is valid")
     }
 }
 
@@ -668,9 +677,9 @@ impl From<[u8; 32]> for IncomingViewingKey {
 impl From<(AuthorizingKey, NullifierDerivingKey)> for IncomingViewingKey {
     /// For this invocation of Blake2s-256 as _CRH^ivk_.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concreteprfs
-    /// https://zips.z.cash/protocol/protocol.pdf#jubjub
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concreteprfs>
+    /// <https://zips.z.cash/protocol/protocol.pdf#jubjub>
     // TODO: return None if ivk = 0
     //
     // "If ivk = 0, discard this key and start over with a new
@@ -687,10 +696,12 @@ impl From<(AuthorizingKey, NullifierDerivingKey)> for IncomingViewingKey {
 impl FromStr for IncomingViewingKey {
     type Err = SerializationError;
 
+    #[allow(clippy::unwrap_in_result)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
             Ok((hrp, bytes, Variant::Bech32)) => {
-                let decoded = Vec::<u8>::from_base32(&bytes).unwrap();
+                let decoded =
+                    Vec::<u8>::from_base32(&bytes).expect("bech32::decode guarantees valid base32");
 
                 let mut scalar_bytes = [0u8; 32];
                 scalar_bytes[..].copy_from_slice(&decoded[0..32]);
@@ -815,8 +826,8 @@ impl Diversifier {
     /// as a preimage to a valid diversified base point when used to
     /// derive a diversified payment address.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concretediversifyhash
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concretediversifyhash>
     pub fn new<T>(csprng: &mut T) -> Self
     where
         T: RngCore + CryptoRng,
@@ -870,8 +881,8 @@ impl TryFrom<[u8; 32]> for TransmissionKey {
     /// Attempts to interpret a byte representation of an affine Jubjub point, failing if the
     /// element is not on the curve, non-canonical, or not in the prime-order subgroup.
     ///
-    /// https://github.com/zkcrypto/jubjub/blob/master/src/lib.rs#L411
-    /// https://zips.z.cash/zip-0216
+    /// <https://github.com/zkcrypto/jubjub/blob/master/src/lib.rs#L411>
+    /// <https://zips.z.cash/zip-0216>
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
         let affine_point = jubjub::AffinePoint::from_bytes(bytes).unwrap();
         // Check if it's identity or has prime order (i.e. is in the prime-order subgroup).
@@ -895,8 +906,8 @@ impl TryFrom<(IncomingViewingKey, Diversifier)> for TransmissionKey {
     /// This includes _KA^Sapling.DerivePublic(ivk, G_d)_, which is just a
     /// scalar mult _\[ivk\]G_d_.
     ///
-    /// https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents
-    /// https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
+    /// <https://zips.z.cash/protocol/protocol.pdf#saplingkeycomponents>
+    /// <https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement>
     fn try_from((ivk, d): (IncomingViewingKey, Diversifier)) -> Result<Self, Self::Error> {
         let affine_point = jubjub::AffinePoint::from(
             diversify_hash(d.0).ok_or("invalid diversifier")? * ivk.scalar,
@@ -932,7 +943,7 @@ mod fvk_hrp {
 /// Human-Readable Part is "zviews". For incoming viewing keys on the
 /// test network, the Human-Readable Part is "zviewtestsapling".
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#saplingfullviewingkeyencoding
+/// <https://zips.z.cash/protocol/protocol.pdf#saplingfullviewingkeyencoding>
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct FullViewingKey {
     network: Network,
@@ -955,6 +966,7 @@ impl fmt::Debug for FullViewingKey {
 }
 
 impl fmt::Display for FullViewingKey {
+    #[allow(clippy::unwrap_in_result)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut bytes = io::Cursor::new(Vec::new());
 
@@ -967,17 +979,21 @@ impl fmt::Display for FullViewingKey {
             _ => fvk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, bytes.get_ref().to_base32(), Variant::Bech32).unwrap()
+        bech32::encode_to_fmt(f, hrp, bytes.get_ref().to_base32(), Variant::Bech32)
+            .expect("hrp is valid")
     }
 }
 
 impl FromStr for FullViewingKey {
     type Err = SerializationError;
 
+    #[allow(clippy::unwrap_in_result)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match bech32::decode(s) {
             Ok((hrp, bytes, Variant::Bech32)) => {
-                let mut decoded_bytes = io::Cursor::new(Vec::<u8>::from_base32(&bytes).unwrap());
+                let mut decoded_bytes = io::Cursor::new(
+                    Vec::<u8>::from_base32(&bytes).expect("bech32::decode guarantees valid base32"),
+                );
 
                 let authorizing_key_bytes = decoded_bytes.read_32_bytes()?;
                 let nullifier_deriving_key_bytes = decoded_bytes.read_32_bytes()?;
@@ -1055,7 +1071,7 @@ impl TryFrom<[u8; 32]> for EphemeralPublicKey {
     /// # Consensus
     ///
     /// > Check that a Output description's cv and epk are not of small order,
-    /// > i.e. [h_J]cv MUST NOT be 𝒪_J and [h_J]epk MUST NOT be 𝒪_J.
+    /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]epk MUST NOT be 𝒪_J.
     ///
     /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
@@ -1106,7 +1122,7 @@ impl TryFrom<redjubjub::VerificationKey<SpendAuth>> for ValidatingKey {
     /// # Consensus
     ///
     /// > Check that a Spend description's cv and rk are not of small order,
-    /// > i.e. [h_J]cv MUST NOT be 𝒪_J and [h_J]rk MUST NOT be 𝒪_J.
+    /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]rk MUST NOT be 𝒪_J.
     ///
     /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
     fn try_from(key: redjubjub::VerificationKey<SpendAuth>) -> Result<Self, Self::Error> {

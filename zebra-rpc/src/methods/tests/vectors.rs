@@ -20,9 +20,9 @@ use zebra_test::mock_service::MockService;
 
 use super::super::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getinfo() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -53,9 +53,9 @@ async fn rpc_getinfo() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -77,14 +77,33 @@ async fn rpc_getblock() {
         Mainnet,
     );
 
-    // Make calls and check response
-    for (i, block) in blocks.into_iter().enumerate() {
+    // Make calls with verbosity=0 and check response
+    for (i, block) in blocks.iter().enumerate() {
         let get_block = rpc
             .get_block(i.to_string(), 0u8)
             .await
             .expect("We should have a GetBlock struct");
 
-        assert_eq!(get_block.0, block.into());
+        assert_eq!(get_block, GetBlock::Raw(block.clone().into()));
+    }
+
+    // Make calls with verbosity=1 and check response
+    for (i, block) in blocks.iter().enumerate() {
+        let get_block = rpc
+            .get_block(i.to_string(), 1u8)
+            .await
+            .expect("We should have a GetBlock struct");
+
+        assert_eq!(
+            get_block,
+            GetBlock::Object {
+                tx: block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.hash().encode_hex())
+                    .collect()
+            }
+        );
     }
 
     mempool.expect_no_requests().await;
@@ -94,9 +113,9 @@ async fn rpc_getblock() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_parse_error() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -124,9 +143,9 @@ async fn rpc_getblock_parse_error() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_missing_error() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -176,9 +195,9 @@ async fn rpc_getblock_missing_error() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getbestblockhash() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -222,9 +241,9 @@ async fn rpc_getbestblockhash() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getrawtransaction() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -307,9 +326,9 @@ async fn rpc_getrawtransaction() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddresstxids_invalid_arguments() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
@@ -337,14 +356,18 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     let start: u32 = 1;
     let end: u32 = 2;
     let error = rpc
-        .get_address_tx_ids(AddressStrings::new(addresses), start, end)
+        .get_address_tx_ids(GetAddressTxIdsRequest {
+            addresses: addresses.clone(),
+            start,
+            end,
+        })
         .await
         .unwrap_err();
     assert_eq!(
         error.message,
         format!(
             "invalid address \"{}\": parse error: t-addr decoding error",
-            address
+            address.clone()
         )
     );
 
@@ -356,7 +379,11 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     let start: u32 = 2;
     let end: u32 = 1;
     let error = rpc
-        .get_address_tx_ids(AddressStrings::new(addresses.clone()), start, end)
+        .get_address_tx_ids(GetAddressTxIdsRequest {
+            addresses: addresses.clone(),
+            start,
+            end,
+        })
         .await
         .unwrap_err();
     assert_eq!(
@@ -368,7 +395,11 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     let start: u32 = 0;
     let end: u32 = 1;
     let error = rpc
-        .get_address_tx_ids(AddressStrings::new(addresses.clone()), start, end)
+        .get_address_tx_ids(GetAddressTxIdsRequest {
+            addresses: addresses.clone(),
+            start,
+            end,
+        })
         .await
         .unwrap_err();
     assert_eq!(
@@ -380,7 +411,11 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     let start: u32 = 1;
     let end: u32 = 11;
     let error = rpc
-        .get_address_tx_ids(AddressStrings::new(addresses), start, end)
+        .get_address_tx_ids(GetAddressTxIdsRequest {
+            addresses,
+            start,
+            end,
+        })
         .await
         .unwrap_err();
     assert_eq!(
@@ -395,9 +430,9 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     assert!(matches!(rpc_tx_queue_task_result, None));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddresstxids_response() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for network in [Mainnet, Testnet] {
         let blocks: Vec<Arc<Block>> = match network {
@@ -459,7 +494,11 @@ async fn rpc_getaddresstxids_response_with(
     // call the method with valid arguments
     let addresses = vec![address.to_string()];
     let response = rpc
-        .get_address_tx_ids(AddressStrings::new(addresses), *range.start(), *range.end())
+        .get_address_tx_ids(GetAddressTxIdsRequest {
+            addresses,
+            start: *range.start(),
+            end: *range.end(),
+        })
         .await
         .expect("arguments are valid so no error can happen here");
 
@@ -486,9 +525,9 @@ async fn rpc_getaddresstxids_response_with(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddressutxos_invalid_arguments() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -521,9 +560,9 @@ async fn rpc_getaddressutxos_invalid_arguments() {
     state.expect_no_requests().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddressutxos_response() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .iter()

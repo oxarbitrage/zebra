@@ -7,7 +7,7 @@ use proptest::prelude::*;
 
 #[test]
 fn generate_keys_from_test_vectors() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     for test_vector in KEY_COMPONENTS.iter() {
         let spending_key = SpendingKey::from_bytes(test_vector.sk, Network::Mainnet);
@@ -33,7 +33,8 @@ fn generate_keys_from_test_vectors() {
         let diversifier_key = DiversifierKey::from(full_viewing_key);
         assert_eq!(diversifier_key, test_vector.dk);
 
-        let incoming_viewing_key = IncomingViewingKey::from(full_viewing_key);
+        let incoming_viewing_key =
+            IncomingViewingKey::try_from(full_viewing_key).expect("a valid incoming viewing key");
         assert_eq!(<[u8; 32]>::from(incoming_viewing_key.ivk), test_vector.ivk);
 
         let outgoing_viewing_key = OutgoingViewingKey::from(full_viewing_key);
@@ -52,7 +53,7 @@ proptest! {
     #[test]
     #[allow(clippy::clone_on_copy, clippy::cmp_owned)]
     fn generate_keys(spending_key in any::<SpendingKey>()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         // Test ConstantTimeEq, Eq, PartialEq
         assert_eq!(spending_key, SpendingKey::from_bytes(spending_key.bytes, spending_key.network));
@@ -84,7 +85,7 @@ proptest! {
         // Test ConstantTimeEq, Eq, PartialEq
         assert_eq!(diversifier_key, diversifier_key.clone());
 
-        let incoming_viewing_key = IncomingViewingKey::from(full_viewing_key);
+        let incoming_viewing_key = IncomingViewingKey::try_from(full_viewing_key).expect("a valid incoming viewing key");
         // Test ConstantTimeEq, Eq, PartialEq
         assert_eq!(incoming_viewing_key, incoming_viewing_key.clone());
 

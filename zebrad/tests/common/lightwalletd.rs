@@ -20,7 +20,7 @@ use zebra_test::{
 use zebrad::config::ZebradConfig;
 
 use super::{
-    cached_state::ZEBRA_CACHED_STATE_DIR_VAR,
+    cached_state::ZEBRA_CACHED_STATE_DIR,
     config::default_test_config,
     failure_messages::{
         LIGHTWALLETD_EMPTY_ZEBRA_STATE_IGNORE_MESSAGES, LIGHTWALLETD_FAILURE_MESSAGES,
@@ -28,14 +28,17 @@ use super::{
     },
     launch::{
         ZebradTestDirExt, LIGHTWALLETD_DELAY, LIGHTWALLETD_FULL_SYNC_TIP_DELAY,
-        LIGHTWALLETD_UPDATE_TIP_DELAY,
+        LIGHTWALLETD_UPDATE_TIP_DELAY, ZEBRAD_EXTRA_DELAY_FOR_LIGHTWALLETD_WORKAROUND,
     },
 };
 
 use LightwalletdTestType::*;
 
+#[cfg(feature = "lightwalletd-grpc-tests")]
 pub mod send_transaction_test;
+#[cfg(feature = "lightwalletd-grpc-tests")]
 pub mod wallet_grpc;
+#[cfg(feature = "lightwalletd-grpc-tests")]
 pub mod wallet_grpc_test;
 
 /// The name of the env var that enables Zebra lightwalletd integration tests.
@@ -56,10 +59,7 @@ pub const ZEBRA_TEST_LIGHTWALLETD: &str = "ZEBRA_TEST_LIGHTWALLETD";
 ///
 /// Can also be used to speed up the [`sending_transactions_using_lightwalletd`] test,
 /// by skipping the lightwalletd initial sync.
-pub const LIGHTWALLETD_DATA_DIR_VAR: &str = "LIGHTWALLETD_DATA_DIR";
-
-/// The maximum time that a `lightwalletd` integration test is expected to run.
-pub const LIGHTWALLETD_TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+pub const LIGHTWALLETD_DATA_DIR: &str = "LIGHTWALLETD_DATA_DIR";
 
 /// Should we skip Zebra lightwalletd integration tests?
 #[allow(clippy::print_stderr)]
@@ -67,7 +67,7 @@ pub fn zebra_skip_lightwalletd_tests() -> bool {
     // TODO: check if the lightwalletd binary is in the PATH?
     //       (this doesn't seem to be implemented in the standard library)
     //
-    // See is_command_available in zebra-test/tests/command.rs for one way to do this.
+    // See is_command_available() in zebra-test/src/tests/command.rs for one way to do this.
 
     if env::var_os(ZEBRA_TEST_LIGHTWALLETD).is_none() {
         // This message is captured by the test runner, use
@@ -130,6 +130,7 @@ impl<T> LightWalletdTestDirExt for T
 where
     Self: TestDirExt + AsRef<Path> + Sized,
 {
+    #[allow(clippy::unwrap_in_result)]
     fn spawn_lightwalletd_child(
         self,
         lightwalletd_state_path: impl Into<Option<PathBuf>>,
@@ -235,6 +236,14 @@ pub enum LightwalletdTestType {
     ///
     /// This test requires a cached Zebra and lightwalletd state.
     UpdateCachedState,
+
+    /// Launch `zebrad` and sync it to the tip, but don't launch `lightwalletd`.
+    ///
+    /// If this test fails, the failure is in `zebrad` without RPCs or `lightwalletd`.
+    /// If it succeeds, but the RPC tests fail, the problem is caused by RPCs or `lightwalletd`.
+    ///
+    /// This test requires a cached Zebra state.
+    UpdateZebraCachedStateNoRpc,
 }
 
 impl LightwalletdTestType {
@@ -242,37 +251,48 @@ impl LightwalletdTestType {
     pub fn needs_zebra_cached_state(&self) -> bool {
         match self {
             LaunchWithEmptyState => false,
-            FullSyncFromGenesis { .. } | UpdateCachedState => true,
+            FullSyncFromGenesis { .. } | UpdateCachedState | UpdateZebraCachedStateNoRpc => true,
         }
     }
 
-    /// Does this test need a lightwalletd cached state?
+    /// Does this test launch `lightwalletd`?
+    pub fn launches_lightwalletd(&self) -> bool {
+        match self {
+            UpdateZebraCachedStateNoRpc => false,
+            LaunchWithEmptyState | FullSyncFromGenesis { .. } | UpdateCachedState => true,
+        }
+    }
+
+    /// Does this test need a `lightwalletd` cached state?
     pub fn needs_lightwalletd_cached_state(&self) -> bool {
         match self {
-            LaunchWithEmptyState | FullSyncFromGenesis { .. } => false,
+            LaunchWithEmptyState | FullSyncFromGenesis { .. } | UpdateZebraCachedStateNoRpc => {
+                false
+            }
             UpdateCachedState => true,
         }
     }
 
-    /// Does this test allow a lightwalletd cached state, even if it is not required?
+    /// Does this test allow a `lightwalletd` cached state, even if it is not required?
     pub fn allow_lightwalletd_cached_state(&self) -> bool {
         match self {
             LaunchWithEmptyState => false,
             FullSyncFromGenesis {
                 allow_lightwalletd_cached_state,
             } => *allow_lightwalletd_cached_state,
-            UpdateCachedState => true,
+            UpdateCachedState | UpdateZebraCachedStateNoRpc => true,
         }
     }
 
     /// Returns the Zebra state path for this test, if set.
-    pub fn zebrad_state_path(&self) -> Option<PathBuf> {
-        match env::var_os(ZEBRA_CACHED_STATE_DIR_VAR) {
+    #[allow(clippy::print_stderr)]
+    pub fn zebrad_state_path(&self, test_name: String) -> Option<PathBuf> {
+        match env::var_os(ZEBRA_CACHED_STATE_DIR) {
             Some(path) => Some(path.into()),
             None => {
-                tracing::info!(
-                    "skipped {self:?} lightwalletd test, \
-                     set the {ZEBRA_CACHED_STATE_DIR_VAR:?} environment variable to run the test",
+                eprintln!(
+                    "skipped {test_name:?} {self:?} lightwalletd test, \
+                     set the {ZEBRA_CACHED_STATE_DIR:?} environment variable to run the test",
                 );
 
                 None
@@ -284,19 +304,30 @@ impl LightwalletdTestType {
     ///
     /// Returns `None` if the test should be skipped,
     /// and `Some(Err(_))` if the config could not be created.
-    pub fn zebrad_config(&self) -> Option<Result<ZebradConfig>> {
-        if !self.needs_zebra_cached_state() {
-            return Some(random_known_rpc_port_config());
-        }
+    pub fn zebrad_config(&self, test_name: String) -> Option<Result<ZebradConfig>> {
+        let config = if self.launches_lightwalletd() {
+            random_known_rpc_port_config()
+        } else {
+            default_test_config()
+        };
 
-        let zebra_state_path = self.zebrad_state_path()?;
-
-        let mut config = match random_known_rpc_port_config() {
+        let mut config = match config {
             Ok(config) => config,
             Err(error) => return Some(Err(error)),
         };
 
-        config.sync.lookahead_limit = zebrad::components::sync::DEFAULT_LOOKAHEAD_LIMIT;
+        // We want to preload the consensus parameters,
+        // except when we're doing the quick empty state test
+        config.consensus.debug_skip_parameter_preload = !self.needs_zebra_cached_state();
+
+        if !self.needs_zebra_cached_state() {
+            return Some(Ok(config));
+        }
+
+        let zebra_state_path = self.zebrad_state_path(test_name)?;
+
+        config.sync.checkpoint_verify_concurrency_limit =
+            zebrad::components::sync::DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT;
 
         config.state.ephemeral = false;
         config.state.cache_dir = zebra_state_path;
@@ -304,25 +335,62 @@ impl LightwalletdTestType {
         Some(Ok(config))
     }
 
-    /// Returns the lightwalletd state path for this test, if set.
-    pub fn lightwalletd_state_path(&self) -> Option<PathBuf> {
-        env::var_os(LIGHTWALLETD_DATA_DIR_VAR).map(Into::into)
+    /// Returns the `lightwalletd` state path for this test, if set, and if allowed for this test.
+    pub fn lightwalletd_state_path(&self, test_name: String) -> Option<PathBuf> {
+        if !self.launches_lightwalletd() {
+            tracing::info!(
+                "running {test_name:?} {self:?} lightwalletd test, \
+                 ignoring any cached state in the {LIGHTWALLETD_DATA_DIR:?} environment variable",
+            );
+
+            return None;
+        }
+
+        match env::var_os(LIGHTWALLETD_DATA_DIR) {
+            Some(path) => Some(path.into()),
+            None => {
+                if self.needs_lightwalletd_cached_state() {
+                    tracing::info!(
+                        "skipped {test_name:?} {self:?} lightwalletd test, \
+                         set the {LIGHTWALLETD_DATA_DIR:?} environment variable to run the test",
+                    );
+                } else if self.allow_lightwalletd_cached_state() {
+                    tracing::info!(
+                        "running {test_name:?} {self:?} lightwalletd test without cached state, \
+                         set the {LIGHTWALLETD_DATA_DIR:?} environment variable to run with cached state",
+                    );
+                }
+
+                None
+            }
+        }
     }
 
     /// Returns the `zebrad` timeout for this test type.
     pub fn zebrad_timeout(&self) -> Duration {
-        match self {
+        let base_timeout = match self {
             LaunchWithEmptyState => LIGHTWALLETD_DELAY,
-            FullSyncFromGenesis { .. } | UpdateCachedState => LIGHTWALLETD_UPDATE_TIP_DELAY,
-        }
+            FullSyncFromGenesis { .. } => LIGHTWALLETD_FULL_SYNC_TIP_DELAY,
+            UpdateCachedState | UpdateZebraCachedStateNoRpc => LIGHTWALLETD_UPDATE_TIP_DELAY,
+        };
+
+        // If lightwalletd hangs and times out, Zebra needs a bit of extra time to finish
+        base_timeout + ZEBRAD_EXTRA_DELAY_FOR_LIGHTWALLETD_WORKAROUND
     }
 
     /// Returns the `lightwalletd` timeout for this test type.
+    #[track_caller]
     pub fn lightwalletd_timeout(&self) -> Duration {
+        if !self.launches_lightwalletd() {
+            panic!("lightwalletd must not be launched in the {self:?} test");
+        }
+
+        // We use the same timeouts for zebrad and lightwalletd,
+        // because the tests swap between checking zebrad and lightwalletd.
         match self {
             LaunchWithEmptyState => LIGHTWALLETD_DELAY,
-            UpdateCachedState => LIGHTWALLETD_UPDATE_TIP_DELAY,
             FullSyncFromGenesis { .. } => LIGHTWALLETD_FULL_SYNC_TIP_DELAY,
+            UpdateCachedState | UpdateZebraCachedStateNoRpc => LIGHTWALLETD_UPDATE_TIP_DELAY,
         }
     }
 
@@ -337,12 +405,12 @@ impl LightwalletdTestType {
 
         if self.needs_zebra_cached_state() {
             // Fail if we need a cached Zebra state, but it's empty
-            zebrad_failure_messages.push("loaded Zebra state cache tip=None".to_string());
+            zebrad_failure_messages.push("loaded Zebra state cache .*tip.*=.*None".to_string());
         }
         if *self == LaunchWithEmptyState {
             // Fail if we need an empty Zebra state, but it has blocks
             zebrad_failure_messages
-                .push(r"loaded Zebra state cache tip=.*Height\([1-9][0-9]*\)".to_string());
+                .push(r"loaded Zebra state cache .*tip.*=.*Height\([1-9][0-9]*\)".to_string());
         }
 
         let zebrad_ignore_messages = Vec::new();
@@ -352,7 +420,12 @@ impl LightwalletdTestType {
 
     /// Returns `lightwalletd` log regexes that indicate the tests have failed,
     /// and regexes of any failures that should be ignored.
+    #[track_caller]
     pub fn lightwalletd_failure_messages(&self) -> (Vec<String>, Vec<String>) {
+        if !self.launches_lightwalletd() {
+            panic!("lightwalletd must not be launched in the {self:?} test");
+        }
+
         let mut lightwalletd_failure_messages: Vec<String> = LIGHTWALLETD_FAILURE_MESSAGES
             .iter()
             .chain(PROCESS_FAILURE_MESSAGES)
@@ -368,9 +441,7 @@ impl LightwalletdTestType {
         // lightwalletd state failures
         if self.needs_lightwalletd_cached_state() {
             // Fail if we need a cached lightwalletd state, but it isn't near the tip
-            //
-            // TODO: fail on `[0-9]{1,6}` when we're using the tip cached state (#4155)
-            lightwalletd_failure_messages.push("Found [0-9]{1,5} blocks in cache".to_string());
+            lightwalletd_failure_messages.push("Found [0-9]{1,6} blocks in cache".to_string());
         }
         if !self.allow_lightwalletd_cached_state() {
             // Fail if we need an empty lightwalletd state, but it has blocks

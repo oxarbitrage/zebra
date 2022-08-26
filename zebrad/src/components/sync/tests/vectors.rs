@@ -6,7 +6,7 @@ use color_eyre::Report;
 use futures::{Future, FutureExt};
 
 use zebra_chain::{
-    block::{self, Block},
+    block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
     serialization::ZcashDeserializeInto,
 };
@@ -937,7 +937,7 @@ fn setup() -> (
     MockService<zebra_state::Request, zebra_state::Response, PanicAssertion>,
     MockChainTipSender,
 ) {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let consensus_config = ConsensusConfig::default();
     let state_config = StateConfig::ephemeral();
@@ -966,6 +966,7 @@ fn setup() -> (
 
     let (chain_sync, sync_status) = ChainSync::new(
         &config,
+        Height(0),
         peer_set.clone(),
         chain_verifier.clone(),
         state_service.clone(),

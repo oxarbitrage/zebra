@@ -1,7 +1,8 @@
 //! Provides low-level access to RocksDB using some database-specific types.
 //!
 //! This module makes sure that:
-//! - all disk writes happen inside a RocksDB transaction ([`WriteBatch`]), and
+//! - all disk writes happen inside a RocksDB transaction
+//!   ([`rocksdb::WriteBatch`]), and
 //! - format-specific invariants are maintained.
 //!
 //! # Correctness
@@ -215,6 +216,7 @@ impl ReadDisk for DiskDb {
             .valid()
     }
 
+    #[allow(clippy::unwrap_in_result)]
     fn zs_get<C, K, V>(&self, cf: &C, key: &K) -> Option<V>
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -345,7 +347,7 @@ impl DiskDb {
     ///
     /// On Windows, the default limit is 512 high-level I/O files, and 8192
     /// low-level I/O files:
-    /// https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/setmaxstdio?view=msvc-160#remarks
+    /// <https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/setmaxstdio?view=msvc-160#remarks>
     const MIN_OPEN_FILE_LIMIT: u64 = 512;
 
     /// The number of files used internally by Zebra.
@@ -356,7 +358,7 @@ impl DiskDb {
 
     /// The size of the database memtable RAM cache in megabytes.
     ///
-    /// https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning
+    /// <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning>
     const MEMTABLE_RAM_CACHE_MEGABYTES: usize = 128;
 
     /// Opens or creates the database at `config.path` for `network`,
@@ -367,27 +369,22 @@ impl DiskDb {
 
         let column_families = vec![
             // Blocks
-            // TODO: rename to block_header_by_height (#3151)
-            rocksdb::ColumnFamilyDescriptor::new("block_by_height", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("hash_by_height", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("height_by_hash", db_options.clone()),
+            rocksdb::ColumnFamilyDescriptor::new("block_header_by_height", db_options.clone()),
             // Transactions
             rocksdb::ColumnFamilyDescriptor::new("tx_by_loc", db_options.clone()),
             rocksdb::ColumnFamilyDescriptor::new("hash_by_tx_loc", db_options.clone()),
-            // TODO: rename to tx_loc_by_hash (#3950)
-            rocksdb::ColumnFamilyDescriptor::new("tx_by_hash", db_options.clone()),
+            rocksdb::ColumnFamilyDescriptor::new("tx_loc_by_hash", db_options.clone()),
             // Transparent
             rocksdb::ColumnFamilyDescriptor::new("balance_by_transparent_addr", db_options.clone()),
-            // TODO: #3951
-            //rocksdb::ColumnFamilyDescriptor::new("tx_by_transparent_addr_loc", db_options.clone()),
-            // TODO: rename to utxo_by_out_loc (#3952)
-            rocksdb::ColumnFamilyDescriptor::new("utxo_by_outpoint", db_options.clone()),
-            rocksdb::ColumnFamilyDescriptor::new(
-                "utxo_loc_by_transparent_addr_loc",
-                db_options.clone(),
-            ),
             rocksdb::ColumnFamilyDescriptor::new(
                 "tx_loc_by_transparent_addr_loc",
+                db_options.clone(),
+            ),
+            rocksdb::ColumnFamilyDescriptor::new("utxo_by_out_loc", db_options.clone()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                "utxo_loc_by_transparent_addr_loc",
                 db_options.clone(),
             ),
             // Sprout
@@ -463,7 +460,6 @@ impl DiskDb {
 
     /// Writes `batch` to the database.
     pub fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        // TODO: move writing to the database to a blocking thread (#2188)
         self.db.write(batch.batch)
     }
 

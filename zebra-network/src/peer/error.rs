@@ -40,31 +40,31 @@ pub enum PeerError {
     #[error("Peer closed connection")]
     ConnectionClosed,
 
-    /// Zebra dropped the [`Connection`].
+    /// Zebra dropped the [`Connection`](crate::peer::Connection).
     #[error("Internal connection dropped")]
     ConnectionDropped,
 
-    /// Zebra dropped the [`Client`].
+    /// Zebra dropped the [`Client`](crate::peer::Client).
     #[error("Internal client dropped")]
     ClientDropped,
 
-    /// A [`Client`]'s internal connection task exited.
+    /// A [`Client`](crate::peer::Client)'s internal connection task exited.
     #[error("Internal peer connection task exited")]
     ConnectionTaskExited,
 
-    /// Zebra's [`Client`] cancelled its heartbeat task.
+    /// Zebra's [`Client`](crate::peer::Client) cancelled its heartbeat task.
     #[error("Internal client cancelled its heartbeat task")]
     ClientCancelledHeartbeatTask,
 
     /// Zebra's internal heartbeat task exited.
-    #[error("Internal heartbeat task exited")]
-    HeartbeatTaskExited,
+    #[error("Internal heartbeat task exited with message: {0:?}")]
+    HeartbeatTaskExited(String),
 
     /// Sending a message to a remote peer took too long.
     #[error("Sending Client request timed out")]
     ConnectionSendTimeout,
 
-    /// Receiving a response to a [`peer::Client`] request took too long.
+    /// Receiving a response to a [`Client`](crate::peer::Client) request took too long.
     #[error("Receiving client response timed out")]
     ConnectionReceiveTimeout,
 
@@ -94,26 +94,30 @@ pub enum PeerError {
     /// or peers can download and verify the missing data.
     ///
     /// If the peer has some of the data, the request returns an [`Ok`] response,
-    /// with any `notfound` data is marked as [`Missing`](InventoryResponse::Missing).
+    /// with any `notfound` data is marked as [`Missing`][1].
+    ///
+    /// [1]: crate::protocol::internal::InventoryResponse::Missing
     #[error("Remote peer could not find any of the items: {0:?}")]
     NotFoundResponse(Vec<InventoryHash>),
 
     /// We requested data, but all our ready peers are marked as recently
-    /// [`Missing`](InventoryResponse::Missing) that data in our local inventory registry.
+    /// [`Missing`][1] that data in our local inventory registry.
     ///
     /// This is a temporary error.
     ///
-    /// Peers with the inventory can finish their requests and become ready,
-    /// or other peers can download and verify the missing data.
+    /// Peers with the inventory can finish their requests and become ready, or
+    /// other peers can download and verify the missing data.
     ///
     /// # Correctness
     ///
-    /// This error is produced using Zebra's local inventory registry,
-    /// without contacting any peers.
+    /// This error is produced using Zebra's local inventory registry, without
+    /// contacting any peers.
     ///
-    /// Client responses containing this error must not be used to update the inventory registry.
-    /// This makes sure that we eventually expire our local cache of missing inventory,
-    /// and send requests to peers again.
+    /// Client responses containing this error must not be used to update the
+    /// inventory registry. This makes sure that we eventually expire our local
+    /// cache of missing inventory, and send requests to peers again.
+    ///
+    /// [1]: crate::protocol::internal::InventoryResponse::Missing
     #[error("All ready peers are registered as recently missing these items: {0:?}")]
     NotFoundRegistry(Vec<InventoryHash>),
 }
@@ -126,7 +130,7 @@ impl PeerError {
             PeerError::ConnectionDropped => "ConnectionDropped".into(),
             PeerError::ClientDropped => "ClientDropped".into(),
             PeerError::ClientCancelledHeartbeatTask => "ClientCancelledHeartbeatTask".into(),
-            PeerError::HeartbeatTaskExited => "HeartbeatTaskExited".into(),
+            PeerError::HeartbeatTaskExited(_) => "HeartbeatTaskExited".into(),
             PeerError::ConnectionTaskExited => "ConnectionTaskExited".into(),
             PeerError::ConnectionSendTimeout => "ConnectionSendTimeout".into(),
             PeerError::ConnectionReceiveTimeout => "ConnectionReceiveTimeout".into(),
@@ -154,7 +158,7 @@ impl PeerError {
 /// > that provides non-async methods for performing operations on the data within,
 /// > and only lock the mutex inside these methods
 ///
-/// https://docs.rs/tokio/1.15.0/tokio/sync/struct.Mutex.html#which-kind-of-mutex-should-you-use
+/// <https://docs.rs/tokio/1.15.0/tokio/sync/struct.Mutex.html#which-kind-of-mutex-should-you-use>
 #[derive(Default, Clone)]
 pub struct ErrorSlot(Arc<std::sync::Mutex<Option<SharedPeerError>>>);
 
@@ -177,6 +181,7 @@ impl ErrorSlot {
     ///
     /// Briefly locks the error slot's threaded `std::sync::Mutex`, to get a
     /// reference to the error in the slot.
+    #[allow(clippy::unwrap_in_result)]
     pub fn try_get_error(&self) -> Option<SharedPeerError> {
         self.0
             .lock()
@@ -193,6 +198,7 @@ impl ErrorSlot {
     ///
     /// Briefly locks the error slot's threaded `std::sync::Mutex`, to check for
     /// a previous error, then update the error in the slot.
+    #[allow(clippy::unwrap_in_result)]
     pub fn try_update_error(&self, e: SharedPeerError) -> Result<(), AlreadyErrored> {
         let mut guard = self.0.lock().expect("error mutex should be unpoisoned");
 
@@ -205,7 +211,7 @@ impl ErrorSlot {
     }
 }
 
-/// Error returned when the `ErrorSlot` already contains an error.
+/// Error returned when the [`ErrorSlot`] already contains an error.
 #[derive(Clone, Debug)]
 pub struct AlreadyErrored {
     /// The original error in the error slot.

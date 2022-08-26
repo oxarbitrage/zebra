@@ -16,7 +16,7 @@ mod tests;
 lazy_static::lazy_static! {
     /// The shared isolated [`TorClient`] instance.
     ///
-    /// TODO: turn this into a tower service that takes a hostname, and returns an `arti_client::DataStream`
+    /// TODO: turn this into a tower service that takes a hostname, and returns an [`arti_client::DataStream`]
     ///       (or a task that updates a watch channel when it's done?)
     pub static ref SHARED_TOR_CLIENT: Arc<Mutex<Option<TorClient<TokioRuntimeHandle>>>> =
         Arc::new(Mutex::new(None));
@@ -96,9 +96,9 @@ async fn new_tor_stream(hostname: String) -> Result<DataStream, BoxError> {
     Ok(tor_stream)
 }
 
-/// Returns a new tor client instance, and updates [`SHARED_TOR_CLIENT`].
+/// Returns a new tor client instance, and updates [`struct@SHARED_TOR_CLIENT`].
 ///
-/// If there is a bootstrap error, [`SHARED_TOR_CLIENT`] is not modified.
+/// If there is a bootstrap error, [`struct@SHARED_TOR_CLIENT`] is not modified.
 async fn new_tor_client() -> Result<TorClient<TokioRuntimeHandle>, BoxError> {
     let runtime = tokio::runtime::Handle::current();
     let runtime = TokioRuntimeHandle::new(runtime);
@@ -117,7 +117,7 @@ async fn new_tor_client() -> Result<TorClient<TokioRuntimeHandle>, BoxError> {
     Ok(tor_client)
 }
 
-/// Returns an isolated tor client instance by cloning [`SHARED_TOR_CLIENT`].
+/// Returns an isolated tor client instance by cloning [`struct@SHARED_TOR_CLIENT`].
 ///
 /// If [`new_tor_client`] has not run successfully yet, returns `None`.
 fn cloned_tor_client() -> Option<TorClient<TokioRuntimeHandle>> {

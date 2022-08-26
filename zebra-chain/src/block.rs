@@ -1,31 +1,6 @@
 //! Blocks and block-related structures (heights, headers, etc.)
 
-mod commitment;
-mod error;
-mod hash;
-mod header;
-mod height;
-mod serialize;
-
-pub mod merkle;
-
-#[cfg(any(test, feature = "proptest-impl"))]
-pub mod arbitrary;
-#[cfg(any(test, feature = "bench", feature = "proptest-impl"))]
-pub mod tests;
-
-use std::{collections::HashMap, fmt, ops::Neg};
-
-pub use commitment::{
-    ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Commitment, CommitmentError,
-};
-pub use hash::Hash;
-pub use header::{BlockTimeError, CountedHeader, Header};
-pub use height::Height;
-pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
-
-#[cfg(any(test, feature = "proptest-impl"))]
-pub use arbitrary::LedgerState;
+use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
 
 use crate::{
     amount::NegativeAllowed,
@@ -41,14 +16,39 @@ use crate::{
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
+mod commitment;
+mod error;
+mod hash;
+mod header;
+mod height;
+mod serialize;
+
+pub mod merkle;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+pub mod arbitrary;
+#[cfg(any(test, feature = "bench", feature = "proptest-impl"))]
+pub mod tests;
+
+pub use commitment::{
+    ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Commitment, CommitmentError,
+};
+pub use hash::Hash;
+pub use header::{BlockTimeError, CountedHeader, Header};
+pub use height::Height;
+pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
+
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use arbitrary::LedgerState;
+
 /// A Zcash block, containing a header and a list of transactions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub struct Block {
     /// The block header, containing block metadata.
-    pub header: Header,
+    pub header: Arc<Header>,
     /// The block transactions.
-    pub transactions: Vec<std::sync::Arc<Transaction>>,
+    pub transactions: Vec<Arc<Transaction>>,
 }
 
 impl fmt::Display for Block {
@@ -67,6 +67,10 @@ impl fmt::Display for Block {
 
 impl Block {
     /// Return the block height reported in the coinbase transaction, if any.
+    ///
+    /// Note
+    ///
+    /// Verified blocks have a valid height.
     pub fn coinbase_height(&self) -> Option<Height> {
         self.transactions
             .get(0)
@@ -107,7 +111,9 @@ impl Block {
     /// > for SIGHASH transaction hashes, as specified in [ZIP-244].
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+    ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
+    #[allow(clippy::unwrap_in_result)]
     pub fn check_transaction_network_upgrade_consistency(
         &self,
         network: Network,
@@ -150,7 +156,7 @@ impl Block {
 
     /// Count how many Sapling transactions exist in a block,
     /// i.e. transactions "where either of vSpendsSapling or vOutputsSapling is non-empty"
-    /// (https://zips.z.cash/zip-0221#tree-node-specification).
+    /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn sapling_transactions_count(&self) -> u64 {
         self.transactions
             .iter()
@@ -162,7 +168,7 @@ impl Block {
 
     /// Count how many Orchard transactions exist in a block,
     /// i.e. transactions "where vActionsOrchard is non-empty."
-    /// (https://zips.z.cash/zip-0221#tree-node-specification).
+    /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn orchard_transactions_count(&self) -> u64 {
         self.transactions
             .iter()
@@ -181,9 +187,9 @@ impl Block {
     /// Positive values are added to the corresponding chain value pool.
     /// Negative values are removed from the corresponding pool.
     ///
-    /// https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
+    /// <https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions>
     ///
-    /// `utxos` must contain the [`Utxo`]s of every input in this block,
+    /// `utxos` must contain the [`transparent::Utxo`]s of every input in this block,
     /// including UTXOs created by earlier transactions in this block.
     /// (It can also contain unrelated UTXOs, which are ignored.)
     ///
@@ -213,7 +219,7 @@ impl Block {
 
 impl<'a> From<&'a Block> for Hash {
     fn from(block: &'a Block) -> Hash {
-        (&block.header).into()
+        block.header.as_ref().into()
     }
 }
 

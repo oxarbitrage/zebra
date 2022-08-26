@@ -55,7 +55,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
         setup(network, cost_limit).await;
 
     // Enable the mempool
-    let _ = service.enable(&mut recent_syncs).await;
+    service.enable(&mut recent_syncs).await;
 
     // Insert the genesis block coinbase transaction into the mempool storage.
     let mut inserted_ids = HashSet::new();
@@ -202,7 +202,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
         setup(network, cost_limit).await;
 
     // Enable the mempool
-    let _ = service.enable(&mut recent_syncs).await;
+    service.enable(&mut recent_syncs).await;
 
     // Insert [transactions...] into the mempool storage.
     // This will cause the at least one transaction to be rejected, since
@@ -286,7 +286,7 @@ async fn mempool_service_disabled() -> Result<(), Report> {
     assert!(!service.is_enabled());
 
     // Enable the mempool
-    let _ = service.enable(&mut recent_syncs).await;
+    service.enable(&mut recent_syncs).await;
 
     assert!(service.is_enabled());
 
@@ -325,7 +325,7 @@ async fn mempool_service_disabled() -> Result<(), Report> {
     assert_eq!(service.tx_downloads().in_flight(), 1);
 
     // Disable the mempool
-    let _ = service.disable(&mut recent_syncs).await;
+    service.disable(&mut recent_syncs).await;
 
     // Test if mempool is disabled again
     assert!(!service.is_enabled());
@@ -375,7 +375,7 @@ async fn mempool_service_disabled() -> Result<(), Report> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_cancel_mined() -> Result<(), Report> {
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
@@ -390,10 +390,8 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     let (mut mempool, _peer_set, mut state_service, _tx_verifier, mut recent_syncs) =
         setup(network, u64::MAX).await;
 
-    time::pause();
-
     // Enable the mempool
-    let _ = mempool.enable(&mut recent_syncs).await;
+    mempool.enable(&mut recent_syncs).await;
     assert!(mempool.is_enabled());
 
     // Push the genesis block to the state
@@ -470,7 +468,7 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> {
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
@@ -486,7 +484,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         setup(network, u64::MAX).await;
 
     // Enable the mempool
-    let _ = mempool.enable(&mut recent_syncs).await;
+    mempool.enable(&mut recent_syncs).await;
     assert!(mempool.is_enabled());
 
     // Push the genesis block to the state
@@ -545,36 +543,20 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
 }
 
 /// Check if a transaction that fails verification is rejected by the mempool.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
     // Using the mainnet for now
     let network = Network::Mainnet;
 
-    let (mut mempool, _peer_set, mut state_service, mut tx_verifier, mut recent_syncs) =
+    let (mut mempool, _peer_set, _state_service, mut tx_verifier, mut recent_syncs) =
         setup(network, u64::MAX).await;
 
     // Get transactions to use in the test
     let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, network);
     let rejected_tx = unmined_transactions.next().unwrap().clone();
 
-    time::pause();
-
     // Enable the mempool
-    let _ = mempool.enable(&mut recent_syncs).await;
-
-    // Push the genesis block to the state, since downloader needs a valid tip.
-    let genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitFinalizedBlock(
-            genesis_block.clone().into(),
-        ))
-        .await
-        .unwrap();
+    mempool.enable(&mut recent_syncs).await;
 
     // Queue first transaction for verification
     // (queue the transaction itself to avoid a download).
@@ -630,36 +612,20 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
 }
 
 /// Check if a transaction that fails download is _not_ rejected.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
     // Using the mainnet for now
     let network = Network::Mainnet;
 
-    let (mut mempool, mut peer_set, mut state_service, _tx_verifier, mut recent_syncs) =
+    let (mut mempool, mut peer_set, _state_service, _tx_verifier, mut recent_syncs) =
         setup(network, u64::MAX).await;
 
     // Get transactions to use in the test
     let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, network);
     let rejected_valid_tx = unmined_transactions.next().unwrap().clone();
 
-    time::pause();
-
     // Enable the mempool
-    let _ = mempool.enable(&mut recent_syncs).await;
-
-    // Push the genesis block to the state, since downloader needs a valid tip.
-    let genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitFinalizedBlock(
-            genesis_block.clone().into(),
-        ))
-        .await
-        .unwrap();
+    mempool.enable(&mut recent_syncs).await;
 
     // Queue second transaction for download and verification.
     let request = mempool

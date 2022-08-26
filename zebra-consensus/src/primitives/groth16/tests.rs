@@ -1,8 +1,9 @@
 //! Tests for transaction verification
 
-use std::convert::TryInto;
-
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    future::ready,
+    stream::{FuturesUnordered, StreamExt},
+};
 use hex::FromHex;
 use tower::ServiceExt;
 
@@ -26,7 +27,7 @@ where
                 std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>,
             >,
 {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut async_checks = FuturesUnordered::new();
 
@@ -67,13 +68,14 @@ where
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn verify_sapling_groth16() {
     // Use separate verifiers so shared batch tasks aren't killed when the test ends (#2390)
     let mut spend_verifier = Fallback::new(
         Batch::new(
             Verifier::new(&GROTH16_PARAMETERS.sapling.spend.vk),
             crate::primitives::MAX_BATCH_SIZE,
+            None,
             crate::primitives::MAX_BATCH_LATENCY,
         ),
         tower::service_fn(
@@ -86,6 +88,7 @@ async fn verify_sapling_groth16() {
         Batch::new(
             Verifier::new(&GROTH16_PARAMETERS.sapling.output.vk),
             crate::primitives::MAX_BATCH_SIZE,
+            None,
             crate::primitives::MAX_BATCH_LATENCY,
         ),
         tower::service_fn(
@@ -135,7 +138,7 @@ where
             std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>,
         >,
 {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut async_checks = FuturesUnordered::new();
 
@@ -170,7 +173,7 @@ where
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn correctly_err_on_invalid_output_proof() {
     // Use separate verifiers so shared batch tasks aren't killed when the test ends (#2390).
     // Also, since we expect these to fail, we don't want to slow down the communal verifiers.
@@ -178,6 +181,7 @@ async fn correctly_err_on_invalid_output_proof() {
         Batch::new(
             Verifier::new(&GROTH16_PARAMETERS.sapling.output.vk),
             crate::primitives::MAX_BATCH_SIZE,
+            None,
             crate::primitives::MAX_BATCH_LATENCY,
         ),
         tower::service_fn(
@@ -215,7 +219,7 @@ where
                 std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>,
             >,
 {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut async_checks = FuturesUnordered::new();
 
@@ -246,7 +250,7 @@ where
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn verify_sprout_groth16() {
     let mut verifier = tower::service_fn(
         (|item: Item| {
@@ -287,7 +291,7 @@ where
                 std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>,
             >,
 {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut async_checks = FuturesUnordered::new();
 
@@ -309,7 +313,7 @@ where
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn verify_sprout_groth16_vector() {
     let mut verifier = tower::service_fn(
         (|item: Item| {
@@ -403,7 +407,7 @@ where
             std::boxed::Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>,
         >,
 {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mut async_checks = FuturesUnordered::new();
 
@@ -431,7 +435,7 @@ where
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn correctly_err_on_invalid_joinsplit_proof() {
     // Use separate verifiers so shared batch tasks aren't killed when the test ends (#2390).
     // Also, since we expect these to fail, we don't want to slow down the communal verifiers.

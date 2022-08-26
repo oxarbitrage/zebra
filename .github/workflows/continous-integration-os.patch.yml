@@ -1,0 +1,55 @@
+name: CI OSes
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.rs'
+      - '**/*.txt'
+      - '**/*.snap'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/deny.toml'
+      - '.github/workflows/continous-integration-os.yml'
+
+jobs:
+  test:
+    name: Test ${{ matrix.rust }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # TODO: Windows was removed for now, see https://github.com/ZcashFoundation/zebra/issues/3801
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+        exclude:
+          - os: macos-latest
+            rust: beta
+
+    steps:
+      - run: 'echo "No build required"'
+
+  install-from-lockfile-no-cache:
+    name: Install zebrad from lockfile without cache on ubuntu-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: 'echo "No build required"'
+
+  check-cargo-lock:
+    name: Check Cargo.lock is up to date
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: 'echo "No build required"'
+
+  cargo-deny:
+    name: Check deny.toml ${{ matrix.checks }} ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        checks:
+          - bans
+          - sources
+        features: ['', '--all-features', '--no-default-features']
+
+    steps:
+      - run: 'echo "No build required"'

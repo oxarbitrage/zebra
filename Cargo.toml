@@ -20,6 +20,8 @@ panic = "abort"
 
 # Speed up tests by optimizing performance-critical crates
 
+# Cryptographic crates
+
 [profile.dev.package.blake2b_simd]
 opt-level = 3
 
@@ -41,11 +43,25 @@ opt-level = 3
 [profile.dev.package.bls12_381]
 opt-level = 3
 
-[profile.dev.package.minreq]
-opt-level = 1
+# Cryptographic and parameter download crates
 
 [profile.dev.package.zcash_proofs]
-opt-level = 1
+opt-level = 3
+
+[profile.dev.package.minreq]
+opt-level = 3
+
+[profile.dev.package.rustls]
+opt-level = 3
+
+[profile.dev.package.ring]
+opt-level = 3
+
+[profile.dev.package.spin]
+opt-level = 3
+
+[profile.dev.package.untrusted]
+opt-level = 3
 
 
 [profile.release]
@@ -65,17 +81,5 @@ lto = "thin"
 
 [patch.crates-io]
 
-# TODO: replace with upstream librustzcash when these changes are merged (#3037)
-#       remove these after a new librustzcash release (#2982)
-
-# These are librustzcash file requirements specified in its workspace Cargo.toml,
-# that we must replace with git requirements
-equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "d14e7a707ce01cefcbc82651dad48f002185dded" }
-hdwallet = { git = "https://github.com/nuttycom/hdwallet", rev = "9b4c1bdbe0517e3a7a8f285d6048a37d472ba3bc" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "d14e7a707ce01cefcbc82651dad48f002185dded" }
-zcash_note_encryption = { git = "https://github.com/zcash/librustzcash.git", rev = "d14e7a707ce01cefcbc82651dad48f002185dded" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "d14e7a707ce01cefcbc82651dad48f002185dded" }
-# Currently pointing to `download-sprout-params-new` branch which contains the
-# changes from `download-sprout-params-d14e7a70` rebased on top of d14e7a70 as
-# required by `zcash/Cargo.toml`.
-zcash_proofs = { git = "https://github.com/ZcashFoundation/librustzcash.git", rev = "c3ff94134b472ba90af665e5454983dc12de1338" }
+# Currently pointing to `download-sprout-params` branch.
+zcash_proofs = { git = "https://github.com/ZcashFoundation/librustzcash.git", rev = "4567a37ceccbd506a58aaaded39ba14c952c1510" }

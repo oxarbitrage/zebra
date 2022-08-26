@@ -22,12 +22,12 @@ fn peer_set_ready_single_connection() {
     let peer_versions = PeerVersions {
         peer_versions: vec![Version::min_specified_for_upgrade(
             Network::Mainnet,
-            NetworkUpgrade::Canopy,
+            NetworkUpgrade::Nu5,
         )],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Get peers and client handles of them
@@ -114,13 +114,13 @@ fn peer_set_ready_single_connection() {
 #[test]
 fn peer_set_ready_multiple_connections() {
     // Use three peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Canopy);
+    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Nu5);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version, peer_version],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Pause the runtime's timer so that it advances automatically.
@@ -178,13 +178,13 @@ fn peer_set_route_inv_empty_registry() {
     let test_hash = block::Hash([0; 32]);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Canopy);
+    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Nu5);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Pause the runtime's timer so that it advances automatically.
@@ -260,13 +260,13 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
     let test_change = InventoryStatus::new_available(test_inv, test_peer);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Canopy);
+    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Nu5);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Pause the runtime's timer so that it advances automatically.
@@ -369,13 +369,13 @@ fn peer_set_route_inv_missing_registry_order(missing_first: bool) {
     let test_change = InventoryStatus::new_missing(test_inv, test_peer);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Canopy);
+    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Nu5);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Pause the runtime's timer so that it advances automatically.
@@ -472,13 +472,13 @@ fn peer_set_route_inv_all_missing_fail() {
     let test_change = InventoryStatus::new_missing(test_inv, test_peer);
 
     // Use one peer
-    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Canopy);
+    let peer_version = Version::min_specified_for_upgrade(Network::Mainnet, NetworkUpgrade::Nu5);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version],
     };
 
     // Start the runtime
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // Pause the runtime's timer so that it advances automatically.

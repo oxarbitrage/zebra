@@ -4,6 +4,439 @@ All notable changes to Zebra are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org).
 
+
+## [Zebra 1.0.0-beta.13](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.13) - 2022-07-29
+
+This release fixes multiple bugs in proof and signature verification, which were causing big performance issues near the blockchain tip.
+It also improves Zebra's sync performance and reliability under heavy load.
+
+### Disk and Network Usage Changes
+
+Zebra now uses around 50 - 100 GB of disk space, because many large transactions were recently added to the block chain. (In the longer term, several hundred GB are likely to be needed.)
+
+When there are a lot of large user-generated transactions on the network, Zebra can upload or download 1 GB or more per day.
+
+### Configuration Changes
+
+- Split the checkpoint and full verification [`sync` concurrency options](https://doc.zebra.zfnd.org/zebrad/config/struct.SyncSection.html) (#4726, #4758):
+  - Add a new `full_verify_concurrency_limit`
+  - Rename `max_concurrent_block_requests` to `download_concurrency_limit`
+  - Rename `lookahead_limit` to `checkpoint_verify_concurrency_limit`
+  For backwards compatibility, the old names are still accepted as aliases.
+- Add a new `parallel_cpu_threads` [`sync` concurrency option](https://doc.zebra.zfnd.org/zebrad/config/struct.SyncSection.html) (#4776).
+  This option sets the number of threads to use for CPU-bound tasks, such as proof and signature verification.
+  By default, Zebra uses all available CPU cores.
+
+### Rust Compiler Bug Fixes
+
+- The Rust team has recently [fixed compilation bugs](https://blog.rust-lang.org/2022/07/19/Rust-1.62.1.html) in function coercions of `impl Trait` return types, and `async fn` lifetimes.
+  We recommend that you update your Rust compiler to release 1.62.1, and re-compile Zebra.
+
+### Added
+
+- Add a `rayon` thread pool for CPU-bound tasks (#4776)
+- Run multiple cryptographic batches concurrently within each verifier (#4776)
+- Run deserialization of transaction in a rayon thread (#4801)
+- Run CPU-intensive state updates in parallel rayon threads (#4802)
+- Run CPU-intensive state reads in parallel rayon threads (#4805)
+- Support Tiers and supported platforms per Tier doc (#4773)
+
+### Changed
+
+- Update column family names to match Zebra's database design (#4639)
+- Update Zebra's mainnet and testnet checkpoints (#4777, #4833)
+- Process more blocks and batch items concurrently, so there's a batch ready for each available CPU (#4776)
+- Wrap note commitment trees in an `Arc`, to reduce CPU and memory usage (#4757)
+- Increment `tokio` dependency from 1.19.2 to 1.20.0, to improve diagnostics (#4780)
+
+### Fixed
+
+- Only verify halo2 proofs once per transaction (#4752)
+- Use a separate channel for each cryptographic batch, to avoid dropped batch results (#4750)
+- Improve batch fairness and latency under heavy load (#4750, #4776)
+- Run all verifier cryptography on blocking CPU-bound threads, using `tokio` and `rayon`  (#4750, #4776)
+- Use `tokio`'s `PollSemaphore`, instead of an outdated `Semaphore` impl (#4750)
+- Check batch worker tasks for panics and task termination (#4750, #4777)
+- Limit the length of the `reject` network message's `message` and `reason` fields (#4687)
+- Change the `bitvec` dependency from 1.0.0 to 1.0.1, to fix a performance regression (#4769)
+- Fix an occasional panic when a `zebra-network` connection closes (#4782)
+- Stop panicking when the connection error slot is not set (#4770)
+- When writing blocks to disk, don't block other async tasks (#4199)
+- When sending headers to peers, only deserialize the header data from disk (#4792)
+- Return errors from `send_periodic_heartbeats_with_shutdown_handle` (#4756)
+- Make FindHeaders and FindHashes run concurrently with state updates (#4826)
+- Stop reading redundant blocks for every FindHashes and FindHeaders request (#4825)
+- Generate sapling point outside the method (#4799)
+
+#### CI
+
+- Workaround lightwalletd hangs by waiting until we're near the tip (#4763)
+- Split out Canopy logs into a separate job (#4730)
+- Make full sync go all the way to the tip (#4709)
+- Split Docker logs into sprout, other checkpoints, and full validation (#4704)
+- Add a Zebra cached state update test, fix lightwalletd tests (#4813)
+
+
+## [Zebra 1.0.0-beta.12](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.12) - 2022-06-29
+
+This release improves Zebra's Orchard proof verification performance and sync performance.
+Zebra prefers to connect to peers on the canonical Zcash ports.
+
+This release also contains some breaking changes which:
+- improve usability, and
+- make Zebra compile faster.
+
+### Breaking Changes
+
+#### Cache Deletion
+
+- Zebra deletes unused cached state directories in `<OS-specific cache dir>/zebra` (#4586)
+  These caches only contain public chain data, so it is safe to delete them.
+
+#### Compile-Time Features
+
+- Most of Zebra's [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
+  and [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md) features
+  are off by default at compile time (#4539, #4680)
+- The `enable-sentry` feature has been renamed to `sentry` (#4623)
+
+#### Config
+
+- Times in `zebrad.config` change from seconds/nanoseconds to a
+  [human-readable format](https://docs.rs/humantime/latest/humantime/).
+  Remove times in the old format, or use `zebrad generate` to create a new config. (#4587)
+
+### Added
+
+#### Diagnostics
+
+- Show the current network upgrade in progress logs (#4694)
+- Add some missing tracing spans (#4660)
+- Add tokio-console support to zebrad (#4519, #4641)
+- Add `fallible_impl_from` clippy lint (#4609)
+- Add `unwrap_in_result` clippy lint (#4667)
+
+#### Testing
+
+- Check that old `zebrad.toml` configs can be parsed by the latest version (#4676)
+- Test `cargo doc` warnings and errors (#4635, #4654)
+- Document how to run full sync and lightwalletd tests (#4523)
+
+#### Continuous Integration
+
+- Add `beta` rust to CI (#4637, #4668)
+- Build each Zebra crate individually (#4640)
+
+### Changed
+
+#### Chain Sync
+
+- Update mainnet and testnet checkpoint hashes (#4708) 
+
+#### Diagnostics
+
+- Update transaction verification dashboard to show all shielded pool sigs, proofs, nullifiers (#4585)
+
+#### Testing
+
+- Add an identifiable suffix to zcash-rpc-diff temp directories (#4577)
+
+#### Dependencies
+
+- Manage`cargo-mdbook` as a GitHub action (#4636)
+
+#### Continuous Integration
+
+- Automatically delete old GCP resources (#4598)
+
+#### Documentation
+
+- Improve the release checklist (#4568, #4595)
+
+### Removed
+
+#### Continuous Integration
+
+- Remove redundant build-chain-no-features job (#4656)
+
+### Fixed
+
+#### Performance
+
+- Upgrade `halo2` and related dependencies to improve proof verification speed (#4699)
+- Change default sync config to improve reliability (#4662, #4670, #4679)
+- Fix a lookahead config panic (#4662)
+
+#### Continuous Integration
+
+- Actually create a cached state image after running a sync (#4669)
+- Split `docker run` into launch, `logs`, and `wait`, to avoid GitHub job timeouts (#4675, #4690)
+- Ignore lightwalletd test hangs for now (#4663)
+- Disable `zcash_rpc_conflict` test on macOS (#4614)
+- Use `latest` lightwalletd image for Zebra's Dockerfile (#4599)
+- Increase lightwalletd timeout, remove testnet tests (#4584)
+
+#### Documentation
+
+- Fix various `cargo doc` warnings (#4561, #4611, #4627)
+- Clarify how Zebra and `zcashd` interact in `README.md` (#4570)
+- Improve `lightwalletd` tutorial (#4566)
+- Simplify README and link to detailed documentation (#4680)
+
+#### Diagnostics
+
+- Resolve some lifetime and reference lints  (#4578)
+
+### Security
+
+- When connecting to peers, ignore invalid ports, and prefer canonical ports (#4564)
+
+
+## [Zebra 1.0.0-beta.11](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.11) - 2022-06-03
+
+This release cleans up a lot of tech dept accumulated in the previous
+development and improves the documentation.
+
+### Added
+
+- Log the tracing level when it is set or reloaded (#4515)
+
+#### CI
+
+- Add a codespell linting action (#4482)
+- Add grpc tests to CI (#4453)
+- Require network names in cached state disk names (#4392)
+
+#### RPC
+
+- Add support for `verbosity=1` in getblock (#4511)
+- Add `z_gettreestate` gRPC tests (#4455)
+
+#### Documentation
+
+- Explain what Zebra does when it starts up (#4502)
+- Add a lightwalletd tutorial (#4526)
+
+### Changed
+
+- Immediately disconnect from pre-NU5 nodes (#4538)
+- Upgrade tracing-subscriber and related dependencies (#4517)
+- Disable debug logging at compile time in release builds (#4516)
+- Activate the mempool after 2 syncer runs at the chain tip, rather than 4 (#4501)
+- Run coverage on stable (#4465)
+- Allow more time for tests to end gracefully (#4469)
+- Do not create draft PRs if not needed (#4540)
+
+#### Rust Dependencies
+
+- Bump inferno from 0.11.3 to 0.11.4 (#4534)
+- Bump insta from 1.14.0 to 1.14.1 (#4542)
+- Bump log from 0.4.14 to 0.4.17 (#4530)
+- Bump serde_with from 1.13.0 to 1.14.0 (#4532)
+- Bump indexmap from 1.8.1 to 1.8.2 (#4531)
+- Bump vergen from 7.1.0 to 7.2.0 (#4521)
+- Bump prost from 0.10.3 to 0.10.4 (#4490)
+- Bump regex from 1.5.5 to 1.5.6 (#4463)
+- Bump once_cell from 1.11.0 to 1.12.0 (#4462)
+- Bump once_cell from 1.10.0 to 1.11.0 (#4447)
+
+
+#### CI Dependencies
+
+- Bump tj-actions/changed-files from 20 to 21 (#4510)
+- Bump google-github-actions/auth from 0.7.3 to 0.8.0 (#4478)
+- Bump tj-actions/changed-files from 21 to 22 (#4541)
+- Bump w9jds/firebase-action from 2.1.0 to 2.1.2 (#4431)
+- Bump reviewdog/action-actionlint from 1.24.0 to 1.25.0 (#4432)
+- Bump reviewdog/action-actionlint from 1.25.0 to 1.25.1 (#4479)
+
+### Fixed
+
+- Index spending transaction IDs for each address (#4355)
+- Resolve various clippy warnings (#4473)
+
+#### Documentation
+
+- Fix various doc warnings (#4514)
+- Fix the syntax of links in comments (#4494)
+
+#### CI
+
+- Test RPCs with zcash/lightwalletd, to fix post-NU5 failures in adityapk00/lightwalletd (#4553)
+- Add lightwalletd gRPC, clippy, rustfmt patch jobs (#4518)
+- Permanently fix unreliable sync finished log regex (#4504)
+- Always run patch jobs that depend on cached cloud disks (#4496)
+- Temporarily finish full sync at 99% (#4457)
+- Increase clippy timeout (#4472)
+- Set a network env variable to be used in get-available-disks (#4477)
+- Temporarily stop full sync at 97%, but send transactions at 100% (#4483)
+- Mount the `lwd-cache` dir to the lightwalletd-full-sync (#4486)
+- Require cached state for the send transactions test (#4487)
+- Make reusable workflow job names match patch job names (#4466)
+- Update docker patch jobs for recent changes (#4460)
+
+
+## [Zebra 1.0.0-beta.10](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.10) - 2022-05-19
+
+Zebra's latest beta continues adding support for `lightwalletd` RPC methods and continues with the testing of each of these features. Also, this beta sets the NU5 mainnet activation height.
+
+### Added
+
+#### RPC
+
+- `z_gettreestate` RPC (#3990)
+
+##### Tests
+
+- grpc test for `GetTaddressBalanceStream` and `GetAddressUtxosStream` (#4407)
+- snapshot tests for RPC methods responses (#4352 #4401)
+
+#### CI
+
+- `lightwalletd_update_sync` test to CI (#4269)
+- `lightwalletd_full_sync` test to CI (#4268)
+
+### Changed
+
+- Set NU5 mainnet activation height and current network protocol version (#4390)
+- NU5 mainnet dependency upgrades (#4405)
+- Use the latest lightwalletd version (#4398)
+
+#### Rust Dependencies
+
+- orchard, redjubjub, jubjub, group, bls12_381, bitvec, halo2, jubjub, primitive_types,
+  librustzcash, zcash_history, zcash_encoding, bellman, zcash_script, incrementalmerkletree (#4405)
+- vergen from 7.0.0 to 7.1.0 (#4420)
+- tokio-util from 0.7.1 to 0.7.2 (#4406)
+- inferno from 0.11.2 to 0.11.3 (#4357)
+- tokio from 1.18.1 to 1.18.2 (#4358)
+- prost from 0.10.2 to 0.10.3 (#4348)
+- bech32 from 0.8.1 to 0.9.0 (#4394)
+
+#### CI Dependencies
+
+- google-github-actions/auth from 0.7.1 to 0.7.3 (#4404 #4419)
+- tj-actions/changed-files from 19 to 20 (#4403)
+- w9jds/firebase-action from 2.0.0 to 2.1.0 (#4402)
+
+#### Others
+
+- Rename workflow files (#3941)
+- Added block hash and height to syncer errors (#4287)
+- Drop sentry dependencies when enable-sentry feature is disabled (#4372)
+- Deprecate gcr.io as a registry and build faster (#4298)
+- Clippy: Remove redundant bindings, allocations, and generics (#4353)
+
+#### Documentation
+
+- Added "old state directories aren't deleted" to known issues (#4365)
+- Added support for Mermaid to render graphs (#4359)
+- Fix some typos (#4397)
+
+### Fixed
+
+#### RPC
+
+- Use the Sapling activation height in gRPC tests (#4424)
+
+#### State
+
+- Return non-finalized UTXOs and tx IDs in address queries (#4356)
+- List cached state files before or after tests (#4409)
+
+#### CI and testing fixes
+
+- Updated Cargo.lock check job name in patch workflow (#4428)
+- Put gRPC tests behind an optional feature flag to fix production build issues (#4369)
+- Stop failing the send transaction test (#4416)
+- Require cached lightwalletd state for the send transaction tests (#4303)
+- Errors in Docker entrypoint (#4411)
+- Only use cached state disks with the same state version (#4391)
+- Output length in some tests (#4387)
+- Wrong file being referenced by CI (#4364)
+- Make test selection and logging consistent (#4375)
+- Allow builds over 1 hour and tests without the sentry feature (#4370)
+
+
+## [Zebra 1.0.0-beta.9](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.9) - 2022-05-06
+
+Zebra's latest beta continues our work on `lightwalletd` RPC methods, and contains some internal CI improvements.
+
+### Added
+
+#### RPCs
+
+- Add a script for comparing zcashd and zebrad RPC responses (#4219)
+- Add Rust tests for lightwalletd sync from Zebra (#4177)
+- Add integration test to send transactions using lightwalletd (#4068)
+- RPC test with fully synced Zebra (#4157)
+- Log unrecognized RPC requests (#3860)
+- Implement the `get_address_tx_ids` RPC method query (#4119)
+- Implement `getaddressbalance` RPC (#4138)
+- Add a query function for transparent UTXOs (#4111)
+
+#### CI
+
+- Add `sending_transactions_using_lightwalletd` test to CI (#4267)
+- Add a `zebrad tip-height` utility command (#4289)
+- Add `fully_synced_rpc_test` test to CI (#4223)
+- Add a reusable workflow for deployable integration tests (#4271)
+- Add wallet grpc tests (#4253)
+- Implement reusable workflows for image building (#4173)
+- Implement `getaddressutxos` RPC method. (#4087)
+
+
+### Changed
+
+- Increase block validation timeouts (#4156)
+- Decrease the peer handshake timeout to 3 seconds, to speed up the initial sync (#4212)
+- Use link-time optimisation in release builds (#4184)
+- Add an extra block retry, to speed up the initial sync (#4185)
+- Update Zebra's block hash checkpoints (#4183)
+- Document coinbase rules, refactor to ease understanding (#4056)
+- Disconnect from testnet peers using the first NU5 testnet rules (#3976)
+
+#### RPCs
+
+- Simplify RPC types and add documentation (#4218)
+
+#### Documentation
+
+- Add transaction index diagram to RFC-0005 (#4330)
+
+#### CI
+
+- Skip tests when doing a manual full sync (#4333)
+- Add cached state version to disk images (#4314)
+- Check specific files for each job when linting (#4311)
+- Use debian for faster mounting and bump readiness time (#4276)
+- Use docker instead of Konlet for GCP deployments in CI (#4252)
+- Create a full sync disk to add the cached state inside (#4266)
+- Increase the Zcash parameter fetch timeout (#4148)
+
+### Fixed
+
+- Fix testnet syncer loop on large Orchard blocks (#4286)
+
+#### RPCs
+
+- Fix some RPC response formats to match `zcashd` (#4217)
+- Make Zebra RPC compatible with the `zcash-cli` RPC client (#4215)
+- Use a structure for parameters of getaddresstxids (#4264)
+
+#### CI
+
+- Only update cached states when needed (#4332)
+- Run sync tests according to the right conditions (#4313)
+- Stop actionlint from failing in main (#4317)
+- Make the full sync tests cache state at `/zebrad-cache` (#4308)
+- Avoid docker cache contamination and invalidation (#4254)
+- Garbage collect instances no matter previous steps status (#4255)
+- Do not delete instances from `main` branch on merge (#4206)
+- Retry after docker log follow ssh failures (#4198)
+- Share GitHub runner caches between branches (#4149)
+
+
 ## [Zebra 1.0.0-beta.8](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-beta.8) - 2022-04-19
 
 Zebra's latest beta completes our work on the NU5 consensus rules. It continues our work on `lightwalletd` RPC methods, and contains some internal CI improvements.

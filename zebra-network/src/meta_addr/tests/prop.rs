@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tower::service_fn;
 use tracing::Span;
 
-use zebra_chain::serialization::DateTime32;
+use zebra_chain::{parameters::Network::*, serialization::DateTime32};
 
 use crate::{
     constants::{MAX_ADDRS_IN_ADDRESS_BOOK, MAX_RECENT_PEER_AGE, MIN_PEER_RECONNECTION_DELAY},
@@ -41,11 +41,11 @@ proptest! {
     /// and client services.
     #[test]
     fn sanitize_avoids_leaks(addr in MetaAddr::arbitrary()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
-        if let Some(sanitized) = addr.sanitize() {
+        if let Some(sanitized) = addr.sanitize(Mainnet) {
             // check that all sanitized addresses are valid for outbound
-            prop_assert!(addr.last_known_info_is_valid_for_outbound());
+            prop_assert!(addr.last_known_info_is_valid_for_outbound(Mainnet));
             // also check the address, port, and services individually
             prop_assert!(!addr.addr.ip().is_unspecified());
             prop_assert_ne!(addr.addr.port(), 0);
@@ -65,7 +65,7 @@ proptest! {
     fn preserve_initial_untrusted_values(
         (mut addr, changes) in MetaAddrChange::addr_changes_strategy(MAX_ADDR_CHANGE),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         for change in changes {
             if let Some(changed_addr) = change.apply_to_meta_addr(addr) {
@@ -106,7 +106,7 @@ proptest! {
     fn individual_peer_retry_limit_meta_addr(
         (mut addr, changes) in MetaAddrChange::addr_changes_strategy(MAX_ADDR_CHANGE)
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let instant_now = std::time::Instant::now();
         let chrono_now = Utc::now();
@@ -114,7 +114,7 @@ proptest! {
         let mut attempt_count: usize = 0;
 
         for change in changes {
-            while addr.is_ready_for_connection_attempt(instant_now, chrono_now) {
+            while addr.is_ready_for_connection_attempt(instant_now, chrono_now, Mainnet) {
                 attempt_count += 1;
                 // Assume that this test doesn't last longer than MIN_PEER_RECONNECTION_DELAY
                 prop_assert!(attempt_count <= 1);
@@ -145,12 +145,13 @@ proptest! {
         local_listener in any::<SocketAddr>(),
         address_book_addrs in vec(any::<MetaAddr>(), 0..MAX_META_ADDR),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let chrono_now = Utc::now();
 
         let address_book = AddressBook::new_with_addrs(
             local_listener,
+            Mainnet,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             address_book_addrs
@@ -167,7 +168,7 @@ proptest! {
         // regardless of where they have come from
         prop_assert_eq!(
             book_sanitized_local_listener.cloned(),
-            expected_local_listener.sanitize(),
+            expected_local_listener.sanitize(Mainnet),
             "address book: {:?}, sanitized_addrs: {:?}, canonical_local_listener: {:?}",
             address_book,
             sanitized_addrs,
@@ -184,7 +185,7 @@ proptest! {
     fn new_meta_addr_from_meta_addr_change(
         (addr, changes) in MetaAddrChange::addr_changes_strategy(MAX_ADDR_CHANGE)
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let local_listener = "0.0.0.0:0".parse().expect("unexpected invalid SocketAddr");
 
@@ -205,6 +206,7 @@ proptest! {
             // Check address book update - return value
             let mut address_book = AddressBook::new_with_addrs(
                 local_listener,
+                Mainnet,
                 1,
                 Span::none(),
                 Vec::new(),
@@ -215,8 +217,8 @@ proptest! {
             let book_contents: Vec<MetaAddr> = address_book.peers().collect();
 
             // Ignore the same addresses that the address book ignores
-            let expected_result = if !expected_result.address_is_valid_for_outbound()
-                || ( !expected_result.last_known_info_is_valid_for_outbound()
+            let expected_result = if !expected_result.address_is_valid_for_outbound(Mainnet)
+                || ( !expected_result.last_known_info_is_valid_for_outbound(Mainnet)
                       && expected_result.last_connection_state.is_never_attempted())
             {
                None
@@ -291,7 +293,7 @@ proptest! {
     fn individual_peer_retry_limit_candidate_set(
         (addr, changes) in MetaAddrChange::addr_changes_strategy(MAX_ADDR_CHANGE)
     ) {
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
         // Run the test for this many simulated live peer durations
@@ -309,7 +311,7 @@ proptest! {
 
         // Only put valid addresses in the address book.
         // This means some tests will start with an empty address book.
-        let addrs = if addr.last_known_info_is_valid_for_outbound() {
+        let addrs = if addr.last_known_info_is_valid_for_outbound(Mainnet) {
             Some(addr)
         } else {
             None
@@ -317,6 +319,7 @@ proptest! {
 
         let address_book = Arc::new(std::sync::Mutex::new(AddressBook::new_with_addrs(
             SocketAddr::from_str("0.0.0.0:0").unwrap(),
+            Mainnet,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             addrs,
@@ -355,7 +358,7 @@ proptest! {
                         LIVE_PEER_INTERVALS,
                         overall_test_time,
                         peer_change_interval,
-                        addr.last_known_info_is_valid_for_outbound(),
+                        addr.last_known_info_is_valid_for_outbound(Mainnet),
                     );
                 }
 
@@ -389,7 +392,7 @@ proptest! {
             2..MAX_ADDR_CHANGE
         ),
     ) {
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
         let instant_now = std::time::Instant::now();
@@ -422,7 +425,7 @@ proptest! {
                     let addr = addrs.entry(addr.addr).or_insert(*addr);
                     let change = changes.get(change_index);
 
-                    while addr.is_ready_for_connection_attempt(instant_now, chrono_now) {
+                    while addr.is_ready_for_connection_attempt(instant_now, chrono_now, Mainnet) {
                         *attempt_counts.entry(addr.addr).or_default() += 1;
                         prop_assert!(
                             *attempt_counts.get(&addr.addr).unwrap() <= LIVE_PEER_INTERVALS + 1

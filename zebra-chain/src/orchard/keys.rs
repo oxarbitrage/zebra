@@ -1,7 +1,7 @@
 //! Orchard key types.
 //!
 //! <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
-#![allow(clippy::unit_arg)]
+#![allow(clippy::fallible_impl_from)]
 #![allow(dead_code)]
 
 #[cfg(test)]
@@ -18,7 +18,7 @@ use bitvec::prelude::*;
 use fpe::ff1::{BinaryNumeralString, FF1};
 use group::{ff::PrimeField, prime::PrimeCurveAffine, Group, GroupEncoding};
 use halo2::{
-    arithmetic::{Coordinates, CurveAffine, FieldExt},
+    arithmetic::{Coordinates, CurveAffine, Field, FieldExt},
     pasta::pallas,
 };
 use rand_core::{CryptoRng, RngCore};
@@ -161,13 +161,15 @@ impl ConstantTimeEq for SpendingKey {
 }
 
 impl fmt::Display for SpendingKey {
+    #[allow(clippy::unwrap_in_result)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let hrp = match self.network {
             Network::Mainnet => sk_hrp::MAINNET,
             Network::Testnet => sk_hrp::TESTNET,
         };
 
-        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32(), Variant::Bech32).unwrap()
+        bech32::encode_to_fmt(f, hrp, &self.bytes.to_base32(), Variant::Bech32)
+            .expect("hrp is valid")
     }
 }
 
@@ -203,7 +205,12 @@ impl SpendingKey {
             let sk = Self::from_bytes(bytes, network);
 
             // "if ask = 0, discard this key and repeat with a new sk"
-            if SpendAuthorizingKey::from(sk).0 == pallas::Scalar::zero() {
+            if SpendAuthorizingKey::from(sk).0.is_zero().into() {
+                continue;
+            }
+
+            // "if ivk ∈ {0, ⊥}, discard this key and repeat with a new sk"
+            if IncomingViewingKey::try_from(FullViewingKey::from(sk)).is_err() {
                 continue;
             }
 
@@ -253,7 +260,7 @@ impl From<SpendingKey> for SpendAuthorizingKey {
     /// Invokes Blake2b-512 as _PRF^expand_, t=6, to derive a
     /// `SpendAuthorizingKey` from a `SpendingKey`.
     ///
-    /// ask := ToScalar^Orchard(PRF^expand(sk, [6]))
+    /// ask := ToScalar^Orchard(PRF^expand(sk, \[6\]))
     ///
     /// <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
     /// <https://zips.z.cash/protocol/nu5.pdf#concreteprfs>
@@ -308,7 +315,9 @@ impl From<SpendValidatingKey> for [u8; 32] {
 
 impl From<SpendAuthorizingKey> for SpendValidatingKey {
     fn from(ask: SpendAuthorizingKey) -> Self {
-        let sk = redpallas::SigningKey::<SpendAuth>::try_from(<[u8; 32]>::from(ask)).unwrap();
+        let sk = redpallas::SigningKey::<SpendAuth>::try_from(<[u8; 32]>::from(ask)).expect(
+            "a scalar converted to byte array and then converted back to a scalar should not fail",
+        );
 
         Self(redpallas::VerificationKey::from(&sk))
     }
@@ -380,7 +389,7 @@ impl From<[u8; 32]> for NullifierDerivingKey {
 }
 
 impl From<SpendingKey> for NullifierDerivingKey {
-    /// nk = ToBase^Orchard(PRF^expand_sk ([7]))
+    /// nk = ToBase^Orchard(PRF^expand_sk (\[7\]))
     ///
     /// <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
     fn from(sk: SpendingKey) -> Self {
@@ -429,7 +438,7 @@ impl fmt::Debug for IvkCommitRandomness {
 impl Eq for IvkCommitRandomness {}
 
 impl From<SpendingKey> for IvkCommitRandomness {
-    /// rivk = ToScalar^Orchard(PRF^expand_sk ([8]))
+    /// rivk = ToScalar^Orchard(PRF^expand_sk (\[8\]))
     ///
     /// <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
     fn from(sk: SpendingKey) -> Self {
@@ -595,7 +604,7 @@ impl PartialEq for FullViewingKey {
 #[derive(Copy, Clone)]
 pub struct IncomingViewingKey {
     dk: DiversifierKey,
-    // TODO: refine type
+    // TODO: refine type, so that IncomingViewingkey.ivk cannot be 0
     ivk: pallas::Scalar,
 }
 
@@ -642,7 +651,46 @@ impl From<IncomingViewingKey> for [u8; 64] {
     }
 }
 
-impl From<FullViewingKey> for IncomingViewingKey {
+impl TryFrom<[u8; 64]> for IncomingViewingKey {
+    type Error = &'static str;
+
+    /// Convert an array of bytes into a [`IncomingViewingKey`].
+    ///
+    /// Returns an error if the encoding is malformed or if it [encodes the scalar additive
+    /// identity, 0][1].
+    ///
+    /// > ivk MUST be in the range {1 .. 𝑞P - 1}
+    ///
+    /// [1]: https://zips.z.cash/protocol/protocol.pdf#orchardinviewingkeyencoding
+    fn try_from(bytes: [u8; 64]) -> Result<Self, Self::Error> {
+        let mut dk_bytes = [0u8; 32];
+        dk_bytes.copy_from_slice(&bytes[..32]);
+        let dk = DiversifierKey::from(dk_bytes);
+
+        let mut ivk_bytes = [0u8; 32];
+        ivk_bytes.copy_from_slice(&bytes[32..]);
+
+        let possible_scalar = pallas::Scalar::from_repr(ivk_bytes);
+
+        if possible_scalar.is_some().into() {
+            let scalar = possible_scalar.unwrap();
+            if scalar.is_zero().into() {
+                Err("pallas::Scalar value for Orchard IncomingViewingKey is 0")
+            } else {
+                Ok(Self {
+                    dk,
+                    ivk: possible_scalar.unwrap(),
+                })
+            }
+        } else {
+            Err("Invalid pallas::Scalar value for Orchard IncomingViewingKey")
+        }
+    }
+}
+
+impl TryFrom<FullViewingKey> for IncomingViewingKey {
+    type Error = &'static str;
+
     /// Commit^ivk_rivk(ak, nk) :=
     ///     SinsemillaShortCommit_rcm(︁
     ///        "z.cash:Orchard-CommitIvk",
@@ -652,18 +700,19 @@ impl From<FullViewingKey> for IncomingViewingKey {
     /// <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
     /// <https://zips.z.cash/protocol/nu5.pdf#concreteprfs>
     #[allow(non_snake_case)]
-    fn from(fvk: FullViewingKey) -> Self {
-        let mut M: BitVec<Lsb0, u8> = BitVec::new();
+    #[allow(clippy::unwrap_in_result)]
+    fn try_from(fvk: FullViewingKey) -> Result<Self, Self::Error> {
+        let mut M: BitVec<u8, Lsb0> = BitVec::new();
 
         // I2LEBSP_l^Orchard_base(ak)︁
         let ak_bytes =
             extract_p(pallas::Point::from_bytes(&fvk.spend_validating_key.into()).unwrap())
                 .to_repr();
-        M.extend_from_bitslice(&BitArray::<Lsb0, _>::from(ak_bytes)[0..255]);
+        M.extend_from_bitslice(&BitArray::<_, Lsb0>::from(ak_bytes)[0..255]);
 
         // I2LEBSP_l^Orchard_base(nk)︁
         let nk_bytes: [u8; 32] = fvk.nullifier_deriving_key.into();
-        M.extend_from_bitslice(&BitArray::<Lsb0, _>::from(nk_bytes)[0..255]);
+        M.extend_from_bitslice(&BitArray::<_, Lsb0>::from(nk_bytes)[0..255]);
 
         // Commit^ivk_rivk
         // rivk needs to be 255 bits long
@@ -674,10 +723,18 @@ impl From<FullViewingKey> for IncomingViewingKey {
         )
         .expect("deriving orchard commit^ivk should not output ⊥ ");
 
-        Self {
-            dk: fvk.into(),
-            // mod r_P
-            ivk: pallas::Scalar::from_repr(commit_x.into()).unwrap(),
+        let ivk_ctoption = pallas::Scalar::from_repr(commit_x.into());
+
+        // if ivk ∈ {0, ⊥}, discard this key
+
+        // [`Scalar::is_zero()`] is constant-time under the hood, and ivk is mod r_P
+        if ivk_ctoption.is_some().into() && !<bool>::from(ivk_ctoption.unwrap().is_zero()) {
+            Ok(Self {
+                dk: fvk.into(),
+                ivk: ivk_ctoption.unwrap(),
+            })
+        } else {
+            Err("generated ivk is the additive identity 0, invalid")
         }
     }
 }
@@ -801,6 +858,12 @@ impl From<FullViewingKey> for DiversifierKey {
 
         // "let dk be the first [32] bytes of R"
         Self(R[..32].try_into().expect("subslice of R is a valid array"))
+    }
+}
+
+impl From<[u8; 32]> for DiversifierKey {
+    fn from(bytes: [u8; 32]) -> DiversifierKey {
+        DiversifierKey(bytes)
     }
 }
 
@@ -962,7 +1025,7 @@ impl From<(IncomingViewingKey, Diversifier)> for TransmissionKey {
     /// This includes _KA^Orchard.DerivePublic(ivk, G_d)_, which is just a
     /// scalar mult _\[ivk\]G_d_.
     ///
-    ///  KA^Orchard.DerivePublic(sk, B) := [sk] B
+    ///  KA^Orchard.DerivePublic(sk, B) := \[sk\] B
     ///
     /// <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
     /// <https://zips.z.cash/protocol/nu5.pdf#concreteorchardkeyagreement>
@@ -983,7 +1046,7 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#saplingandorchardencrypt>
 // TODO: derive `OutgoingCipherKey`: https://github.com/ZcashFoundation/zebra/issues/2041
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct OutgoingCipherKey([u8; 32]);
 
 impl fmt::Debug for OutgoingCipherKey {
@@ -1002,10 +1065,11 @@ impl From<&OutgoingCipherKey> for [u8; 32] {
 
 // TODO: implement PrivateKey: #2192
 
-/// An ephemeral private key for Orchard key agreement.
+/// An _ephemeral private key_ for Orchard key agreement.
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concreteorchardkeyagreement>
 /// <https://zips.z.cash/protocol/nu5.pdf#saplingandorchardencrypt>
+// TODO: refine so that the inner `Scalar` != 0
 #[derive(Copy, Clone, Debug)]
 pub struct EphemeralPrivateKey(pub(crate) pallas::Scalar);
 
@@ -1040,7 +1104,7 @@ impl PartialEq<[u8; 32]> for EphemeralPrivateKey {
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concreteorchardkeyagreement>
 /// <https://zips.z.cash/protocol/nu5.pdf#saplingandorchardencrypt>
-#[derive(Copy, Clone, Deserialize, PartialEq, Serialize)]
+#[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(#[serde(with = "serde_helpers::Affine")] pub(crate) pallas::Affine);
 
 impl fmt::Debug for EphemeralPublicKey {
@@ -1061,8 +1125,6 @@ impl fmt::Debug for EphemeralPublicKey {
         }
     }
 }
-
-impl Eq for EphemeralPublicKey {}
 
 impl From<EphemeralPublicKey> for [u8; 32] {
     fn from(epk: EphemeralPublicKey) -> [u8; 32] {

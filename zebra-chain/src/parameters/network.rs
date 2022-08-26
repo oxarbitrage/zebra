@@ -1,4 +1,6 @@
-use std::{convert::From, fmt};
+use std::{convert::From, fmt, str::FromStr};
+
+use thiserror::Error;
 
 use crate::{block::Height, parameters::NetworkUpgrade::Canopy};
 
@@ -25,7 +27,7 @@ mod tests;
 /// > plaintext according to the preceding rule MUST have note plaintext lead byte equal to 0x02.
 /// > (This applies even during the “grace period” specified in [ZIP-212].)
 ///
-/// https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+/// <https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus>
 ///
 /// Wallets have a grace period of 32,256 blocks after Canopy's activation to validate those blocks,
 /// but nodes do not.
@@ -36,7 +38,7 @@ mod tests;
 /// > Let ActivationHeight be the activation height of this ZIP, and let GracePeriodEndHeight be
 /// > ActivationHeight + 32256.
 ///
-/// https://zips.z.cash/zip-0212#changes-to-the-process-of-receiving-sapling-or-orchard-notes
+/// <https://zips.z.cash/zip-0212#changes-to-the-process-of-receiving-sapling-or-orchard-notes>
 ///
 /// Zebra uses `librustzcash` to validate that rule, but it won't validate it during the grace
 /// period. Therefore Zebra must validate those blocks during the grace period using checkpoints.
@@ -54,8 +56,8 @@ pub enum Network {
     Testnet,
 }
 
-impl From<&Network> for &'static str {
-    fn from(network: &Network) -> &'static str {
+impl From<Network> for &'static str {
+    fn from(network: Network) -> &'static str {
         match network {
             Network::Mainnet => "Mainnet",
             Network::Testnet => "Testnet",
@@ -63,9 +65,9 @@ impl From<&Network> for &'static str {
     }
 }
 
-impl From<Network> for &'static str {
-    fn from(network: Network) -> &'static str {
-        (&network).into()
+impl From<&Network> for &'static str {
+    fn from(network: &Network) -> &'static str {
+        (*network).into()
     }
 }
 
@@ -117,3 +119,19 @@ impl Default for Network {
         Network::Mainnet
     }
 }
+
+impl FromStr for Network {
+    type Err = InvalidNetworkError;
+
+    fn from_str(string: &str) -> Result<Self, Self::Err> {
+        match string.to_lowercase().as_str() {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            _ => Err(InvalidNetworkError(string.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("Invalid network: {0}")]
+pub struct InvalidNetworkError(String);

@@ -2,7 +2,7 @@
 //!
 //! TODO: move these tests into tests::vectors and tests::prop modules.
 
-use std::{convert::TryInto, env, sync::Arc};
+use std::{env, sync::Arc};
 
 use tower::{buffer::Buffer, util::BoxService};
 
@@ -40,12 +40,7 @@ async fn test_populated_state_responds_correctly(
     let block_headers: Vec<CountedHeader> = blocks
         .iter()
         .map(|block| CountedHeader {
-            header: block.header,
-            transaction_count: block
-                .transactions
-                .len()
-                .try_into()
-                .expect("test block transaction counts are valid"),
+            header: block.header.clone(),
         })
         .collect();
 
@@ -107,10 +102,8 @@ async fn test_populated_state_responds_correctly(
 
                 let from_coinbase = transaction.is_coinbase();
                 for (index, output) in transaction.outputs().iter().cloned().enumerate() {
-                    let outpoint = transparent::OutPoint {
-                        hash: transaction_hash,
-                        index: index as _,
-                    };
+                    let outpoint = transparent::OutPoint::from_usize(transaction_hash, index);
+
                     let utxo = transparent::Utxo {
                         output,
                         height,
@@ -215,9 +208,9 @@ fn out_of_order_committing_strategy() -> BoxedStrategy<Vec<Arc<Block>>> {
     Just(blocks).prop_shuffle().boxed()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn empty_state_still_responds_to_requests() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let block =
         zebra_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
@@ -269,7 +262,7 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
 
 #[test]
 fn state_behaves_when_blocks_are_committed_in_order() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let blocks = zebra_test::vectors::MAINNET_BLOCKS
         .range(0..=LAST_BLOCK_HEIGHT)
@@ -300,7 +293,7 @@ proptest! {
     /// Test out of order commits of continuous block test vectors from genesis onward.
     #[test]
     fn state_behaves_when_blocks_are_committed_out_of_order(blocks in out_of_order_committing_strategy()) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         populate_and_check(blocks).unwrap();
     }
@@ -393,7 +386,7 @@ proptest! {
         (network, finalized_blocks, non_finalized_blocks)
             in continuous_empty_blocks_from_test_vectors(),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), network);
 
@@ -446,7 +439,7 @@ proptest! {
         (network, finalized_blocks, non_finalized_blocks)
             in continuous_empty_blocks_from_test_vectors(),
     ) {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let (mut state_service, _, _, _) = StateService::new(Config::ephemeral(), network);
 

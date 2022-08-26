@@ -1,3 +1,5 @@
+//! Randomised property tests for the peer set.
+
 use std::net::SocketAddr;
 
 use futures::FutureExt;
@@ -25,7 +27,7 @@ proptest! {
         block_height in any::<block::Height>(),
         peer_versions in any::<PeerVersions>(),
     ) {
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
 
         let (mut minimum_peer_version, best_tip_height) =
             MinimumPeerVersion::with_mock_chain_tip(network);
@@ -57,7 +59,7 @@ proptest! {
         block_heights in any::<BlockHeightPairAcrossNetworkUpgrades>(),
         peer_versions in any::<PeerVersions>(),
     ) {
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
 
         let (mut minimum_peer_version, best_tip_height) =
             MinimumPeerVersion::with_mock_chain_tip(block_heights.network);
@@ -101,7 +103,7 @@ proptest! {
         let block_hash = block::Hash::from(&block);
 
         // Start the runtime
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
         let peer_versions = vec![CURRENT_NETWORK_PROTOCOL_VERSION; total_number_of_peers];
@@ -174,7 +176,7 @@ proptest! {
         let block_hash = block::Hash::from(&block);
 
         // Start the runtime
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
         // All peers will have the current version
@@ -243,7 +245,7 @@ proptest! {
         let block_hash = block::Hash::from(&block);
 
         // Start the runtime
-        let runtime = zebra_test::init_async();
+        let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
         // All peers will have the current version

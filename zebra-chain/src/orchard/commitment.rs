@@ -26,7 +26,7 @@ use super::{
 
 /// Generates a random scalar from the scalar field 𝔽_{q_P}.
 ///
-/// https://zips.z.cash/protocol/nu5.pdf#pallasandvesta
+/// <https://zips.z.cash/protocol/nu5.pdf#pallasandvesta>
 pub fn generate_trapdoor<T>(csprng: &mut T) -> pallas::Scalar
 where
     T: RngCore + CryptoRng,
@@ -38,13 +38,13 @@ where
 }
 
 /// The randomness used in the Simsemilla hash for note commitment.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CommitmentRandomness(pallas::Scalar);
 
 impl From<SeedRandomness> for CommitmentRandomness {
-    /// rcm = ToScalar^Orchard((PRF^expand_rseed ([5]))
+    /// rcm = ToScalar^Orchard((PRF^expand_rseed (\[5\]))
     ///
-    /// https://zips.z.cash/protocol/nu5.pdf#orchardsend
+    /// <https://zips.z.cash/protocol/nu5.pdf#orchardsend>
     fn from(rseed: SeedRandomness) -> Self {
         Self(pallas::Scalar::from_bytes_wide(&prf_expand(
             rseed.0,
@@ -54,7 +54,7 @@ impl From<SeedRandomness> for CommitmentRandomness {
 }
 
 /// Note commitments for the output notes.
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NoteCommitment(#[serde(with = "serde_helpers::Affine")] pub pallas::Affine);
 
 impl fmt::Debug for NoteCommitment {
@@ -75,8 +75,6 @@ impl fmt::Debug for NoteCommitment {
         }
     }
 }
-
-impl Eq for NoteCommitment {}
 
 impl From<pallas::Point> for NoteCommitment {
     fn from(projective_point: pallas::Point) -> Self {
@@ -113,11 +111,12 @@ impl NoteCommitment {
     ///
     /// NoteCommit^Orchard_rcm(repr_P(gd),repr_P(pkd), v, ρ, ψ) :=
     ///
-    /// https://zips.z.cash/protocol/nu5.pdf#concretewindowedcommit
+    /// <https://zips.z.cash/protocol/nu5.pdf#concretewindowedcommit>
     #[allow(non_snake_case)]
+    #[allow(clippy::unwrap_in_result)]
     pub fn new(note: Note) -> Option<Self> {
         // s as in the argument name for WindowedPedersenCommit_r(s)
-        let mut s: BitVec<Lsb0, u8> = BitVec::new();
+        let mut s: BitVec<u8, Lsb0> = BitVec::new();
 
         // Prefix
         s.append(&mut bitvec![1; 6]);
@@ -158,8 +157,8 @@ impl NoteCommitment {
 /// A homomorphic Pedersen commitment to the net value of a _note_, used in
 /// Action descriptions.
 ///
-/// https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+/// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValueCommitment(#[serde(with = "serde_helpers::Affine")] pub pallas::Affine);
 
 impl<'a> std::ops::Add<&'a ValueCommitment> for ValueCommitment {
@@ -209,11 +208,9 @@ impl From<pallas::Point> for ValueCommitment {
     }
 }
 
-impl Eq for ValueCommitment {}
-
 /// LEBS2OSP256(repr_P(cv))
 ///
-/// https://zips.z.cash/protocol/nu5.pdf#pallasandvesta
+/// <https://zips.z.cash/protocol/nu5.pdf#pallasandvesta>
 impl From<ValueCommitment> for [u8; 32] {
     fn from(cm: ValueCommitment) -> [u8; 32] {
         cm.0.to_bytes()
@@ -256,7 +253,7 @@ impl std::iter::Sum for ValueCommitment {
 
 /// LEBS2OSP256(repr_P(cv))
 ///
-/// https://zips.z.cash/protocol/nu5.pdf#pallasandvesta
+/// <https://zips.z.cash/protocol/nu5.pdf#pallasandvesta>
 impl TryFrom<[u8; 32]> for ValueCommitment {
     type Error = &'static str;
 
@@ -287,7 +284,7 @@ impl ZcashDeserialize for ValueCommitment {
 impl ValueCommitment {
     /// Generate a new _ValueCommitment_.
     ///
-    /// https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit
+    /// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
     pub fn randomized<T>(csprng: &mut T, value: Amount) -> Self
     where
         T: RngCore + CryptoRng,
@@ -301,18 +298,17 @@ impl ValueCommitment {
     ///
     /// ValueCommit^Orchard(v) :=
     ///
-    /// https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit
+    /// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
     #[allow(non_snake_case)]
     pub fn new(rcv: pallas::Scalar, value: Amount) -> Self {
-        lazy_static! {
-            static ref V: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"v");
-            static ref R: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"r");
-        }
-
         let v = pallas::Scalar::from(value);
-
         Self::from(*V * v + *R * rcv)
     }
+}
+
+lazy_static! {
+    static ref V: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"v");
+    static ref R: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"r");
 }
 
 #[cfg(test)]
@@ -326,7 +322,7 @@ mod tests {
 
     // #[test]
     // fn sinsemilla_hash_to_point_test_vectors() {
-    //     zebra_test::init();
+    //     let _init_guard = zebra_test::init();
 
     //     const D: [u8; 8] = *b"Zcash_PH";
 
@@ -340,7 +336,7 @@ mod tests {
 
     #[test]
     fn add() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let identity = ValueCommitment(pallas::Affine::identity());
 
@@ -351,7 +347,7 @@ mod tests {
 
     #[test]
     fn add_assign() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let mut identity = ValueCommitment(pallas::Affine::identity());
 
@@ -365,7 +361,7 @@ mod tests {
 
     #[test]
     fn sub() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let g_point = pallas::Affine::generator();
 
@@ -378,7 +374,7 @@ mod tests {
 
     #[test]
     fn sub_assign() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let g_point = pallas::Affine::generator();
 
@@ -394,7 +390,7 @@ mod tests {
 
     #[test]
     fn sum() {
-        zebra_test::init();
+        let _init_guard = zebra_test::init();
 
         let g_point = pallas::Affine::generator();
 

@@ -12,15 +12,19 @@
 //!
 //! # Correctness
 //!
-//! The mempool downloader doesn't send verified transactions to the [`Mempool`] service.
-//! So Zebra must spawn a task that regularly polls the downloader for ready transactions.
-//! (To ensure that transactions propagate across the entire network in each 75s block interval,
-//! the polling interval should be around 5-10 seconds.)
+//! The mempool downloader doesn't send verified transactions to the [`Mempool`]
+//! service. So Zebra must spawn a task that regularly polls the downloader for
+//! ready transactions. (To ensure that transactions propagate across the entire
+//! network in each 75s block interval, the polling interval should be around
+//! 5-10 seconds.)
 //!
 //! Polling the downloader from [`Mempool::poll_ready`] is not sufficient.
 //! [`Service::poll_ready`] is only called when there is a service request.
 //! But we want to download and gossip transactions,
 //! even when there are no other service requests.
+//!
+//! [`Mempool`]: super::Mempool
+//! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
@@ -39,7 +43,10 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::transaction::{self, UnminedTxId, VerifiedUnminedTx};
+use zebra_chain::{
+    block::Height,
+    transaction::{self, UnminedTxId, VerifiedUnminedTx},
+};
 use zebra_consensus::transaction as tx;
 use zebra_network as zn;
 use zebra_node_services::mempool::Gossip;
@@ -53,14 +60,14 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Controls how long we wait for a transaction download request to complete.
 ///
-/// This is currently equal to [`crate::components::sync::BLOCK_DOWNLOAD_TIMEOUT`] for
+/// This is currently equal to [`BLOCK_DOWNLOAD_TIMEOUT`] for
 /// consistency, even though parts of the rationale used for defining the value
 /// don't apply here (e.g. we can drop transactions hashes when the queue is full).
 pub(crate) const TRANSACTION_DOWNLOAD_TIMEOUT: Duration = BLOCK_DOWNLOAD_TIMEOUT;
 
 /// Controls how long we wait for a transaction verify request to complete.
 ///
-/// This is currently equal to [`crate::components::sync::BLOCK_VERIFY_TIMEOUT`] for
+/// This is currently equal to [`BLOCK_VERIFY_TIMEOUT`] for
 /// consistency.
 ///
 /// This timeout may lead to denial of service, which will be handled in
@@ -87,7 +94,7 @@ pub(crate) const TRANSACTION_VERIFY_TIMEOUT: Duration = BLOCK_VERIFY_TIMEOUT;
 /// Since Zebra keeps an `inv` index, inbound downloads for malicious transactions
 /// will be directed to the malicious node that originally gossiped the hash.
 /// Therefore, this attack can be carried out by a single malicious node.
-pub(crate) const MAX_INBOUND_CONCURRENCY: usize = 10;
+pub const MAX_INBOUND_CONCURRENCY: usize = 10;
 
 /// Errors that can occur while downloading and verifying a transaction.
 #[derive(Error, Debug)]
@@ -98,9 +105,6 @@ pub enum TransactionDownloadVerifyError {
 
     #[error("error in state service")]
     StateError(#[source] BoxError),
-
-    #[error("transaction not validated because the tip is empty")]
-    NoTip,
 
     #[error("error downloading transaction")]
     DownloadFailed(#[source] BoxError),
@@ -237,7 +241,7 @@ where
             );
             metrics::gauge!(
                 "mempool.currently.queued.transactions",
-                self.pending.len() as _
+                self.pending.len() as f64,
             );
 
             return Err(MempoolError::AlreadyQueued);
@@ -252,7 +256,7 @@ where
             );
             metrics::gauge!(
                 "mempool.currently.queued.transactions",
-                self.pending.len() as _
+                self.pending.len() as f64,
             );
 
             return Err(MempoolError::FullQueue);
@@ -269,13 +273,16 @@ where
             // Don't download/verify if the transaction is already in the state.
             Self::transaction_in_state(&mut state, txid).await?;
 
-            let height = match state.oneshot(zs::Request::Tip).await {
-                Ok(zs::Response::Tip(None)) => Err(TransactionDownloadVerifyError::NoTip),
-                Ok(zs::Response::Tip(Some((height, _hash)))) => Ok(height),
+            let next_height = match state.oneshot(zs::Request::Tip).await {
+                Ok(zs::Response::Tip(None)) => Ok(Height(0)),
+                Ok(zs::Response::Tip(Some((height, _hash)))) => {
+                    let next_height =
+                        (height + 1).expect("valid heights are far below the maximum");
+                    Ok(next_height)
+                }
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(TransactionDownloadVerifyError::StateError(e)),
             }?;
-            let height = (height + 1).expect("must have next height");
 
             let tx = match gossiped_tx {
                 Gossip::Id(txid) => {
@@ -318,7 +325,7 @@ where
             let result = verifier
                 .oneshot(tx::Request::Mempool {
                     transaction: tx.clone(),
-                    height,
+                    height: next_height,
                 })
                 .map_ok(|rsp| {
                     rsp.into_mempool_transaction()
@@ -370,7 +377,7 @@ where
         );
         metrics::gauge!(
             "mempool.currently.queued.transactions",
-            self.pending.len() as _
+            self.pending.len() as f64,
         );
         metrics::counter!("mempool.queued.transactions.total", 1);
 
@@ -411,7 +418,7 @@ where
         assert!(self.cancel_handles.is_empty());
         metrics::gauge!(
             "mempool.currently.queued.transactions",
-            self.pending.len() as _
+            self.pending.len() as f64,
         );
     }
 
@@ -456,6 +463,6 @@ where
     ZS::Future: Send,
 {
     fn drop(self: Pin<&mut Self>) {
-        metrics::gauge!("mempool.currently.queued.transactions", 0 as _);
+        metrics::gauge!("mempool.currently.queued.transactions", 0 as f64);
     }
 }

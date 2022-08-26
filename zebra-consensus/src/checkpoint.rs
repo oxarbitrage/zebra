@@ -347,7 +347,7 @@ where
         }
         metrics::gauge!(
             "checkpoint.queued.continuous.height",
-            pending_height.0 as f64
+            pending_height.0 as f64,
         );
 
         // Now find the start of the checkpoint range
@@ -369,7 +369,7 @@ where
         if let Some(block::Height(target_checkpoint)) = target_checkpoint {
             metrics::gauge!(
                 "checkpoint.processing.next.height",
-                target_checkpoint as f64
+                target_checkpoint as f64,
             );
         } else {
             // Use the start height if there is no potential next checkpoint
@@ -464,6 +464,11 @@ where
         if verified_height == self.checkpoint_list.max_height() {
             metrics::gauge!("checkpoint.verified.height", verified_height.0 as f64);
             self.verifier_progress = FinalCheckpoint;
+
+            tracing::info!(
+                final_checkpoint_height = ?verified_height,
+                "verified final checkpoint: starting full validation",
+            );
         } else if self.checkpoint_list.contains(verified_height) {
             metrics::gauge!("checkpoint.verified.height", verified_height.0 as f64);
             self.verifier_progress = PreviousCheckpoint(verified_height);
@@ -516,6 +521,7 @@ where
     ///
     /// If the block does not pass basic validity checks,
     /// returns an error immediately.
+    #[allow(clippy::unwrap_in_result)]
     fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
@@ -578,7 +584,7 @@ where
                 .keys()
                 .next_back()
                 .expect("queued has at least one entry")
-                .0 as f64
+                .0 as f64,
         );
 
         let is_checkpoint = self.checkpoint_list.contains(height);
@@ -590,6 +596,7 @@ where
     /// During checkpoint range processing, process all the blocks at `height`.
     ///
     /// Returns the first valid block. If there is no valid block, returns None.
+    #[allow(clippy::unwrap_in_result)]
     fn process_height(
         &mut self,
         height: block::Height,
@@ -767,7 +774,7 @@ where
 
         let block_count = rev_valid_blocks.len();
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
-        metrics::counter!("checkpoint.verified.block.count", block_count as _);
+        metrics::counter!("checkpoint.verified.block.count", block_count as u64);
 
         // All the blocks we've kept are valid, so let's verify them
         // in height order.

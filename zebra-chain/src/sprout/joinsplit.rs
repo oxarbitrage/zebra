@@ -1,3 +1,5 @@
+//! Sprout funds transfers using [`JoinSplit`]s.
+
 use std::io;
 
 use serde::{Deserialize, Serialize};
@@ -82,18 +84,25 @@ impl<P: ZkSnarkProof> ZcashSerialize for JoinSplit<P> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         self.vpub_old.zcash_serialize(&mut writer)?;
         self.vpub_new.zcash_serialize(&mut writer)?;
+
         writer.write_32_bytes(&self.anchor.into())?;
         writer.write_32_bytes(&self.nullifiers[0].into())?;
         writer.write_32_bytes(&self.nullifiers[1].into())?;
         writer.write_32_bytes(&self.commitments[0].into())?;
         writer.write_32_bytes(&self.commitments[1].into())?;
+
         writer.write_all(&self.ephemeral_key.as_bytes()[..])?;
+        // The borrow is actually needed to avoid taking ownership
+        #[allow(clippy::needless_borrow)]
         writer.write_32_bytes(&(&self.random_seed).into())?;
+
         self.vmacs[0].zcash_serialize(&mut writer)?;
         self.vmacs[1].zcash_serialize(&mut writer)?;
         self.zkproof.zcash_serialize(&mut writer)?;
+
         self.enc_ciphertexts[0].zcash_serialize(&mut writer)?;
         self.enc_ciphertexts[1].zcash_serialize(&mut writer)?;
+
         Ok(())
     }
 }
@@ -102,9 +111,11 @@ impl<P: ZkSnarkProof> JoinSplit<P> {
     /// Return the sprout value balance,
     /// the change in the transaction value pool due to this sprout [`JoinSplit`].
     ///
-    /// https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
+    /// <https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions>
     ///
-    /// See [`Transaction::sprout_value_balance`] for details.
+    /// See [`sprout_value_balance`][svb] for details.
+    ///
+    /// [svb]: crate::transaction::Transaction::sprout_value_balance
     pub fn value_balance(&self) -> Amount<NegativeAllowed> {
         let vpub_new = self
             .vpub_new
@@ -161,7 +172,7 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
             // The type is validated when validating the proof, see
             // [`groth16::Item::try_from`]. In #3179 we plan to validate here instead.
             zkproof: P::zcash_deserialize(&mut reader)?,
-            // Types are `Sym.C`, i.e. `B^Y^{[N]}`, i.e. arbitrary-sized byte arrays
+            // Types are `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 601 bytes in https://zips.z.cash/protocol/protocol.pdf#joinsplitencodingandconsensus
             // See [`note::EncryptedNote::zcash_deserialize`].

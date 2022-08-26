@@ -11,7 +11,10 @@ use std::{
 use futures::future;
 use tokio::time::{timeout, Duration};
 
-use zebra_chain::parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING};
+use zebra_chain::{
+    block::Height,
+    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
+};
 use zebra_network::constants::{
     DEFAULT_CRAWL_NEW_PEER_INTERVAL, HANDSHAKE_TIMEOUT, INVENTORY_ROTATION_INTERVAL,
 };
@@ -28,7 +31,7 @@ use crate::{
 /// Make sure the timeout values are consistent with each other.
 #[test]
 fn ensure_timeouts_consistent() {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     // This constraint clears the download pipeline during a restart
     assert!(
@@ -111,7 +114,7 @@ fn ensure_timeouts_consistent() {
 /// Test that calls to [`ChainSync::request_genesis`] are rate limited.
 #[test]
 fn request_genesis_is_rate_limited() {
-    let runtime = zebra_test::init_async();
+    let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
     // The number of calls to `request_genesis()` we are going to be testing for
@@ -163,6 +166,7 @@ fn request_genesis_is_rate_limited() {
     // start the sync
     let (mut chain_sync, _) = ChainSync::new(
         &ZebradConfig::default(),
+        Height(0),
         peer_service,
         verifier_service,
         state_service,

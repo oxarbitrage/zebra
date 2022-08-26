@@ -37,7 +37,7 @@ const DEFAULT_SHORT_CHAIN_PROPTEST_CASES: u32 = 16;
 /// Logs extra debugging information when the chain value balances fail.
 #[test]
 fn push_genesis_chain() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(
         ProptestConfig::with_cases(env::var("PROPTEST_CASES")
@@ -81,7 +81,7 @@ fn push_genesis_chain() -> Result<()> {
 /// Check that chain block pushes work with history tree blocks
 #[test]
 fn push_history_tree_chain() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(
     ProptestConfig::with_cases(env::var("PROPTEST_CASES")
@@ -129,7 +129,7 @@ fn push_history_tree_chain() -> Result<()> {
 /// - Chain value balances are non-negative.
 #[test]
 fn forked_equals_pushed_genesis() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(
     ProptestConfig::with_cases(env::var("PROPTEST_CASES")
@@ -234,7 +234,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
 /// Check that a forked history tree chain is the same as a chain that had the same blocks appended.
 #[test]
 fn forked_equals_pushed_history_tree() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(
     ProptestConfig::with_cases(env::var("PROPTEST_CASES")
@@ -305,7 +305,7 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
 /// a chain that never had those blocks added.
 #[test]
 fn finalized_equals_pushed_genesis() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
                                          .ok()
@@ -368,7 +368,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
 /// a chain that never had those blocks added.
 #[test]
 fn finalized_equals_pushed_history_tree() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
                                          .ok()
@@ -439,7 +439,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 /// in a non-finalized state.
 #[test]
 fn rejection_restores_internal_state_genesis() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
                                .ok()
@@ -511,7 +511,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
         prop_assert_eq!(state.best_tip(), reject_state.best_tip());
         prop_assert!(state.eq_internal_state(&reject_state));
 
-        bad_block.header.previous_block_hash = valid_tip_hash;
+        Arc::make_mut(&mut bad_block.header).previous_block_hash = valid_tip_hash;
         let bad_block = Arc::new(bad_block.0).prepare();
         let reject_result = reject_state.commit_block(bad_block, &finalized_state);
 
@@ -532,7 +532,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
 /// and that all the state fields are covered by `eq_internal_state`.
 #[test]
 fn different_blocks_different_chains() -> Result<()> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
                                .ok()
@@ -551,18 +551,25 @@ fn different_blocks_different_chains() -> Result<()> {
     )| {
         let prev_block1 = vec1[0].clone();
         let prev_block2 = vec2[0].clone();
+
         let height1 = prev_block1.coinbase_height().unwrap();
         let height2 = prev_block1.coinbase_height().unwrap();
-        let finalized_tree1: HistoryTree = if height1 >= Heartwood.activation_height(Network::Mainnet).unwrap() {
-            NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block1, &Default::default(), &Default::default()).unwrap().into()
+
+        let finalized_tree1: Arc<HistoryTree> = if height1 >= Heartwood.activation_height(Network::Mainnet).unwrap() {
+            Arc::new(
+                NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block1, &Default::default(), &Default::default()).unwrap().into()
+            )
         } else {
             Default::default()
         };
-        let finalized_tree2 = if height2 >= NetworkUpgrade::Heartwood.activation_height(Network::Mainnet).unwrap() {
-            NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block2, &Default::default(), &Default::default()).unwrap().into()
+        let finalized_tree2: Arc<HistoryTree> = if height2 >= NetworkUpgrade::Heartwood.activation_height(Network::Mainnet).unwrap() {
+            Arc::new(
+                NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block2, &Default::default(), &Default::default()).unwrap().into()
+            )
         } else {
             Default::default()
         };
+
         let chain1 = Chain::new(Network::Mainnet, Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool());
         let chain2 = Chain::new(Network::Mainnet, Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool());
 
@@ -592,7 +599,7 @@ fn different_blocks_different_chains() -> Result<()> {
                 // blocks, heights, hashes
                 chain1.blocks = chain2.blocks.clone();
                 chain1.height_by_hash = chain2.height_by_hash.clone();
-                chain1.tx_by_hash = chain2.tx_by_hash.clone();
+                chain1.tx_loc_by_hash = chain2.tx_loc_by_hash.clone();
 
                 // transparent UTXOs
                 chain1.created_utxos = chain2.created_utxos.clone();

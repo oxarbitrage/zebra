@@ -52,19 +52,19 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
     ]
 });
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn check_transcripts_mainnet() -> Result<(), Report> {
     check_transcripts(Network::Mainnet).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn check_transcripts_testnet() -> Result<(), Report> {
     check_transcripts(Network::Testnet).await
 }
 
 #[spandoc::spandoc]
 async fn check_transcripts(network: Network) -> Result<(), Report> {
-    zebra_test::init();
+    let _init_guard = zebra_test::init();
 
     let mainnet_transcript = &[&COMMIT_FINALIZED_BLOCK_MAINNET];
     let testnet_transcript = &[&COMMIT_FINALIZED_BLOCK_TESTNET];

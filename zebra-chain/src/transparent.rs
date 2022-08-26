@@ -77,6 +77,7 @@ impl AsRef<[u8]> for CoinbaseData {
 }
 
 impl std::fmt::Debug for CoinbaseData {
+    #[allow(clippy::unwrap_in_result)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let escaped = String::from_utf8(
             self.0
@@ -100,7 +101,8 @@ pub struct OutPoint {
     ///
     /// # Correctness
     ///
-    /// Consensus-critical serialization uses [`ZcashSerialize`].
+    /// Consensus-critical serialization uses
+    /// [`ZcashSerialize`](crate::serialization::ZcashSerialize).
     /// [`serde`]-based hex serialization must only be used for testing.
     #[cfg_attr(any(test, feature = "proptest-impl"), serde(with = "hex"))]
     pub hash: transaction::Hash,
@@ -111,7 +113,7 @@ pub struct OutPoint {
 }
 
 impl OutPoint {
-    /// Returns a new OutPoint from an in-memory output `index`.
+    /// Returns a new [`OutPoint`] from an in-memory output `index`.
     ///
     /// # Panics
     ///
@@ -197,8 +199,8 @@ impl Input {
         }
     }
 
-    /// If this is a `PrevOut` input, returns this input's outpoint.
-    /// Otherwise, returns `None`.
+    /// If this is a [`Input::PrevOut`] input, returns this input's
+    /// [`OutPoint`]. Otherwise, returns `None`.
     pub fn outpoint(&self) -> Option<OutPoint> {
         if let Input::PrevOut { outpoint, .. } = self {
             Some(*outpoint)
@@ -207,9 +209,9 @@ impl Input {
         }
     }
 
-    /// Set this input's outpoint.
+    /// Set this input's [`OutPoint`].
     ///
-    /// Should only be called on `PrevOut` inputs.
+    /// Should only be called on [`Input::PrevOut`] inputs.
     ///
     /// # Panics
     ///
@@ -226,12 +228,12 @@ impl Input {
         }
     }
 
-    /// Get the value spent by this input, by looking up its [`Outpoint`] in `outputs`.
-    /// See `value` for details.
+    /// Get the value spent by this input, by looking up its [`OutPoint`] in `outputs`.
+    /// See [`Self::value`] for details.
     ///
     /// # Panics
     ///
-    /// If the provided `Output`s don't have this input's `Outpoint`.
+    /// If the provided [`Output`]s don't have this input's [`OutPoint`].
     pub(crate) fn value_from_outputs(
         &self,
         outputs: &HashMap<OutPoint, Output>,
@@ -253,13 +255,14 @@ impl Input {
         }
     }
 
-    /// Get the value spent by this input, by looking up its [`Outpoint`] in `utxos`.
+    /// Get the value spent by this input, by looking up its [`OutPoint`] in
+    /// [`Utxo`]s.
     ///
     /// This amount is added to the transaction value pool by this input.
     ///
     /// # Panics
     ///
-    /// If the provided `Utxo`s don't have this input's `Outpoint`.
+    /// If the provided [`Utxo`]s don't have this input's [`OutPoint`].
     pub fn value(&self, utxos: &HashMap<OutPoint, utxo::Utxo>) -> Amount<NonNegative> {
         if let Some(outpoint) = self.outpoint() {
             // look up the specific Output and convert it to the expected format
@@ -275,12 +278,14 @@ impl Input {
         }
     }
 
-    /// Get the value spent by this input, by looking up its [`Outpoint`] in `ordered_utxos`.
-    /// See `value` for details.
+    /// Get the value spent by this input, by looking up its [`OutPoint`] in
+    /// [`OrderedUtxo`]s.
+    ///
+    /// See [`Self::value`] for details.
     ///
     /// # Panics
     ///
-    /// If the provided `OrderedUtxo`s don't have this input's `Outpoint`.
+    /// If the provided [`OrderedUtxo`]s don't have this input's [`OutPoint`].
     pub fn value_from_ordered_utxos(
         &self,
         ordered_utxos: &HashMap<OutPoint, utxo::OrderedUtxo>,

@@ -16,9 +16,12 @@ use crate::BoxError;
 
 use crate::components::sync::TIPS_RESPONSE_TIMEOUT;
 
-/// Run continuously, gossiping new [`zebra_chain::transaction::UnminedTxId`] to peers.
+/// Runs continuously, gossiping new [`UnminedTxId`] to peers.
 ///
-/// Broadcast any [`transaction::UnminedTxId`] that gets stored in the mempool to all ready peers.
+/// Broadcasts any [`UnminedTxId`] that gets stored in the mempool to all ready
+/// peers.
+///
+/// [`UnminedTxId`]: zebra_chain::transaction::UnminedTxId
 pub async fn gossip_mempool_transaction_id<ZN>(
     mut receiver: watch::Receiver<HashSet<UnminedTxId>>,
     broadcast_network: ZN,
@@ -46,6 +49,6 @@ where
         // broadcast requests don't return errors, and we'd just want to ignore them anyway
         let _ = broadcast_network.ready().await?.call(request).await;
 
-        metrics::counter!("mempool.gossiped.transactions.total", txs_len as _);
+        metrics::counter!("mempool.gossiped.transactions.total", txs_len as u64);
     }
 }
