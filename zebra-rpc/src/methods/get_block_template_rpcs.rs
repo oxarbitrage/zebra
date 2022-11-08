@@ -260,10 +260,12 @@ where
 
         // Since this is a very large RPC, we use separate functions for each group of fields.
         async move {
-            let _tip_height = best_chain_tip_height(&latest_chain_tip)?;
+            let tip_height = best_chain_tip_height(&latest_chain_tip)?;
             let mempool_txs = select_mempool_transactions(mempool).await?;
 
             let miner_fee = miner_fee(&mempool_txs);
+
+            let next_height = (tip_height + 1).expect("We should be far below the max");
 
             /*
             Fake a "coinbase" transaction by duplicating a mempool transaction,
@@ -307,7 +309,7 @@ where
                     size_limit: 0,
                     cur_time: 0,
                     bits: empty_string,
-                    height: 0,
+                    height: next_height.0,
                 });
             } else {
                 mempool_txs[0].transaction.clone()
@@ -355,7 +357,7 @@ where
 
                 bits: empty_string,
 
-                height: 0,
+                height: next_height.0,
             })
         }
         .boxed()
