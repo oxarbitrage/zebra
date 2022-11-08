@@ -307,7 +307,7 @@ where
                     nonce_range: empty_string.clone(),
                     sigop_limit: 0,
                     size_limit: 0,
-                    cur_time: 0,
+                    cur_time: chrono::Utc::now().timestamp(),
                     bits: empty_string,
                     height: next_height.0,
                 });
@@ -353,7 +353,7 @@ where
                 sigop_limit: 0,
                 size_limit: 0,
 
-                cur_time: 0,
+                cur_time: chrono::Utc::now().timestamp(),
 
                 bits: empty_string,
 
