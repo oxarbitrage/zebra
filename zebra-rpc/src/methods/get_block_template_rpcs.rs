@@ -24,7 +24,7 @@ use zebra_consensus::{BlockError, VerifyBlockError, VerifyChainError, VerifyChec
 use zebra_node_services::mempool;
 
 use crate::methods::{
-    best_chain_tip_height,
+    best_chain_tip_height, best_chain_tip_time,
     get_block_template_rpcs::types::{
         default_roots::DefaultRoots, get_block_template::GetBlockTemplate, hex_data::HexData,
         submit_block, transaction::TransactionTemplate,
@@ -267,6 +267,8 @@ where
 
             let next_height = (tip_height + 1).expect("We should be far below the max");
 
+            let block_time = best_chain_tip_time(&latest_chain_tip)?;
+
             /*
             Fake a "coinbase" transaction by duplicating a mempool transaction,
             or fake a response.
@@ -302,7 +304,8 @@ where
                         required: true,
                     },
                     target: empty_string.clone(),
-                    min_time: 0,
+                    min_time: block_time.timestamp()
+                        + zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING,
                     mutable: vec![],
                     nonce_range: empty_string.clone(),
                     sigop_limit: 0,
@@ -344,7 +347,8 @@ where
 
                 target: empty_string.clone(),
 
-                min_time: 0,
+                min_time: block_time.timestamp()
+                    + zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING,
 
                 mutable: vec![],
 

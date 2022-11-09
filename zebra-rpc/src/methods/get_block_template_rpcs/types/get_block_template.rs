@@ -57,10 +57,10 @@ pub struct GetBlockTemplate {
     // TODO: use ExpandedDifficulty type.
     pub target: String,
 
-    /// Add documentation.
-    #[serde(rename = "mintime")]
+    /// Last block time plus block spacing.
     // TODO: use DateTime32 type?
-    pub min_time: u32,
+    #[serde(rename = "mintime")]
+    pub min_time: i64,
 
     /// Add documentation.
     pub mutable: Vec<String>,
