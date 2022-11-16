@@ -1549,6 +1549,65 @@ impl Service<ReadRequest> for ReadStateService {
                 .map(|join_result| join_result.expect("panic in ReadRequest::BestChainBlockHash"))
                 .boxed()
             }
+
+            // Used by get_block_template RPC.
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            ReadRequest::ChainInfo() => {
+                metrics::counter!(
+                    "state.requests",
+                    1,
+                    "service" => "read_state",
+                    "type" => "best_chain_info",
+                );
+
+                let timer = CodeTimer::start();
+
+                let state = self.clone();
+
+                // # Performance
+                //
+                // Allow other async tasks to make progress while concurrently reading blocks from disk.
+                let span = Span::current();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        // history tree
+                        let history_tree = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                read::history_tree_root(non_finalized_state.best_chain(), &state.db)
+                            },
+                        );
+
+                        let tip = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                read::tip(non_finalized_state.best_chain(), &state.db)
+                            },
+                        );
+
+                        let relevant_data = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                read::last_n_block_headers(non_finalized_state.best_chain(), &state.db, tip.unwrap().0)
+                            },
+                        );
+
+                        //dbg!(relevant_data);
+                        let mut relevant2 = vec![];
+                        for h in relevant_data.unwrap() {
+                            relevant2.push((h.difficulty_threshold, h.time));
+                        }
+
+                        // The work is done in the future.
+                        timer.finish(module_path!(), line!(), "ReadRequest::BestChainInfo");
+
+                        Ok(ReadResponse::ChainInfo(crate::response::GetBlockTemplateChainInfo {
+                            history_tree,
+                            previous_block_hash : Some(tip.unwrap().1),
+                            relevant_data : Some(relevant2),
+                        }))
+                    })
+                })
+                .map(|join_result| join_result.expect("panic in ReadRequest::BestChainBlockHash"))
+                .boxed()
+            }
         }
     }
 }

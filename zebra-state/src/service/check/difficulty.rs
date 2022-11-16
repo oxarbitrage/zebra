@@ -46,7 +46,7 @@ pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
 pub const BLOCK_MAX_TIME_SINCE_MEDIAN: i64 = 90 * 60;
 
 /// Contains the context needed to calculate the adjusted difficulty for a block.
-pub(super) struct AdjustedDifficulty {
+pub struct AdjustedDifficulty {
     /// The `header.time` field from the candidate block
     candidate_time: DateTime<Utc>,
     /// The coinbase height from the candidate block
@@ -149,6 +149,37 @@ impl AdjustedDifficulty {
             relevant_times,
         }
     }
+
+    /// 
+    pub fn new_from_just_time(
+        time: DateTime<Utc>,
+        previous_block_height: block::Height,
+        network: Network,
+        relevant_data: Vec<(CompactDifficulty, chrono::DateTime<chrono::Utc>)>,
+    ) -> AdjustedDifficulty {
+        let candidate_height = (previous_block_height + 1).expect("next block height is valid");
+
+        let (relevant_difficulty_thresholds, relevant_times) = relevant_data
+            .into_iter()
+            .take(POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN)
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+
+        let relevant_difficulty_thresholds = relevant_difficulty_thresholds
+            .try_into()
+            .expect("not enough context: difficulty adjustment needs at least 28 (PoWAveragingWindow + PoWMedianBlockSpan) headers");
+        let relevant_times = relevant_times
+            .try_into()
+            .expect("not enough context: difficulty adjustment needs at least 28 (PoWAveragingWindow + PoWMedianBlockSpan) headers");
+
+        AdjustedDifficulty {
+            candidate_time: time,
+            candidate_height,
+            network,
+            relevant_difficulty_thresholds,
+            relevant_times,
+        }
+    }
+
 
     /// Returns the candidate block's height.
     pub fn candidate_height(&self) -> block::Height {

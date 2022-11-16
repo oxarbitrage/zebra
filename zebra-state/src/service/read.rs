@@ -16,6 +16,8 @@ use crate::service;
 
 pub mod address;
 pub mod block;
+#[cfg(feature = "getblocktemplate-rpcs")]
+pub mod chain;
 pub mod find;
 pub mod tree;
 
@@ -32,6 +34,12 @@ pub use block::{any_utxo, block, block_header, transaction, transaction_hashes_f
 
 #[cfg(feature = "getblocktemplate-rpcs")]
 pub use block::hash;
+
+#[cfg(feature = "getblocktemplate-rpcs")]
+pub use chain::history_tree_root;
+
+#[cfg(feature = "getblocktemplate-rpcs")]
+pub use chain::last_n_block_headers;
 
 pub use find::{
     best_tip, block_locator, chain_contains_hash, depth, find_chain_hashes, find_chain_headers,

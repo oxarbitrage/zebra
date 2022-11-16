@@ -58,7 +58,7 @@ mod tests;
 /// multiple equivalent `CompactDifficulty` values, due to redundancy in the
 /// floating-point format.
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CompactDifficulty(pub(crate) u32);
+pub struct CompactDifficulty(pub u32);
 
 impl fmt::Debug for CompactDifficulty {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

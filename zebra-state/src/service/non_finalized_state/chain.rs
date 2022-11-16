@@ -577,6 +577,12 @@ impl Chain {
             .hash
     }
 
+    /// Returns the block blah
+    #[allow(dead_code)]
+    pub fn non_finalized_nth_header(&self, n: usize) -> Option<Arc<block::Header>> {
+        self.blocks.values().nth(n).map(|block| block.block.header.clone())
+    }
+
     /// Returns the non-finalized root block hash and height.
     #[allow(dead_code)]
     pub fn non_finalized_root(&self) -> (block::Hash, block::Height) {

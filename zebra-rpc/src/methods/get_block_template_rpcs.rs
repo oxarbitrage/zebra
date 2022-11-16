@@ -23,6 +23,8 @@ use zebra_chain::{
 use zebra_consensus::{BlockError, VerifyBlockError, VerifyChainError, VerifyCheckpointError};
 use zebra_node_services::mempool;
 
+use zebra_state::AdjustedDifficulty;
+
 use crate::methods::{
     best_chain_tip_height, best_chain_tip_time,
     get_block_template_rpcs::types::{
@@ -256,6 +258,7 @@ where
 
     fn get_block_template(&self) -> BoxFuture<Result<GetBlockTemplate>> {
         let mempool = self.mempool.clone();
+        let mut state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         // Since this is a very large RPC, we use separate functions for each group of fields.
@@ -269,6 +272,46 @@ where
 
             let block_time = best_chain_tip_time(&latest_chain_tip)?;
 
+            // Call state chainfo to get data
+            let request = zebra_state::ReadRequest::ChainInfo();
+            let response = state
+                .ready()
+                .and_then(|service| service.call(request))
+                .await
+                .map_err(|error| Error {
+                    code: ErrorCode::ServerError(0),
+                    message: error.to_string(),
+                    data: None,
+                })?;
+
+            let chain_info = match response {
+                zebra_state::ReadResponse::ChainInfo(chain_info) => chain_info,
+                _ => unreachable!("chaininfo always respond even if all data inside is `None`"),
+            };
+
+            //dbg!(&chain_info);
+            // this has to be done after looping transactions to get block commitments hash
+            //let auth_data_root =  self.transactions.iter().collect::<AuthDataRoot>();
+            //let hash_block_commitments =
+            //    ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            //        &chain_info.history_tree_root,
+            //        &auth_data_root,
+            //);
+
+
+            //dbg!(&chain_info.relevant_data);
+            let relevant_data = chain_info.relevant_data.unwrap();
+            dbg!(&relevant_data.len()); 
+
+            let previous_block_height = tip_height;
+
+            let time = chrono::Utc::now();
+            let network = Network::Mainnet;
+            let difficulty_adjustment =
+                AdjustedDifficulty::new_from_just_time(time, previous_block_height, network, relevant_data);
+
+            let diff = difficulty_adjustment.expected_difficulty_threshold();
+        
             /*
             Fake a "coinbase" transaction by duplicating a mempool transaction,
             or fake a response.
@@ -281,7 +324,7 @@ where
             let coinbase_tx = if mempool_txs.is_empty() {
                 let empty_string = String::from("");
                 return Ok(GetBlockTemplate {
-                    capabilities: vec![],
+                    capabilities: vec!["proposal".to_string()], // fixed
                     version: 0,
                     previous_block_hash: GetBlockHash([0; 32].into()),
                     block_commitments_hash: [0; 32].into(),
@@ -303,7 +346,7 @@ where
                         sigops: 0,
                         required: true,
                     },
-                    target: empty_string.clone(),
+                    target: format!("{:?}", diff.to_expanded()),
                     min_time: block_time.timestamp()
                         + zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING,
                     mutable: vec![],
@@ -311,7 +354,7 @@ where
                     sigop_limit: 0,
                     size_limit: 0,
                     cur_time: chrono::Utc::now().timestamp(),
-                    bits: empty_string,
+                    bits: format!("{:#010x}", diff.0),
                     height: next_height.0,
                 });
             } else {

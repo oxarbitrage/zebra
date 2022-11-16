@@ -8,6 +8,7 @@ use zebra_chain::{
     orchard, sapling,
     transaction::{self, Transaction},
     transparent,
+    work::difficulty::CompactDifficulty,
 };
 
 // Allow *only* these unused imports, so that rustdoc link resolution
@@ -115,6 +116,27 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestChainBlockHash`](crate::ReadRequest::BestChainBlockHash) with the
     /// specified block hash.
     BlockHash(Option<block::Hash>),
+
+    #[cfg(feature = "getblocktemplate-rpcs")]
+    /// Response to [`ReadRequest::ChainInfo`](crate::ReadRequest::ChainInfo) with the state 
+    /// information needed by the `getblocktemplate` RPC method.
+    ChainInfo(GetBlockTemplateChainInfo),
+}
+
+#[cfg(feature = "getblocktemplate-rpcs")]
+/// A structure with the information needed from the state to build a `getblocktemplate` RPC response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetBlockTemplateChainInfo {
+    /// ...
+    // Idea:
+    // Call ChainHistoryBlockTxAuthCommitmentHash::
+    pub history_tree: Option<Arc<zebra_chain::history_tree::HistoryTree>>,
+    /// ...
+    pub previous_block_hash: Option<zebra_chain::block::Hash>,
+
+    /// ...
+    // will be good to change this to an iterator when i get time
+    pub relevant_data : Option<Vec<(CompactDifficulty, chrono::DateTime<chrono::Utc>)>>,
 }
 
 /// Conversion from read-only [`ReadResponse`]s to read-write [`Response`]s.
@@ -152,6 +174,10 @@ impl TryFrom<ReadResponse> for Response {
 
             #[cfg(feature = "getblocktemplate-rpcs")]
             ReadResponse::BlockHash(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            ReadResponse::ChainInfo(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
         }
