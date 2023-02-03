@@ -82,6 +82,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "433cfd6710c9986c576a25ca913c39d66a6474107b406f34f91d4a8923395241"
+dependencies = [
+ "cfg-if 1.0.0",
+ "cipher 0.4.3",
+ "cpufeatures",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2639,7 +2650,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f06b263206a75a7d96ca75d46a3e9ca8eaf7ab7feea209749bb8b818d22f427"
 dependencies = [
- "aes",
+ "aes 0.7.5",
  "bitvec",
  "blake2b_simd",
  "ff",
@@ -5325,7 +5336,7 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c2e24cb5e3352f751c699f47d363279178871b126d23f49d9018f6bae49219a"
 dependencies = [
- "aes",
+ "aes 0.7.5",
  "bip0039",
  "bitvec",
  "blake2b_simd",
@@ -5363,7 +5374,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f9a45953c4ddd81d68f45920955707f45c8926800671f354dd13b97507edf28"
 dependencies = [
- "aes",
+ "aes 0.7.5",
  "bip0039",
  "bitvec",
  "blake2b_simd",
@@ -5439,7 +5450,7 @@ dependencies = [
 name = "zebra-chain"
 version = "1.0.0-beta.20"
 dependencies = [
- "aes",
+ "aes 0.8.2",
  "bech32 0.9.1",
  "bitflags",
  "bitvec",
