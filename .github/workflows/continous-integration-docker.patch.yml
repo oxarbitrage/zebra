@@ -14,6 +14,9 @@ on:
       # dependencies
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      # configuration files
+      - '.cargo/config.toml'
+      - '**/clippy.toml'
       # workflow definitions
       - 'docker/**'
       - '.github/workflows/continous-integration-docker.yml'
@@ -28,13 +31,19 @@ jobs:
       - run: 'echo "No build required"'
 
   build:
-    name: Build / Build images
+    name: Build CI Docker / Build images
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'
 
   test-all:
     name: Test all
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-all-getblocktemplate-rpcs:
+    name: Test all with getblocktemplate-rpcs feature
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'
@@ -53,6 +62,18 @@ jobs:
 
   test-lightwalletd-integration:
     name: Test integration with lightwalletd
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-configuration-file:
+    name: Test Zebra default Docker config file
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  test-zebra-conf-path:
+    name: Test Zebra custom Docker config file
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'
@@ -77,6 +98,18 @@ jobs:
 
   lightwalletd-transactions-test:
     name: lightwalletd tip send / Run lwd-send-transactions test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  get-block-template-test:
+    name: get block template / Run get-block-template test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  submit-block-test:
+    name: submit block / Run submit-block test
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'

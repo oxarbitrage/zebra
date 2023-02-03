@@ -17,6 +17,8 @@ use crate::{
 
 /// Mocks computation done during semantic validation
 pub trait Prepare {
+    /// Runs block semantic validation computation, and returns the result.
+    /// Test-only method.
     fn prepare(self) -> PreparedBlock;
 }
 
@@ -57,10 +59,12 @@ impl From<PreparedBlock> for ChainTipBlock {
             new_outputs: _,
             transaction_hashes,
         } = prepared;
+
         Self {
             hash,
             height,
             time: block.header.time,
+            transactions: block.transactions.clone(),
             transaction_hashes,
             previous_block_hash: block.header.previous_block_hash,
         }

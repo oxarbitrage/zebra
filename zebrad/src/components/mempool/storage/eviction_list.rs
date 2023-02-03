@@ -107,7 +107,7 @@ impl EvictionList {
             let evicted_at = self
                 .unique_entries
                 .get(txid)
-                .unwrap_or_else(|| panic!("all entries should exist in both ordered_entries and unique_entries, missing {:?} in unique_entries", txid));
+                .unwrap_or_else(|| panic!("all entries should exist in both ordered_entries and unique_entries, missing {txid:?} in unique_entries"));
             if self.has_expired(evicted_at) {
                 self.pop_front();
             } else {
@@ -128,8 +128,7 @@ impl EvictionList {
             let removed = self.unique_entries.remove(&key);
             assert!(
                 removed.is_some(),
-                "all entries should exist in both ordered_entries and unique_entries, missing {:?} in unique_entries",
-                key
+                "all entries should exist in both ordered_entries and unique_entries, missing {key:?} in unique_entries"
             );
             Some(key)
         } else {

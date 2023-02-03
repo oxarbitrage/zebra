@@ -34,7 +34,7 @@ pub use commitment::{
     ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Commitment, CommitmentError,
 };
 pub use hash::Hash;
-pub use header::{BlockTimeError, CountedHeader, Header};
+pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
 pub use height::Height;
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 
@@ -98,7 +98,7 @@ impl Block {
             None => Err(CommitmentError::MissingBlockHeight {
                 block_hash: self.hash(),
             }),
-            Some(height) => Commitment::from_bytes(self.header.commitment_bytes, network, height),
+            Some(height) => Commitment::from_bytes(*self.header.commitment_bytes, network, height),
         }
     }
 
@@ -149,9 +149,16 @@ impl Block {
 
     /// Access the [`orchard::Nullifier`]s from all transactions in this block.
     pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
-        self.transactions
+        // Work around a compiler panic (ICE) with flat_map():
+        // https://github.com/rust-lang/rust/issues/105044
+        #[allow(clippy::needless_collect)]
+        let nullifiers: Vec<_> = self
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_nullifiers())
+            .collect();
+
+        nullifiers.into_iter()
     }
 
     /// Count how many Sapling transactions exist in a block,

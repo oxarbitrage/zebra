@@ -9,9 +9,11 @@ mod version;
 
 use self::ZebradCmd::*;
 use self::{
-    copy_state::CopyStateCmd, download::DownloadCmd, generate::GenerateCmd, start::StartCmd,
+    copy_state::CopyStateCmd, download::DownloadCmd, generate::GenerateCmd,
     tip_height::TipHeightCmd, version::VersionCmd,
 };
+
+pub use self::start::StartCmd;
 
 use crate::config::ZebradConfig;
 
@@ -40,7 +42,9 @@ pub enum ZebradCmd {
     Generate(GenerateCmd),
 
     /// The `help` subcommand
-    #[options(help = "get usage information")]
+    #[options(help = "get usage information, \
+        use help <subcommand> for subcommand usage information, \
+        or --help flag to see top-level options")]
     Help(Help<Self>),
 
     /// The `start` subcommand
@@ -76,7 +80,7 @@ impl ZebradCmd {
     /// Returns the default log level for this command, based on the `verbose` command line flag.
     ///
     /// Some commands need to be quiet by default.
-    pub(crate) fn default_tracing_filter(&self, verbose: bool) -> &'static str {
+    pub(crate) fn default_tracing_filter(&self, verbose: bool, help: bool) -> &'static str {
         let only_show_warnings = match self {
             // Commands that generate quiet output by default.
             // This output:
@@ -88,7 +92,8 @@ impl ZebradCmd {
             CopyState(_) | Download(_) | Start(_) => false,
         };
 
-        if only_show_warnings && !verbose {
+        // set to warn so that usage info is printed without info-level logs from component registration
+        if help || (only_show_warnings && !verbose) {
             "warn"
         } else if only_show_warnings || !verbose {
             "info"

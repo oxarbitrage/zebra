@@ -49,20 +49,16 @@ fn parses_msg_addr_v1_ip() {
     {
         let deserialized: Message = codec
             .read_addr(&mut addr_v1_bytes.as_slice())
-            .unwrap_or_else(|_| panic!("failed to deserialize AddrV1 case {}", case_idx));
+            .unwrap_or_else(|_| panic!("failed to deserialize AddrV1 case {case_idx}"));
 
         if let Message::Addr(addrs) = deserialized {
             assert!(
                 !addrs.is_empty(),
-                "expected some AddrV1s in case {}: {:?}",
-                case_idx,
-                addrs
+                "expected some AddrV1s in case {case_idx}: {addrs:?}"
             );
             assert!(
                 addrs.len() <= 2,
-                "too many AddrV1s in case {}: {:?}",
-                case_idx,
-                addrs
+                "too many AddrV1s in case {case_idx}: {addrs:?}"
             );
 
             // Check all the fields in the first test case
@@ -92,10 +88,7 @@ fn parses_msg_addr_v1_ip() {
                 );
             }
         } else {
-            panic!(
-                "unexpected message variant in case {}: {:?}",
-                case_idx, deserialized
-            );
+            panic!("unexpected message variant in case {case_idx}: {deserialized:?}");
         }
     }
 }
@@ -114,20 +107,15 @@ fn parses_msg_addr_v1_empty() {
     {
         let deserialized: Message = codec
             .read_addr(&mut addr_v1_bytes.as_slice())
-            .unwrap_or_else(|_| panic!("failed to deserialize AddrV1 case {}", case_idx));
+            .unwrap_or_else(|_| panic!("failed to deserialize AddrV1 case {case_idx}"));
 
         if let Message::Addr(addrs) = deserialized {
             assert!(
                 addrs.is_empty(),
-                "expected empty AddrV1 list for case {}: {:?}",
-                case_idx,
-                addrs,
+                "expected empty AddrV1 list for case {case_idx}: {addrs:?}",
             );
         } else {
-            panic!(
-                "unexpected message variant in case {}: {:?}",
-                case_idx, deserialized
-            );
+            panic!("unexpected message variant in case {case_idx}: {deserialized:?}");
         }
     }
 }
@@ -148,20 +136,16 @@ fn parses_msg_addr_v2_ip() {
     {
         let deserialized: Message = codec
             .read_addrv2(&mut addr_v2_bytes.as_slice())
-            .unwrap_or_else(|_| panic!("failed to deserialize AddrV2 case {}", case_idx));
+            .unwrap_or_else(|_| panic!("failed to deserialize AddrV2 case {case_idx}"));
 
         if let Message::Addr(addrs) = deserialized {
             assert!(
                 !addrs.is_empty(),
-                "expected some AddrV2s in case {}: {:?}",
-                case_idx,
-                addrs
+                "expected some AddrV2s in case {case_idx}: {addrs:?}"
             );
             assert!(
                 addrs.len() <= 2,
-                "too many AddrV2s in case {}: {:?}",
-                case_idx,
-                addrs
+                "too many AddrV2s in case {case_idx}: {addrs:?}"
             );
 
             // Check all the fields in the IPv4 and IPv6 test cases
@@ -216,10 +200,7 @@ fn parses_msg_addr_v2_ip() {
                 );
             }
         } else {
-            panic!(
-                "unexpected message variant in case {}: {:?}",
-                case_idx, deserialized
-            );
+            panic!("unexpected message variant in case {case_idx}: {deserialized:?}");
         }
     }
 }
@@ -238,20 +219,15 @@ fn parses_msg_addr_v2_empty() {
     {
         let deserialized: Message = codec
             .read_addrv2(&mut addr_v2_bytes.as_slice())
-            .unwrap_or_else(|_| panic!("failed to deserialize AddrV2 case {}", case_idx));
+            .unwrap_or_else(|_| panic!("failed to deserialize AddrV2 case {case_idx}"));
 
         if let Message::Addr(addrs) = deserialized {
             assert!(
                 addrs.is_empty(),
-                "expected empty AddrV2 list for case {}: {:?}",
-                case_idx,
-                addrs,
+                "expected empty AddrV2 list for case {case_idx}: {addrs:?}",
             );
         } else {
-            panic!(
-                "unexpected message variant in case {}: {:?}",
-                case_idx, deserialized
-            );
+            panic!("unexpected message variant in case {case_idx}: {deserialized:?}");
         }
     }
 }
@@ -270,8 +246,7 @@ fn parses_msg_addr_v2_invalid() {
         codec
             .read_addrv2(&mut addr_v2_bytes.as_slice())
             .expect_err(&format!(
-                "unexpected success: deserializing invalid AddrV2 case {} should have failed",
-                case_idx
-            ));
+            "unexpected success: deserializing invalid AddrV2 case {case_idx} should have failed"
+        ));
     }
 }

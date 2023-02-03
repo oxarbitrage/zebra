@@ -5,9 +5,9 @@
 //!  * the Testnet minimum difficulty adjustment from ZIPs 205 and 208, and
 //!  * `median-time-past`.
 
-use chrono::{DateTime, Duration, Utc};
-
 use std::{cmp::max, cmp::min, convert::TryInto};
+
+use chrono::{DateTime, Duration, Utc};
 
 use zebra_chain::{
     block,
@@ -23,6 +23,11 @@ use zebra_chain::{
 ///
 /// `PoWMedianBlockSpan` in the Zcash specification.
 pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
+
+/// The overall block span used for adjusting Zcash block difficulty.
+///
+/// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification.
+pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
 
 /// The damping factor for median timespan variance.
 ///
@@ -43,10 +48,10 @@ pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
 /// and the block's `time` field.
 ///
 /// Part of the block header consensus rules in the Zcash specification.
-pub const BLOCK_MAX_TIME_SINCE_MEDIAN: i64 = 90 * 60;
+pub const BLOCK_MAX_TIME_SINCE_MEDIAN: u32 = 90 * 60;
 
 /// Contains the context needed to calculate the adjusted difficulty for a block.
-pub(super) struct AdjustedDifficulty {
+pub(crate) struct AdjustedDifficulty {
     /// The `header.time` field from the candidate block
     candidate_time: DateTime<Utc>,
     /// The coinbase height from the candidate block
@@ -59,15 +64,14 @@ pub(super) struct AdjustedDifficulty {
     /// The `header.difficulty_threshold`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
-    relevant_difficulty_thresholds:
-        [CompactDifficulty; POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN],
+    relevant_difficulty_thresholds: [CompactDifficulty; POW_ADJUSTMENT_BLOCK_SPAN],
     /// The `header.time`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
     ///
     /// Only the first and last `PoWMedianBlockSpan` times are used. Times
     /// `11..=16` are ignored.
-    relevant_times: [DateTime<Utc>; POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN],
+    relevant_times: [DateTime<Utc>; POW_ADJUSTMENT_BLOCK_SPAN],
 }
 
 impl AdjustedDifficulty {
@@ -99,8 +103,8 @@ impl AdjustedDifficulty {
         let previous_block_height = (candidate_block_height - 1)
             .expect("contextual validation is never run on the genesis block");
 
-        AdjustedDifficulty::new_from_header(
-            &candidate_block.header,
+        AdjustedDifficulty::new_from_header_time(
+            candidate_block.header.time,
             previous_block_height,
             network,
             context,
@@ -108,7 +112,7 @@ impl AdjustedDifficulty {
     }
 
     /// Initialise and return a new [`AdjustedDifficulty`] using a
-    /// `candidate_header`, `previous_block_height`, `network`, and a `context`.
+    /// `candidate_header_time`, `previous_block_height`, `network`, and a `context`.
     ///
     /// Designed for use when validating block headers, where the full block has not
     /// been downloaded yet.
@@ -118,8 +122,8 @@ impl AdjustedDifficulty {
     /// # Panics
     ///
     /// If the context contains fewer than 28 items.
-    pub fn new_from_header<C>(
-        candidate_header: &block::Header,
+    pub fn new_from_header_time<C>(
+        candidate_header_time: DateTime<Utc>,
         previous_block_height: block::Height,
         network: Network,
         context: C,
@@ -131,7 +135,7 @@ impl AdjustedDifficulty {
 
         let (relevant_difficulty_thresholds, relevant_times) = context
             .into_iter()
-            .take(POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN)
+            .take(POW_ADJUSTMENT_BLOCK_SPAN)
             .unzip::<_, _, Vec<_>, Vec<_>>();
 
         let relevant_difficulty_thresholds = relevant_difficulty_thresholds
@@ -142,7 +146,7 @@ impl AdjustedDifficulty {
             .expect("not enough context: difficulty adjustment needs at least 28 (PoWAveragingWindow + PoWMedianBlockSpan) headers");
 
         AdjustedDifficulty {
-            candidate_time: candidate_header.time,
+            candidate_time: candidate_header_time,
             candidate_height,
             network,
             relevant_difficulty_thresholds,
@@ -326,7 +330,7 @@ impl AdjustedDifficulty {
     /// slice of `PoWMedianBlockSpan` (11) blocks in the relevant chain.
     ///
     /// Implements `MedianTime` from the Zcash specification.
-    fn median_time(
+    pub(crate) fn median_time(
         mut median_block_span_times: [DateTime<Utc>; POW_MEDIAN_BLOCK_SPAN],
     ) -> DateTime<Utc> {
         median_block_span_times.sort_unstable();

@@ -9,6 +9,7 @@ use crate::{
     constants::CURRENT_NETWORK_PROTOCOL_VERSION,
     protocol::external::{AddrInVersion, Codec, Message},
     types::PeerServices,
+    VersionMessage,
 };
 
 use super::super::*;
@@ -119,7 +120,6 @@ async fn connect_isolated_sends_anonymised_version_message_mem_net(network: Netw
 
 /// Wait to receive a version message on `inbound_stream`,
 /// then check that it is correctly anonymised.
-#[track_caller]
 async fn check_version_message<PeerTransport>(
     network: Network,
     inbound_stream: &mut Framed<PeerTransport, Codec>,
@@ -127,7 +127,7 @@ async fn check_version_message<PeerTransport>(
     PeerTransport: AsyncRead + Unpin,
 {
     // We don't need to send any bytes to get a version message.
-    if let Message::Version {
+    if let Message::Version(VersionMessage {
         version,
         services,
         timestamp,
@@ -137,7 +137,7 @@ async fn check_version_message<PeerTransport>(
         user_agent,
         start_height,
         relay,
-    } = inbound_stream
+    }) = inbound_stream
         .next()
         .await
         .expect("stream item")

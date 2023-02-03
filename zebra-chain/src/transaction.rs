@@ -14,6 +14,9 @@ mod sighash;
 mod txid;
 mod unmined;
 
+#[cfg(feature = "getblocktemplate-rpcs")]
+pub mod builder;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(clippy::unwrap_in_result)]
 pub mod arbitrary;
@@ -56,8 +59,6 @@ use crate::{
 /// activation, we do not validate any pre-Sapling transaction types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
-// XXX consider boxing the Optional fields of V4 and V5 txs
-#[allow(clippy::large_enum_variant)]
 pub enum Transaction {
     /// A fully transparent transaction (`version = 1`).
     V1 {
@@ -138,8 +139,17 @@ impl fmt::Display for Transaction {
         let mut fmter = f.debug_struct("Transaction");
 
         fmter.field("version", &self.version());
+
         if let Some(network_upgrade) = self.network_upgrade() {
             fmter.field("network_upgrade", &network_upgrade);
+        }
+
+        if let Some(lock_time) = self.lock_time() {
+            fmter.field("lock_time", &lock_time);
+        }
+
+        if let Some(expiry_height) = self.expiry_height() {
+            fmter.field("expiry_height", &expiry_height);
         }
 
         fmter.field("transparent_inputs", &self.inputs().len());
@@ -351,6 +361,17 @@ impl Transaction {
         } else {
             None
         }
+    }
+
+    /// Returns `true` if this transaction's `lock_time` is a [`LockTime::Time`].
+    /// Returns `false` if it is a [`LockTime::Height`] (locked or unlocked), is unlocked,
+    /// or if the transparent input sequence numbers have disabled lock times.
+    pub fn lock_time_is_time(&self) -> bool {
+        if let Some(lock_time) = self.lock_time() {
+            return lock_time.is_time();
+        }
+
+        false
     }
 
     /// Get this transaction's expiry height, if any.
@@ -973,29 +994,6 @@ impl Transaction {
         (input_value - output_value)
             .map(ValueBalance::from_transparent_amount)
             .map_err(ValueBalanceError::Transparent)
-    }
-
-    /// Return the transparent value balance,
-    /// the change in the value of the transaction value pool.
-    ///
-    /// The sum of the UTXOs spent by transparent inputs in `tx_in` fields,
-    /// minus the sum of the newly created outputs in `tx_out` fields.
-    ///
-    /// Positive values are added to this transaction's value pool,
-    /// and removed from the transparent chain value pool.
-    /// Negative values are removed from the transparent chain value pool,
-    /// and added to this transaction.
-    ///
-    /// <https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions>
-    ///
-    /// `utxos` must contain the utxos of every input in the transaction,
-    /// including UTXOs created by earlier transactions in this block.
-    #[allow(dead_code)]
-    fn transparent_value_balance(
-        &self,
-        utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
-    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.transparent_value_balance_from_outputs(&outputs_from_utxos(utxos.clone()))
     }
 
     /// Modify the transparent output values of this transaction, regardless of version.

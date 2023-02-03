@@ -10,7 +10,7 @@ use sha2::Sha256;
 use crate::{
     parameters::Network,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
-    transparent::Script,
+    transparent::{opcodes::OpCode, Script},
 };
 
 #[cfg(test)]
@@ -223,6 +223,11 @@ impl Address {
         }
     }
 
+    /// Returns `true` if the address is `PayToScriptHash`, and `false` if it is `PayToPublicKeyHash`.
+    pub fn is_script_hash(&self) -> bool {
+        matches!(self, Address::PayToScriptHash { .. })
+    }
+
     /// Returns the hash bytes for this address, regardless of the address type.
     ///
     /// # Correctness
@@ -244,10 +249,37 @@ impl Address {
     /// <https://en.bitcoin.it/Base58Check_encoding#Encoding_a_Bitcoin_address>
     fn hash_payload(bytes: &[u8]) -> [u8; 20] {
         let sha_hash = Sha256::digest(bytes);
-        let ripe_hash = Ripemd160::digest(&sha_hash);
+        let ripe_hash = Ripemd160::digest(sha_hash);
         let mut payload = [0u8; 20];
         payload[..].copy_from_slice(&ripe_hash[..]);
         payload
+    }
+
+    /// Given a transparent address (P2SH or a P2PKH), create a script that can be used in a coinbase
+    /// transaction output.
+    pub fn create_script_from_address(&self) -> Script {
+        let mut script_bytes = Vec::new();
+
+        match self {
+            // https://developer.bitcoin.org/devguide/transactions.html#pay-to-script-hash-p2sh
+            Address::PayToScriptHash { .. } => {
+                script_bytes.push(OpCode::Hash160 as u8);
+                script_bytes.push(OpCode::Push20Bytes as u8);
+                script_bytes.extend(self.hash_bytes());
+                script_bytes.push(OpCode::Equal as u8);
+            }
+            // https://developer.bitcoin.org/devguide/transactions.html#pay-to-public-key-hash-p2pkh
+            Address::PayToPublicKeyHash { .. } => {
+                script_bytes.push(OpCode::Dup as u8);
+                script_bytes.push(OpCode::Hash160 as u8);
+                script_bytes.push(OpCode::Push20Bytes as u8);
+                script_bytes.extend(self.hash_bytes());
+                script_bytes.push(OpCode::EqualVerify as u8);
+                script_bytes.push(OpCode::CheckSig as u8);
+            }
+        };
+
+        Script::new(&script_bytes)
     }
 }
 
@@ -270,7 +302,7 @@ mod tests {
 
         let t_addr = pub_key.to_address(Network::Mainnet);
 
-        assert_eq!(format!("{}", t_addr), "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq");
+        assert_eq!(format!("{t_addr}"), "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq");
     }
 
     #[test]
@@ -285,7 +317,7 @@ mod tests {
 
         let t_addr = pub_key.to_address(Network::Testnet);
 
-        assert_eq!(format!("{}", t_addr), "tmTc6trRhbv96kGfA99i7vrFwb5p7BVFwc3");
+        assert_eq!(format!("{t_addr}"), "tmTc6trRhbv96kGfA99i7vrFwb5p7BVFwc3");
     }
 
     #[test]
@@ -296,7 +328,7 @@ mod tests {
 
         let t_addr = script.to_address(Network::Mainnet);
 
-        assert_eq!(format!("{}", t_addr), "t3Y5pHwfgHbS6pDjj1HLuMFxhFFip1fcJ6g");
+        assert_eq!(format!("{t_addr}"), "t3Y5pHwfgHbS6pDjj1HLuMFxhFFip1fcJ6g");
     }
 
     #[test]
@@ -307,7 +339,7 @@ mod tests {
 
         let t_addr = script.to_address(Network::Testnet);
 
-        assert_eq!(format!("{}", t_addr), "t2L51LcmpA43UMvKTw2Lwtt9LMjwyqU2V1P");
+        assert_eq!(format!("{t_addr}"), "t2L51LcmpA43UMvKTw2Lwtt9LMjwyqU2V1P");
     }
 
     #[test]
@@ -316,7 +348,7 @@ mod tests {
 
         let t_addr: Address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".parse().unwrap();
 
-        assert_eq!(format!("{}", t_addr), "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd");
+        assert_eq!(format!("{t_addr}"), "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd");
     }
 
     #[test]
@@ -326,7 +358,7 @@ mod tests {
         let t_addr: Address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".parse().unwrap();
 
         assert_eq!(
-            format!("{:?}", t_addr),
+            format!("{t_addr:?}"),
             "TransparentAddress { network: Mainnet, script_hash: \"7d46a730d31f97b1930d3368a967c309bd4d136a\" }"
         );
     }

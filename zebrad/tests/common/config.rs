@@ -7,6 +7,7 @@
 
 use std::{
     env,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -14,9 +15,10 @@ use std::{
 use color_eyre::eyre::Result;
 use tempfile::TempDir;
 
+use zebra_test::net::random_known_port;
 use zebrad::{
-    components::{mempool, sync},
-    config::{SyncSection, TracingSection, ZebradConfig},
+    components::{mempool, sync, tracing},
+    config::ZebradConfig,
 };
 
 /// Returns a config with:
@@ -34,10 +36,10 @@ pub fn default_test_config() -> Result<ZebradConfig> {
         ..zebra_network::Config::default()
     };
 
-    let sync = SyncSection {
+    let sync = sync::Config {
         // Avoid downloading unnecessary blocks.
         checkpoint_verify_concurrency_limit: sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-        ..SyncSection::default()
+        ..sync::Config::default()
     };
 
     let mempool = mempool::Config {
@@ -54,9 +56,9 @@ pub fn default_test_config() -> Result<ZebradConfig> {
         env::var("ZEBRA_FORCE_USE_COLOR"),
         Err(env::VarError::NotPresent)
     );
-    let tracing = TracingSection {
+    let tracing = tracing::Config {
         force_use_color,
-        ..TracingSection::default()
+        ..tracing::Config::default()
     };
 
     let config = ZebradConfig {
@@ -85,7 +87,37 @@ pub fn testdir() -> Result<TempDir> {
         .map_err(Into::into)
 }
 
-/// Get stored config path
-pub fn stored_config_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/config.toml")
+/// Get the directory where we have different config files.
+pub fn configs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/configs")
+}
+
+/// Given a config file name, return full path to it.
+pub fn config_file_full_path(config_file: PathBuf) -> PathBuf {
+    let path = configs_dir().join(config_file);
+    Path::new(&path).into()
+}
+
+/// Returns a `zebrad` config with a random known RPC port.
+///
+/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
+pub fn random_known_rpc_port_config(parallel_cpu_threads: bool) -> Result<ZebradConfig> {
+    // [Note on port conflict](#Note on port conflict)
+    let listen_port = random_known_port();
+    let listen_ip = "127.0.0.1".parse().expect("hard-coded IP is valid");
+    let zebra_rpc_listener = SocketAddr::new(listen_ip, listen_port);
+
+    // Write a configuration that has the rpc listen_addr option set
+    // TODO: split this config into another function?
+    let mut config = default_test_config()?;
+    config.rpc.listen_addr = Some(zebra_rpc_listener);
+    if parallel_cpu_threads {
+        // Auto-configure to the number of CPU cores: most users configre this
+        config.rpc.parallel_cpu_threads = 0;
+    } else {
+        // Default config, users who want to detect port conflicts configure this
+        config.rpc.parallel_cpu_threads = 1;
+    }
+
+    Ok(config)
 }

@@ -30,7 +30,7 @@ fn blockheaderhash_debug() {
     let hash = Hash(sha_writer.finish());
 
     assert_eq!(
-        format!("{:?}", hash),
+        format!("{hash:?}"),
         "block::Hash(\"3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf\")"
     );
 }
@@ -44,7 +44,7 @@ fn blockheaderhash_from_blockheader() {
     let hash = Hash::from(&blockheader);
 
     assert_eq!(
-        format!("{:?}", hash),
+        format!("{hash:?}"),
         "block::Hash(\"d1d6974bbe1d4d127c889119b2fc05724c67588dc72708839727586b8c2bc939\")"
     );
 
@@ -181,9 +181,7 @@ fn block_test_vectors_height(network: Network) {
         {
             assert!(
                 sapling_roots.contains_key(&height),
-                "post-sapling block test vectors must have matching sapling root test vectors: missing {} {}",
-                network,
-                height
+                "post-sapling block test vectors must have matching sapling root test vectors: missing {network} {height}"
             );
         }
     }
@@ -225,10 +223,7 @@ fn block_commitment(network: Network) {
             .expect("block is structurally valid");
 
         let commitment = block.commitment(network).unwrap_or_else(|_| {
-            panic!(
-                "unexpected structurally invalid block commitment at {} {}",
-                network, height
-            )
+            panic!("unexpected structurally invalid block commitment at {network} {height}")
         });
 
         if let FinalSaplingRoot(final_sapling_root) = commitment {
@@ -238,9 +233,7 @@ fn block_commitment(network: Network) {
             assert_eq!(
                 final_sapling_root,
                 crate::sapling::tree::Root::try_from(*expected_final_sapling_root).unwrap(),
-                "unexpected invalid final sapling root commitment at {} {}",
-                network,
-                height
+                "unexpected invalid final sapling root commitment at {network} {height}"
             );
         }
     }

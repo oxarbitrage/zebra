@@ -198,10 +198,12 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     state.commit_block(block2.clone().prepare(), &finalized_state)?;
     state.commit_block(child.prepare(), &finalized_state)?;
 
-    let finalized = state.finalize();
+    let finalized_with_trees = state.finalize();
+    let finalized = finalized_with_trees.finalized;
     assert_eq!(block1, finalized.block);
 
-    let finalized = state.finalize();
+    let finalized_with_trees = state.finalize();
+    let finalized = finalized_with_trees.finalized;
     assert_eq!(block2, finalized.block);
 
     assert!(state.best_chain().is_none());
@@ -525,7 +527,7 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
         crate::ValidateContextError::InvalidBlockCommitment(
             zebra_chain::block::CommitmentError::InvalidChainHistoryActivationReserved { .. },
         ) => {},
-        _ => panic!("Error must be InvalidBlockCommitment::InvalidChainHistoryActivationReserved instead of {:?}", err),
+        _ => panic!("Error must be InvalidBlockCommitment::InvalidChainHistoryActivationReserved instead of {err:?}"),
     };
 
     // Test committing the Heartwood activation block with the correct commitment
@@ -554,8 +556,7 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
             zebra_chain::block::CommitmentError::InvalidChainHistoryRoot { .. },
         ) => {}
         _ => panic!(
-            "Error must be InvalidBlockCommitment::InvalidChainHistoryRoot instead of {:?}",
-            err
+            "Error must be InvalidBlockCommitment::InvalidChainHistoryRoot instead of {err:?}"
         ),
     };
 

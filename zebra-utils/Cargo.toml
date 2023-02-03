@@ -2,23 +2,47 @@
 name = "zebra-utils"
 authors = ["Zcash Foundation <zebra@zfnd.org>"]
 license = "MIT OR Apache-2.0"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.20"
 edition = "2021"
+
 # Prevent accidental publication of this utility crate.
 publish = false
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "block-template-to-proposal"
+# this setting is required for Zebra's Docker build caches
+path = "src/bin/block-template-to-proposal/main.rs"
+required-features = ["getblocktemplate-rpcs"]
+
+[features]
+default = []
+
+# Production features that activate extra dependencies, or extra features in dependencies
+
+# Experimental mining RPC support
+getblocktemplate-rpcs = [
+    "zebra-rpc/getblocktemplate-rpcs",
+    "zebra-node-services/getblocktemplate-rpcs",
+    "zebra-chain/getblocktemplate-rpcs",
+]
+
 [dependencies]
-color-eyre = "0.6.1"
+color-eyre = "0.6.2"
 # This is a transitive dependency via color-eyre.
 # Enable a feature that makes tinyvec compile much faster.
 tinyvec = { version = "1.6.0", features = ["rustc_1_55"] }
 
 structopt = "0.3.26"
 hex = "0.4.3"
-serde_json = "1.0.83"
+serde_json = "1.0.91"
 tracing-error = "0.2.0"
-tracing-subscriber = "0.3.11"
+tracing-subscriber = "0.3.16"
+thiserror = "1.0.38"
 
+zebra-node-services = { path = "../zebra-node-services" }
 zebra-chain = { path = "../zebra-chain" }
-zebra-consensus = { path = "../zebra-consensus" }
-zebra-state = { path = "../zebra-state" }
+
+# Experimental feature getblocktemplate-rpcs
+zebra-rpc = { path = "../zebra-rpc", optional = true }

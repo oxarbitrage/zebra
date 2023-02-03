@@ -47,10 +47,14 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct CommitBlockError(#[from] ValidateContextError);
 
 /// An error describing why a block failed contextual validation.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum ValidateContextError {
+    #[error("block parent not found in any chain")]
+    #[non_exhaustive]
+    NotReadyToBeCommitted,
+
     #[error("block height {candidate_height:?} is lower than the current finalized height {finalized_tip_height:?}")]
     #[non_exhaustive]
     OrphanedBlock {
@@ -220,7 +224,7 @@ pub enum ValidateContextError {
     NoteCommitmentTreeError(#[from] zebra_chain::parallel::tree::NoteCommitmentTreeError),
 
     #[error("error building the history tree")]
-    HistoryTreeError(#[from] HistoryTreeError),
+    HistoryTreeError(#[from] Arc<HistoryTreeError>),
 
     #[error("block contains an invalid commitment")]
     InvalidBlockCommitment(#[from] block::CommitmentError),
@@ -232,8 +236,8 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     UnknownSproutAnchor {
         anchor: sprout::tree::Root,
-        height: block::Height,
-        tx_index_in_block: usize,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
         transaction_hash: transaction::Hash,
     },
 
@@ -244,8 +248,8 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     UnknownSaplingAnchor {
         anchor: sapling::tree::Root,
-        height: block::Height,
-        tx_index_in_block: usize,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
         transaction_hash: transaction::Hash,
     },
 
@@ -256,8 +260,8 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     UnknownOrchardAnchor {
         anchor: orchard::tree::Root,
-        height: block::Height,
-        tx_index_in_block: usize,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
         transaction_hash: transaction::Hash,
     },
 }

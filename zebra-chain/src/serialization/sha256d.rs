@@ -49,7 +49,7 @@ impl<'a> From<&'a [u8]> for Checksum {
 impl fmt::Debug for Checksum {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_tuple("Sha256dChecksum")
-            .field(&hex::encode(&self.0))
+            .field(&hex::encode(self.0))
             .finish()
     }
 }
@@ -76,6 +76,6 @@ mod tests {
         let input = b"hello";
         let checksum = Checksum::from(&input[..]);
 
-        assert_eq!(format!("{:?}", checksum), "Sha256dChecksum(\"9595c9df\")");
+        assert_eq!(format!("{checksum:?}"), "Sha256dChecksum(\"9595c9df\")");
     }
 }

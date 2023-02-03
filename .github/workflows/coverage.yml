@@ -1,5 +1,12 @@
 name: Coverage
 
+# Ensures that only one workflow task will run at a time. Previous builds, if
+# already in process, will get cancelled. Only the latest commit will be allowed
+# to run, cancelling any workflows in between
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
   push:
@@ -15,6 +22,9 @@ on:
       # dependencies
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      # configuration files
+      - '.cargo/config.toml'
+      - '**/clippy.toml'
       # workflow definitions
       - 'codecov.yml'
       - '.github/workflows/coverage.yml'
@@ -25,6 +35,8 @@ on:
       - '**/*.snap'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - '.cargo/config.toml'
+      - '**/clippy.toml'
       - 'codecov.yml'
       - '.github/workflows/coverage.yml'
 
@@ -45,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3.0.2
+      - uses: actions/checkout@v3.3.0
         with:
           persist-credentials: false
 
@@ -99,4 +111,4 @@ jobs:
         run: cargo llvm-cov --lcov --no-run --output-path lcov.info
 
       - name: Upload coverage report to Codecov
-        uses: codecov/codecov-action@v3.1.0
+        uses: codecov/codecov-action@v3.1.1

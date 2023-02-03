@@ -1,59 +1,237 @@
 //! Finding and reading block hashes and headers, in response to peer requests.
+//!
+//! In the functions in this module:
+//!
+//! The block write task commits blocks to the finalized state before updating
+//! `chain` with a cached copy of the best non-finalized chain from
+//! `NonFinalizedState.chain_set`. Then the block commit task can commit additional blocks to
+//! the finalized state after we've cloned the `chain`.
+//!
+//! This means that some blocks can be in both:
+//! - the cached [`Chain`], and
+//! - the shared finalized [`ZebraDb`] reference.
 
 use std::{
+    iter,
     ops::{RangeBounds, RangeInclusive},
     sync::Arc,
 };
 
-use zebra_chain::block::{self, Height};
-
-use crate::service::{
-    finalized_state::ZebraDb, non_finalized_state::Chain, read::block::block_header,
+use chrono::{DateTime, Utc};
+use zebra_chain::{
+    block::{self, Block, Height},
+    serialization::DateTime32,
 };
 
+use crate::{
+    constants,
+    service::{
+        block_iter::any_ancestor_blocks,
+        check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
+        finalized_state::ZebraDb,
+        non_finalized_state::{Chain, NonFinalizedState},
+        read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
+    },
+    BoxError,
+};
+
+#[cfg(test)]
+mod tests;
+
+/// Returns the tip of the best chain in the non-finalized or finalized state.
+pub fn best_tip(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+) -> Option<(block::Height, block::Hash)> {
+    tip(non_finalized_state.best_chain(), db)
+}
+
 /// Returns the tip of `chain`.
+/// If there is no chain, returns the tip of `db`.
+pub fn tip<C>(chain: Option<C>, db: &ZebraDb) -> Option<(Height, block::Hash)>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return either tip.
+    chain
+        .map(|chain| chain.as_ref().non_finalized_tip())
+        .or_else(|| db.tip())
+}
+
+/// Returns the tip [`Height`] of `chain`.
 /// If there is no chain, returns the tip of `db`.
 pub fn tip_height<C>(chain: Option<C>, db: &ZebraDb) -> Option<Height>
 where
     C: AsRef<Chain>,
 {
-    chain
-        .map(|chain| chain.as_ref().non_finalized_tip_height())
-        .or_else(|| db.finalized_tip_height())
+    tip(chain, db).map(|(height, _hash)| height)
 }
 
-/// Return the height for the block at `hash`, if `hash` is in the chain.
+/// Returns the tip [`block::Hash`] of `chain`.
+/// If there is no chain, returns the tip of `db`.
+#[allow(dead_code)]
+pub fn tip_hash<C>(chain: Option<C>, db: &ZebraDb) -> Option<block::Hash>
+where
+    C: AsRef<Chain>,
+{
+    tip(chain, db).map(|(_height, hash)| hash)
+}
+
+/// Return the depth of block `hash` from the chain tip.
+/// Searches `chain` for `hash`, then searches `db`.
+pub fn depth<C>(chain: Option<C>, db: &ZebraDb, hash: block::Hash) -> Option<u32>
+where
+    C: AsRef<Chain>,
+{
+    let chain = chain.as_ref();
+
+    // # Correctness
+    //
+    // It is ok to do this lookup in two different calls. Finalized state updates
+    // can only add overlapping blocks, and hashes are unique.
+
+    let tip = tip_height(chain, db)?;
+    let height = height_by_hash(chain, db, hash)?;
+
+    Some(tip.0 - height.0)
+}
+
+/// Return the height for the block at `hash`, if `hash` is in `chain` or `db`.
 pub fn height_by_hash<C>(chain: Option<C>, db: &ZebraDb, hash: block::Hash) -> Option<Height>
 where
     C: AsRef<Chain>,
 {
+    // # Correctness
+    //
+    // Finalized state updates can only add overlapping blocks, and hashes are unique.
+
     chain
         .and_then(|chain| chain.as_ref().height_by_hash(hash))
         .or_else(|| db.height(hash))
 }
 
-/// Return the hash for the block at `height`, if `height` is in the chain.
+/// Return the hash for the block at `height`, if `height` is in `chain` or `db`.
 pub fn hash_by_height<C>(chain: Option<C>, db: &ZebraDb, height: Height) -> Option<block::Hash>
 where
     C: AsRef<Chain>,
 {
+    // # Correctness
+    //
+    // Finalized state updates can only add overlapping blocks, and heights are unique
+    // in the current `chain`.
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return hashes from either chain.
+
     chain
         .and_then(|chain| chain.as_ref().hash_by_height(height))
         .or_else(|| db.hash(height))
 }
 
-/// Return true if `hash` is in the chain.
+/// Return true if `hash` is in `chain` or `db`.
 pub fn chain_contains_hash<C>(chain: Option<C>, db: &ZebraDb, hash: block::Hash) -> bool
 where
     C: AsRef<Chain>,
 {
+    // # Correctness
+    //
+    // Finalized state updates can only add overlapping blocks, and hashes are unique.
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return hashes from either chain.
+
     chain
         .map(|chain| chain.as_ref().height_by_hash.contains_key(&hash))
         .unwrap_or(false)
         || db.contains_hash(hash)
 }
 
-/// Find the first hash that's in the peer's `known_blocks` and the chain.
+/// Create a block locator from `chain` and `db`.
+///
+/// A block locator is used to efficiently find an intersection of two node's chains.
+/// It contains a list of block hashes at decreasing heights, skipping some blocks,
+/// so that any intersection can be located, no matter how long or different the chains are.
+pub fn block_locator<C>(chain: Option<C>, db: &ZebraDb) -> Option<Vec<block::Hash>>
+where
+    C: AsRef<Chain>,
+{
+    let chain = chain.as_ref();
+
+    // # Correctness
+    //
+    // It is ok to do these lookups using multiple database calls. Finalized state updates
+    // can only add overlapping blocks, and hashes are unique.
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return a set of hashes from multiple chains.
+    //
+    // Multiple heights can not map to the same hash, even in different chains,
+    // because the block height is covered by the block hash,
+    // via the transaction merkle tree commitments.
+    let tip_height = tip_height(chain, db)?;
+
+    let heights = block_locator_heights(tip_height);
+    let mut hashes = Vec::with_capacity(heights.len());
+
+    for height in heights {
+        if let Some(hash) = hash_by_height(chain, db, height) {
+            hashes.push(hash);
+        }
+    }
+
+    Some(hashes)
+}
+
+/// Get the heights of the blocks for constructing a block_locator list.
+///
+/// Zebra uses a decreasing list of block heights, starting at the tip, and skipping some heights.
+/// See [`block_locator()`] for details.
+pub fn block_locator_heights(tip_height: block::Height) -> Vec<block::Height> {
+    // The initial height in the returned `vec` is the tip height,
+    // and the final height is `MAX_BLOCK_REORG_HEIGHT` below the tip.
+    //
+    // The initial distance between heights is 1, and it doubles between each subsequent height.
+    // So the number of returned heights is approximately `log_2(MAX_BLOCK_REORG_HEIGHT)`.
+
+    // Limit the maximum locator depth.
+    let min_locator_height = tip_height
+        .0
+        .saturating_sub(constants::MAX_BLOCK_REORG_HEIGHT);
+
+    // Create an exponentially decreasing set of heights.
+    let exponential_locators = iter::successors(Some(1u32), |h| h.checked_mul(2))
+        .flat_map(move |step| tip_height.0.checked_sub(step));
+
+    // Start at the tip, add decreasing heights, and end MAX_BLOCK_REORG_HEIGHT below the tip.
+    let locators = iter::once(tip_height.0)
+        .chain(exponential_locators)
+        .take_while(move |&height| height > min_locator_height)
+        .chain(iter::once(min_locator_height))
+        .map(block::Height)
+        .collect();
+
+    tracing::debug!(
+        ?tip_height,
+        ?min_locator_height,
+        ?locators,
+        "created block locator"
+    );
+
+    locators
+}
+
+/// Find the first hash that's in the peer's `known_blocks`, and in `chain` or `db`.
 ///
 /// Returns `None` if:
 ///   * there is no matching hash in the chain, or
@@ -156,7 +334,7 @@ where
     // TODO: implement Step for Height, when Step stabilises
     //       https://github.com/rust-lang/rust/issues/42168
     let height_range = start_height.0..=final_height.0;
-    let response_len = height_range.clone().into_iter().count();
+    let response_len = height_range.clone().count();
 
     tracing::debug!(
         ?start_height,
@@ -182,7 +360,6 @@ where
 
 /// Returns a list of [`block::Hash`]es in the chain,
 /// following the `intersection` with the chain.
-///
 ///
 /// See [`find_chain_hashes()`] for details.
 fn collect_chain_hashes<C>(
@@ -305,7 +482,7 @@ where
 /// Stops the list of hashes after:
 ///   * adding the tip,
 ///   * adding the `stop` hash to the list, if it is in the chain, or
-///   * adding 500 hashes to the list.
+///   * adding `max_len` hashes to the list.
 ///
 /// Returns an empty list if the state is empty,
 /// and a partial or empty list if the found heights are concurrently modified.
@@ -319,6 +496,10 @@ pub fn find_chain_hashes<C>(
 where
     C: AsRef<Chain>,
 {
+    // # Correctness
+    //
+    // See the note in `block_locator()`.
+
     let chain = chain.as_ref();
     let intersection = find_chain_intersection(chain, db, known_blocks);
 
@@ -339,8 +520,106 @@ pub fn find_chain_headers<C>(
 where
     C: AsRef<Chain>,
 {
+    // # Correctness
+    //
+    // Headers are looked up by their hashes using a unique mapping,
+    // so it is not possible for multiple hashes to look up the same header,
+    // even across different chains.
+    //
+    // See also the note in `block_locator()`.
+
     let chain = chain.as_ref();
     let intersection = find_chain_intersection(chain, db, known_blocks);
 
     collect_chain_headers(chain, db, intersection, stop, max_len)
+}
+
+/// Returns the median-time-past of the *next* block to be added to the best chain in
+/// `non_finalized_state` or `db`.
+///
+/// # Panics
+///
+/// - If we don't have enough blocks in the state.
+pub fn next_median_time_past(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+) -> Result<DateTime32, BoxError> {
+    let mut best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
+
+    // Retry the finalized state query if it was interrupted by a finalizing block.
+    //
+    // TODO: refactor this into a generic retry(finalized_closure, process_and_check_closure) fn
+    for _ in 0..FINALIZED_STATE_QUERY_RETRIES {
+        if best_relevant_chain_result.is_ok() {
+            break;
+        }
+
+        best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
+    }
+
+    Ok(calculate_median_time_past(best_relevant_chain_result?))
+}
+
+/// Do a consistency check by checking the finalized tip before and after all other database queries.
+///
+/// Returns recent blocks in reverse height order from the tip.
+/// Returns an error if the tip obtained before and after is not the same.
+///
+/// # Panics
+///
+/// - If we don't have enough blocks in the state.
+fn best_relevant_chain(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+) -> Result<[Arc<Block>; POW_MEDIAN_BLOCK_SPAN], BoxError> {
+    let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
+        BoxError::from("Zebra's state is empty, wait until it syncs to the chain tip")
+    })?;
+
+    let best_relevant_chain =
+        any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
+    let best_relevant_chain: Vec<_> = best_relevant_chain
+        .into_iter()
+        .take(POW_MEDIAN_BLOCK_SPAN)
+        .collect();
+    let best_relevant_chain = best_relevant_chain.try_into().map_err(|_error| {
+        "Zebra's state only has a few blocks, wait until it syncs to the chain tip"
+    })?;
+
+    let state_tip_after_queries =
+        read::best_tip(non_finalized_state, db).expect("already checked for an empty tip");
+
+    if state_tip_before_queries != state_tip_after_queries {
+        return Err("Zebra is committing too many blocks to the state, \
+                    wait until it syncs to the chain tip"
+            .into());
+    }
+
+    Ok(best_relevant_chain)
+}
+
+/// Returns the median-time-past for the provided `relevant_chain`.
+///
+/// The `relevant_chain` has blocks in reverse height order.
+///
+/// See [`next_median_time_past()`] for details.
+pub(crate) fn calculate_median_time_past(
+    relevant_chain: [Arc<Block>; POW_MEDIAN_BLOCK_SPAN],
+) -> DateTime32 {
+    let relevant_data: Vec<DateTime<Utc>> = relevant_chain
+        .iter()
+        .map(|block| block.header.time)
+        .collect();
+
+    // > Define the median-time-past of a block to be the median of the nTime fields of the
+    // > preceding PoWMedianBlockSpan blocks (or all preceding blocks if there are fewer than
+    // > PoWMedianBlockSpan). The median-time-past of a genesis block is not defined.
+    // https://zips.z.cash/protocol/protocol.pdf#blockheader
+    let median_time_past = AdjustedDifficulty::median_time(
+        relevant_data
+            .try_into()
+            .expect("always has the correct length due to function argument type"),
+    );
+
+    DateTime32::try_from(median_time_past).expect("valid blocks have in-range times")
 }

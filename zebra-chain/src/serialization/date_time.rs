@@ -1,18 +1,19 @@
 //! DateTime types with specific serialization invariants.
 
 use std::{
-    convert::{TryFrom, TryInto},
     fmt,
-    num::TryFromIntError,
+    num::{ParseIntError, TryFromIntError},
+    str::FromStr,
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::{TimeZone, Utc};
 
-use super::{SerializationError, ZcashDeserialize, ZcashSerialize};
+use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
 /// A date and time, represented by a 32-bit number of seconds since the UNIX epoch.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DateTime32 {
     timestamp: u32,
 }
@@ -228,7 +229,9 @@ impl From<&u32> for DateTime32 {
 impl From<DateTime32> for chrono::DateTime<Utc> {
     fn from(value: DateTime32) -> Self {
         // chrono::DateTime is guaranteed to hold 32-bit values
-        Utc.timestamp(value.timestamp.into(), 0)
+        Utc.timestamp_opt(value.timestamp.into(), 0)
+            .single()
+            .expect("in-range number of seconds and valid nanosecond")
     }
 }
 
@@ -345,6 +348,26 @@ impl TryFrom<&std::time::Duration> for Duration32 {
     /// Conversion fails if the number of seconds in the duration is outside the `u32` range.
     fn try_from(value: &std::time::Duration) -> Result<Self, Self::Error> {
         (*value).try_into()
+    }
+}
+
+impl FromStr for DateTime32 {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(DateTime32 {
+            timestamp: s.parse()?,
+        })
+    }
+}
+
+impl FromStr for Duration32 {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Duration32 {
+            seconds: s.parse()?,
+        })
     }
 }
 

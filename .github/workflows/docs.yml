@@ -1,5 +1,12 @@
 name: Docs
 
+# Ensures that only one workflow task will run at a time. Previous deployments, if
+# already in process, won't get cancelled. Instead, we let the first to complete
+# then queue the latest pending workflow, cancelling any workflows in between
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   push:
@@ -14,6 +21,9 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      # configuration files
+      - '.cargo/config.toml'
+      - '**/clippy.toml'
       # workflow definitions
       - '.github/workflows/docs.yml'
 
@@ -30,9 +40,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the source code
-        uses: actions/checkout@v3.0.2
+        uses: actions/checkout@v3.3.0
         with:
           persist-credentials: false
+
+      - name: Install last version of Protoc
+        uses: arduino/setup-protoc@v1.1.2
+        with:
+          # TODO: increase to latest version after https://github.com/arduino/setup-protoc/issues/33 is fixed
+          version: '3.20.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install latest beta
         uses: actions-rs/toolchain@v1
@@ -44,7 +61,7 @@ jobs:
       - uses: Swatinem/rust-cache@v1
 
       - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v1.1.14
+        uses: peaceiris/actions-mdbook@v1.2.0
         with:
           mdbook-version: '0.4.18'
 
@@ -58,7 +75,7 @@ jobs:
           mdbook build book/
 
       - name: Deploy Zebra book to firebase
-        uses: w9jds/firebase-action@v11.5.0
+        uses: w9jds/firebase-action@v11.22.0
         with:
           args: deploy
         env:
@@ -69,12 +86,12 @@ jobs:
       - name: Build external docs
         run: |
           # Exclude zebra-utils, it is not for library or app users
-          cargo doc --no-deps --workspace --exclude zebra-utils
+          cargo doc --no-deps --workspace --all-features --exclude zebra-utils
         env:
           RUSTDOCFLAGS: '--html-in-header katex-header.html'
 
       - name: Deploy external docs to firebase
-        uses: w9jds/firebase-action@v11.5.0
+        uses: w9jds/firebase-action@v11.22.0
         with:
           args: deploy
         env:
@@ -83,12 +100,12 @@ jobs:
 
       - name: Build internal docs
         run: |
-          cargo doc --no-deps --document-private-items
+          cargo doc --no-deps --workspace --all-features --document-private-items
         env:
           RUSTDOCFLAGS: '--html-in-header katex-header.html'
 
       - name: Deploy internal docs to firebase
-        uses: w9jds/firebase-action@v11.5.0
+        uses: w9jds/firebase-action@v11.22.0
         with:
           args: deploy
         env:

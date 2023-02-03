@@ -1,3 +1,5 @@
+//! Randomised property tests for Zcash blocks.
+
 use std::{env, io::ErrorKind};
 
 use proptest::{arbitrary::any, prelude::*, test_runner::Config};
@@ -40,7 +42,7 @@ proptest! {
     fn block_hash_display_fromstr_roundtrip(hash in any::<Hash>()) {
         let _init_guard = zebra_test::init();
 
-        let display = format!("{}", hash);
+        let display = format!("{hash}");
         let parsed = display.parse::<Hash>().expect("hash should parse");
         prop_assert_eq!(hash, parsed);
     }
@@ -105,7 +107,7 @@ proptest! {
         let commitment = block.commitment(network);
         if let Ok(commitment) = commitment {
             let commitment_bytes = commitment.to_bytes();
-            prop_assert_eq![block.header.commitment_bytes, commitment_bytes];
+            prop_assert_eq![block.header.commitment_bytes.0, commitment_bytes];
         }
 
         // Check the block size limit

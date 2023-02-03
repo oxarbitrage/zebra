@@ -51,7 +51,7 @@ fn transactionhash_struct_from_str_roundtrip() {
         .unwrap();
 
     assert_eq!(
-        format!("{:?}", hash),
+        format!("{hash:?}"),
         r#"transaction::Hash("3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf")"#
     );
     assert_eq!(
@@ -69,7 +69,7 @@ fn auth_digest_struct_from_str_roundtrip() {
         .unwrap();
 
     assert_eq!(
-        format!("{:?}", digest),
+        format!("{digest:?}"),
         r#"AuthDigest("3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf")"#
     );
     assert_eq!(
@@ -87,7 +87,7 @@ fn wtx_id_struct_from_str_roundtrip() {
         .unwrap();
 
     assert_eq!(
-        format!("{:?}", wtx_id),
+        format!("{wtx_id:?}"),
         r#"WtxId { id: transaction::Hash("3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf"), auth_digest: AuthDigest("0000000000000000000000000000000000000000000000000000000000000001") }"#
     );
     assert_eq!(
@@ -223,7 +223,8 @@ fn deserialize_large_transaction() {
 
     // Create a lock time.
     let lock_time = LockTime::Time(DateTime::<Utc>::from_utc(
-        NaiveDateTime::from_timestamp(61, 0),
+        NaiveDateTime::from_timestamp_opt(61, 0)
+            .expect("in-range number of seconds and valid nanosecond"),
         Utc,
     ));
 
@@ -752,7 +753,7 @@ fn test_vec243_2() -> Result<()> {
 
     let lock_script = Script::new(&[]);
     let prevout = transparent::Output { value, lock_script };
-    let index = input_ind as usize;
+    let index = input_ind;
     let all_previous_outputs = mock_pre_v5_output_list(prevout, input_ind);
 
     let alt_sighash = crate::primitives::zcash_primitives::sighash(
@@ -805,7 +806,7 @@ fn test_vec243_3() -> Result<()> {
         "76a914507173527b4c3318a2aecd793bf1cfed705950cf88ac",
     )?);
     let prevout = transparent::Output { value, lock_script };
-    let index = input_ind as usize;
+    let index = input_ind;
 
     let alt_sighash = crate::primitives::zcash_primitives::sighash(
         &transaction,
@@ -850,7 +851,7 @@ fn zip143_sighash() -> Result<()> {
             ),
         );
         let expected = hex::encode(test.sighash);
-        assert_eq!(expected, result, "test #{}: sighash does not match", i);
+        assert_eq!(expected, result, "test #{i}: sighash does not match");
     }
 
     Ok(())
@@ -886,7 +887,7 @@ fn zip243_sighash() -> Result<()> {
             ),
         );
         let expected = hex::encode(test.sighash);
-        assert_eq!(expected, result, "test #{}: sighash does not match", i);
+        assert_eq!(expected, result, "test #{i}: sighash does not match");
     }
 
     Ok(())
@@ -916,7 +917,7 @@ fn zip244_sighash() -> Result<()> {
             None,
         ));
         let expected = hex::encode(test.sighash_shielded);
-        assert_eq!(expected, result, "test #{}: sighash does not match", i);
+        assert_eq!(expected, result, "test #{i}: sighash does not match");
 
         if let Some(sighash_all) = test.sighash_all {
             let result = hex::encode(transaction.sighash(
@@ -926,7 +927,7 @@ fn zip244_sighash() -> Result<()> {
                 test.transparent_input.map(|idx| idx as _),
             ));
             let expected = hex::encode(sighash_all);
-            assert_eq!(expected, result, "test #{}: sighash does not match", i);
+            assert_eq!(expected, result, "test #{i}: sighash does not match");
         }
     }
 

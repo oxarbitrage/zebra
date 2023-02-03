@@ -11,13 +11,9 @@ use tokio::time::timeout;
 use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::parameters::Network::*;
-use zebra_chain::serialization::ZcashDeserialize;
+use zebra_chain::{parameters::Network::*, serialization::ZcashDeserialize};
 
-use super::{
-    types::{Progress::*, TargetHeight::*},
-    *,
-};
+use super::*;
 
 /// The timeout we apply to each verify future during testing.
 ///
@@ -226,7 +222,10 @@ async fn continuous_blockchain_restart() -> Result<(), Report> {
 }
 
 /// Test a continuous blockchain on `network`, restarting verification at `restart_height`.
-#[spandoc::spandoc]
+//
+// This span is far too verbose for use during normal testing.
+// Turn the SPANDOC: comments into doc comments to re-enable.
+//#[spandoc::spandoc]
 async fn continuous_blockchain(
     restart_height: Option<block::Height>,
     network: Network,
@@ -266,7 +265,7 @@ async fn continuous_blockchain(
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    /// SPANDOC: Verify blocks, restarting at {?restart_height} {?network}
+    // SPANDOC: Verify blocks, restarting at {?restart_height} {?network}
     {
         let initial_tip = restart_height.map(|block::Height(height)| {
             (blockchain[height as usize].1, blockchain[height as usize].2)
@@ -322,10 +321,10 @@ async fn continuous_blockchain(
             if let Some(restart_height) = restart_height {
                 if height <= restart_height {
                     let mut state_service = state_service.clone();
-                    /// SPANDOC: Make sure the state service is ready for block {?height}
+                    // SPANDOC: Make sure the state service is ready for block {?height}
                     let ready_state_service = state_service.ready().map_err(|e| eyre!(e)).await?;
 
-                    /// SPANDOC: Add block directly to the state {?height}
+                    // SPANDOC: Add block directly to the state {?height}
                     ready_state_service
                         .call(zebra_state::Request::CommitFinalizedBlock(
                             block.clone().into(),
@@ -338,16 +337,16 @@ async fn continuous_blockchain(
                 }
             }
 
-            /// SPANDOC: Make sure the verifier service is ready for block {?height}
+            // SPANDOC: Make sure the verifier service is ready for block {?height}
             let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
 
-            /// SPANDOC: Set up the future for block {?height}
+            // SPANDOC: Set up the future for block {?height}
             let verify_future = timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
                 ready_verifier_service.call(block.clone()),
             );
 
-            /// SPANDOC: spawn verification future in the background for block {?height}
+            // SPANDOC: spawn verification future in the background for block {?height}
             let handle = tokio::spawn(verify_future.in_current_span());
             handles.push(handle);
 
@@ -376,15 +375,13 @@ async fn continuous_blockchain(
                 assert_eq!(
                     handles.len(),
                     0,
-                    "unexpected number of verify tasks for restart height: {:?}",
-                    restart_height,
+                    "unexpected number of verify tasks for restart height: {restart_height:?}",
                 );
             } else {
                 assert_eq!(
                     handles.len(),
                     blockchain_len - restart_height - 1,
-                    "unexpected number of verify tasks for restart height: {:?}",
-                    restart_height,
+                    "unexpected number of verify tasks for restart height: {restart_height:?}",
                 );
             }
         } else {
@@ -395,7 +392,7 @@ async fn continuous_blockchain(
             );
         }
 
-        /// SPANDOC: wait on spawned verification tasks for restart height {?restart_height} {?network}
+        // SPANDOC: wait on spawned verification tasks for restart height {?restart_height} {?network}
         while let Some(result) = handles.next().await {
             result??.map_err(|e| eyre!(e))?;
         }
@@ -404,20 +401,17 @@ async fn continuous_blockchain(
         assert_eq!(
             checkpoint_verifier.previous_checkpoint_height(),
             FinalCheckpoint,
-            "unexpected previous checkpoint for restart height: {:?}",
-            restart_height,
+            "unexpected previous checkpoint for restart height: {restart_height:?}",
         );
         assert_eq!(
             checkpoint_verifier.target_checkpoint_height(),
             FinishedVerifying,
-            "unexpected target checkpoint for restart height: {:?}",
-            restart_height,
+            "unexpected target checkpoint for restart height: {restart_height:?}",
         );
         assert_eq!(
             checkpoint_verifier.checkpoint_list.max_height(),
             expected_max_height,
-            "unexpected max checkpoint height for restart height: {:?}",
-            restart_height,
+            "unexpected max checkpoint height for restart height: {restart_height:?}",
         );
     }
 

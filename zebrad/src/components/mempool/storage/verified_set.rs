@@ -54,9 +54,20 @@ impl Drop for VerifiedSet {
 }
 
 impl VerifiedSet {
-    /// Returns an iterator over the transactions in the set.
+    /// Returns an iterator over the [`UnminedTx`] in the set.
+    //
+    // TODO: make the transactions() method return VerifiedUnminedTx,
+    //       and remove the full_transactions() method
     pub fn transactions(&self) -> impl Iterator<Item = &UnminedTx> + '_ {
         self.transactions.iter().map(|tx| &tx.transaction)
+    }
+
+    /// Returns an iterator over the [`VerifiedUnminedTx`] in the set.
+    ///
+    /// Each [`VerifiedUnminedTx`] contains an [`UnminedTx`],
+    /// and adds extra fields from the transaction verifier result.
+    pub fn full_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> + '_ {
+        self.transactions.iter()
     }
 
     /// Returns the number of verified transactions in the set.
@@ -72,7 +83,7 @@ impl VerifiedSet {
     }
 
     /// Returns `true` if the set of verified transactions contains the transaction with the
-    /// specified `id.
+    /// specified [`UnminedTxId`].
     pub fn contains(&self, id: &UnminedTxId) -> bool {
         self.transactions.iter().any(|tx| &tx.transaction.id == id)
     }
@@ -150,7 +161,7 @@ impl VerifiedSet {
                 .collect();
 
             let dist = WeightedIndex::new(weights)
-                .expect("there is at least one weight and all weights are valid");
+                .expect("there is at least one weight, all weights are non-negative, and the total is positive");
 
             Some(self.remove(dist.sample(&mut thread_rng())))
         }

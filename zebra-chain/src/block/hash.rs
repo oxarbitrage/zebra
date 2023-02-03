@@ -1,9 +1,6 @@
 use std::{fmt, io, sync::Arc};
 
 use hex::{FromHex, ToHex};
-
-#[cfg(any(test, feature = "proptest-impl"))]
-use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 
 use crate::serialization::{
@@ -11,6 +8,9 @@ use crate::serialization::{
 };
 
 use super::Header;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest_derive::Arbitrary;
 
 /// A hash of a block, used to identify blocks and link blocks into a chain. ⛓️
 ///
@@ -29,10 +29,21 @@ impl Hash {
     ///
     /// Zebra displays transaction and block hashes in big-endian byte-order,
     /// following the u256 convention set by Bitcoin and zcashd.
-    fn bytes_in_display_order(&self) -> [u8; 32] {
+    pub fn bytes_in_display_order(&self) -> [u8; 32] {
         let mut reversed_bytes = self.0;
         reversed_bytes.reverse();
         reversed_bytes
+    }
+
+    /// Convert bytes in big-endian byte-order into a [`block::Hash`](crate::block::Hash).
+    ///
+    /// Zebra displays transaction and block hashes in big-endian byte-order,
+    /// following the u256 convention set by Bitcoin and zcashd.
+    pub fn from_bytes_in_display_order(bytes_in_display_order: &[u8; 32]) -> Hash {
+        let mut internal_byte_order = *bytes_in_display_order;
+        internal_byte_order.reverse();
+
+        Hash(internal_byte_order)
     }
 }
 

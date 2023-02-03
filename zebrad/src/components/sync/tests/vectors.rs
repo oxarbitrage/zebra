@@ -89,7 +89,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .respond(zn::Response::Blocks(vec![Available(block0.clone())]));
 
     chain_verifier
-        .expect_request(block0)
+        .expect_request(zebra_consensus::Request::Commit(block0))
         .await
         .respond(block0_hash);
 
@@ -175,9 +175,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     for _ in 1..=2 {
         chain_verifier
-            .expect_request_that(|req| remaining_blocks.remove(&req.hash()).is_some())
+            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
             .await
-            .respond_with(|req| req.hash());
+            .respond_with(|req| req.block().hash());
     }
     assert_eq!(
         remaining_blocks,
@@ -239,9 +239,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     for _ in 3..=4 {
         chain_verifier
-            .expect_request_that(|req| remaining_blocks.remove(&req.hash()).is_some())
+            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
             .await
-            .respond_with(|req| req.hash());
+            .respond_with(|req| req.block().hash());
     }
     assert_eq!(
         remaining_blocks,
@@ -256,8 +256,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     let chain_sync_result = chain_sync_task_handle.now_or_never();
     assert!(
         matches!(chain_sync_result, None),
-        "unexpected error or panic in chain sync task: {:?}",
-        chain_sync_result,
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
     );
 
     Ok(())
@@ -317,7 +316,7 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
         .respond(zn::Response::Blocks(vec![Available(block0.clone())]));
 
     chain_verifier
-        .expect_request(block0)
+        .expect_request(zebra_consensus::Request::Commit(block0))
         .await
         .respond(block0_hash);
 
@@ -405,9 +404,9 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     for _ in 1..=2 {
         chain_verifier
-            .expect_request_that(|req| remaining_blocks.remove(&req.hash()).is_some())
+            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
             .await
-            .respond_with(|req| req.hash());
+            .respond_with(|req| req.block().hash());
     }
     assert_eq!(
         remaining_blocks,
@@ -471,9 +470,9 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     for _ in 3..=4 {
         chain_verifier
-            .expect_request_that(|req| remaining_blocks.remove(&req.hash()).is_some())
+            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
             .await
-            .respond_with(|req| req.hash());
+            .respond_with(|req| req.block().hash());
     }
     assert_eq!(
         remaining_blocks,
@@ -488,16 +487,15 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
     let chain_sync_result = chain_sync_task_handle.now_or_never();
     assert!(
         matches!(chain_sync_result, None),
-        "unexpected error or panic in chain sync task: {:?}",
-        chain_sync_result,
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
     );
 
     Ok(())
 }
 
-/// Test that zebra-network rejects blocks with the wrong hash.
+/// Test that zebra-network rejects blocks that are a long way ahead of the state tip.
 #[tokio::test]
-async fn sync_block_wrong_hash() -> Result<(), crate::BoxError> {
+async fn sync_block_lookahead_drop() -> Result<(), crate::BoxError> {
     // Get services
     let (
         chain_sync_future,
@@ -526,13 +524,15 @@ async fn sync_block_wrong_hash() -> Result<(), crate::BoxError> {
         .await
         .respond(zs::Response::Depth(None));
 
-    // Block 0 is fetched, but the peer returns a much higher block
+    // Block 0 is fetched, but the peer returns a much higher block.
+    // (Mismatching hashes are usually ignored by the network service,
+    // but we use them here to test the syncer lookahead.)
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
         .await
         .respond(zn::Response::Blocks(vec![Available(block982k.clone())]));
 
-    // Block is dropped because it has the wrong hash.
+    // Block is dropped because it is too far ahead of the tip.
     // We expect more requests to the state service, because the syncer keeps on running.
     peer_set.expect_no_requests().await;
     chain_verifier.expect_no_requests().await;
@@ -540,8 +540,7 @@ async fn sync_block_wrong_hash() -> Result<(), crate::BoxError> {
     let chain_sync_result = chain_sync_task_handle.now_or_never();
     assert!(
         matches!(chain_sync_result, None),
-        "unexpected error or panic in chain sync task: {:?}",
-        chain_sync_result,
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
     );
 
     Ok(())
@@ -599,7 +598,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         .respond(zn::Response::Blocks(vec![Available(block0.clone())]));
 
     chain_verifier
-        .expect_request(block0)
+        .expect_request(zebra_consensus::Request::Commit(block0))
         .await
         .respond(block0_hash);
 
@@ -696,8 +695,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
     let chain_sync_result = chain_sync_task_handle.now_or_never();
     assert!(
         matches!(chain_sync_result, None),
-        "unexpected error or panic in chain sync task: {:?}",
-        chain_sync_result,
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
     );
 
     Ok(())
@@ -761,7 +759,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .respond(zn::Response::Blocks(vec![Available(block0.clone())]));
 
     chain_verifier
-        .expect_request(block0)
+        .expect_request(zebra_consensus::Request::Commit(block0))
         .await
         .respond(block0_hash);
 
@@ -847,9 +845,9 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
 
     for _ in 1..=2 {
         chain_verifier
-            .expect_request_that(|req| remaining_blocks.remove(&req.hash()).is_some())
+            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
             .await
-            .respond_with(|req| req.hash());
+            .respond_with(|req| req.block().hash());
     }
     assert_eq!(
         remaining_blocks,
@@ -918,8 +916,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     let chain_sync_result = chain_sync_task_handle.now_or_never();
     assert!(
         matches!(chain_sync_result, None),
-        "unexpected error or panic in chain sync task: {:?}",
-        chain_sync_result,
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
     );
 
     Ok(())
@@ -930,7 +927,7 @@ fn setup() -> (
     impl Future<Output = Result<(), Report>> + Send,
     SyncStatus,
     // ChainVerifier
-    MockService<Arc<Block>, block::Hash, PanicAssertion>,
+    MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
     // PeerSet
     MockService<zebra_network::Request, zebra_network::Response, PanicAssertion>,
     // StateService

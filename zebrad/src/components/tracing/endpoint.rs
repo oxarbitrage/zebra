@@ -37,7 +37,7 @@ async fn read_filter(req: Request<Body>) -> Result<String, String> {
 impl TracingEndpoint {
     /// Create the component.
     pub fn new(config: &ZebradConfig) -> Result<Self, FrameworkError> {
-        if !cfg!(feature = "filter-reload") {
+        if config.tracing.endpoint_addr.is_some() && !cfg!(feature = "filter-reload") {
             warn!(addr = ?config.tracing.endpoint_addr,
                   "unable to activate configured tracing filter endpoint: \
                    enable the 'filter-reload' feature when compiling zebrad",
@@ -77,10 +77,9 @@ impl TracingEndpoint {
                 let server = match Server::try_bind(&addr) {
                     Ok(s) => s,
                     Err(e) => panic!(
-                        "Opening tracing endpoint listener {:?} failed: {:?}. \
+                        "Opening tracing endpoint listener {addr:?} failed: {e:?}. \
                          Hint: Check if another zebrad or zcashd process is running. \
                          Try changing the tracing endpoint_addr in the Zebra config.",
-                        addr, e,
                     ),
                 }
                 .serve(service);

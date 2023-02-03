@@ -10,13 +10,14 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tower::{buffer::Buffer, builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
 use tracing::Span;
 
 use zebra_chain::{
     amount::Amount,
-    block::Block,
+    block::{Block, Height},
+    fmt::humantime_seconds,
     parameters::Network::{self, *},
     serialization::ZcashDeserializeInto,
     transaction::{UnminedTx, UnminedTxId, VerifiedUnminedTx},
@@ -24,7 +25,7 @@ use zebra_chain::{
 use zebra_consensus::{error::TransactionError, transaction, Config as ConsensusConfig};
 use zebra_network::{AddressBook, InventoryResponse, Request, Response};
 use zebra_node_services::mempool;
-use zebra_state::Config as StateConfig;
+use zebra_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -59,6 +60,7 @@ async fn mempool_requests_for_transactions() {
         _mock_tx_verifier,
         mut peer_set,
         _state_guard,
+        _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     ) = setup(true).await;
@@ -76,8 +78,12 @@ async fn mempool_requests_for_transactions() {
         .await;
     match response {
         Ok(Response::TransactionIds(response)) => assert_eq!(response, added_transaction_ids),
+        Ok(Response::Nil) => assert!(
+            added_transaction_ids.is_empty(),
+            "`MempoolTransactionIds` request should match added_transaction_ids {added_transaction_ids:?}, got Ok(Nil)"
+        ),
         _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`, got {:?}",
+            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`, got {:?}",
             response
         ),
     };
@@ -112,15 +118,13 @@ async fn mempool_requests_for_transactions() {
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
         matches!(sync_gossip_result, None),
-        "unexpected error or panic in sync gossip task: {:?}",
-        sync_gossip_result,
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 }
 
@@ -142,6 +146,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         mut tx_verifier,
         mut peer_set,
         _state_guard,
+        _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     ) = setup(false).await;
@@ -155,13 +160,14 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         let transaction = responder
             .request()
             .clone()
-            .into_mempool_transaction()
+            .mempool_transaction()
             .expect("unexpected non-mempool request");
 
-        // Set a dummy fee.
+        // Set a dummy fee and sigops.
         responder.respond(transaction::Response::from(VerifiedUnminedTx::new(
             transaction,
             Amount::zero(),
+            0,
         )));
     });
 
@@ -185,7 +191,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`",
+        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -200,15 +206,13 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
         matches!(sync_gossip_result, None),
-        "unexpected error or panic in sync gossip task: {:?}",
-        sync_gossip_result,
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -236,6 +240,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         mut tx_verifier,
         mut peer_set,
         _state_guard,
+        _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     ) = setup(false).await;
@@ -257,13 +262,14 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         let transaction = responder
             .request()
             .clone()
-            .into_mempool_transaction()
+            .mempool_transaction()
             .expect("unexpected non-mempool request");
 
-        // Set a dummy fee.
+        // Set a dummy fee and sigops.
         responder.respond(transaction::Response::from(VerifiedUnminedTx::new(
             transaction,
             Amount::zero(),
+            0,
         )));
     });
 
@@ -287,7 +293,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![test_transaction_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`",
+        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
 
     // Make sure there is an additional request broadcasting the
@@ -302,15 +308,13 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
         matches!(sync_gossip_result, None),
-        "unexpected error or panic in sync gossip task: {:?}",
-        sync_gossip_result,
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -342,6 +346,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         mut tx_verifier,
         mut peer_set,
         state_service,
+        _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     ) = setup(false).await;
@@ -356,13 +361,14 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         let transaction = responder
             .request()
             .clone()
-            .into_mempool_transaction()
+            .mempool_transaction()
             .expect("unexpected non-mempool request");
 
-        // Set a dummy fee.
+        // Set a dummy fee and sigops.
         responder.respond(transaction::Response::from(VerifiedUnminedTx::new(
             transaction,
             Amount::zero(),
+            0,
         )));
     });
 
@@ -386,7 +392,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx1_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`",
+        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
 
     // Add a new block to the state (make the chain tip advance)
@@ -452,8 +458,12 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         Ok(Response::TransactionIds(response)) => {
             assert_eq!(response, vec![tx1_id])
         }
+        Ok(Response::Nil) => panic!(
+            "response to `MempoolTransactionIds` request should match {:?}",
+            vec![tx1_id]
+        ),
         _ => unreachable!(
-            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`"
+            "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
         ),
     };
 
@@ -485,13 +495,14 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         let transaction = responder
             .request()
             .clone()
-            .into_mempool_transaction()
+            .mempool_transaction()
             .expect("unexpected non-mempool request");
 
-        // Set a dummy fee.
+        // Set a dummy fee and sigops.
         responder.respond(transaction::Response::from(VerifiedUnminedTx::new(
             transaction,
             Amount::zero(),
+            0,
         )));
     });
 
@@ -516,7 +527,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     assert_eq!(
         mempool_response.expect("unexpected error response from mempool"),
         Response::TransactionIds(vec![tx2_id]),
-        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`",
+        "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
 
     // Check if tx1 was added to the rejected list as well
@@ -598,8 +609,12 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             Ok(Response::TransactionIds(response)) => {
                 assert_eq!(response, vec![tx2_id])
             }
+            Ok(Response::Nil) => panic!(
+                "response to `MempoolTransactionIds` request should match {:?}",
+                vec![tx2_id]
+            ),
             _ => unreachable!(
-                "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId>)`"
+                "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`"
             ),
         };
     }
@@ -610,15 +625,13 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
         matches!(sync_gossip_result, None),
-        "unexpected error or panic in sync gossip task: {:?}",
-        sync_gossip_result,
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -638,6 +651,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         mut tx_verifier,
         mut peer_set,
         state_service,
+        mut chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     ) = setup(false).await;
@@ -658,7 +672,20 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         .await
         .respond(Response::Blocks(vec![Available(block)]));
 
-    // TODO: check that the block is queued in the checkpoint verifier
+    // Wait for the chain tip update
+    if let Err(timeout_error) = timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        chain_tip_change.wait_for_tip_change(),
+    )
+    .await
+    .map(|change_result| change_result.expect("unexpected chain tip update failure"))
+    {
+        info!(
+            timeout = ?humantime_seconds(CHAIN_TIP_UPDATE_WAIT_LIMIT),
+            ?timeout_error,
+            "timeout waiting for chain tip change after committing block"
+        );
+    }
 
     // check that nothing unexpected happened
     peer_set.expect_no_requests().await;
@@ -696,15 +723,13 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
         matches!(sync_gossip_result, None),
-        "unexpected error or panic in sync gossip task: {:?}",
-        sync_gossip_result,
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -729,6 +754,7 @@ async fn setup(
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<BoxService<zebra_state::Request, zebra_state::Response, BoxError>, zebra_state::Request>,
+    ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
 ) {
@@ -744,8 +770,10 @@ async fn setup(
     );
     let address_book = Arc::new(std::sync::Mutex::new(address_book));
     let (sync_status, mut recent_syncs) = SyncStatus::new();
-    let (state, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zebra_state::init(state_config.clone(), network);
+
+    // UTXO verification doesn't matter for these tests.
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+        zebra_state::init(state_config.clone(), network, Height::MAX, 0);
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -786,6 +814,21 @@ async fn setup(
         .unwrap();
     committed_blocks.push(genesis_block);
 
+    // Wait for the chain tip update
+    if let Err(timeout_error) = timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        chain_tip_change.wait_for_tip_change(),
+    )
+    .await
+    .map(|change_result| change_result.expect("unexpected chain tip update failure"))
+    {
+        info!(
+            timeout = ?humantime_seconds(CHAIN_TIP_UPDATE_WAIT_LIMIT),
+            ?timeout_error,
+            "timeout waiting for chain tip change after committing block"
+        );
+    }
+
     // Also push block 1.
     // Block one is a network upgrade and the mempool will be cleared at it,
     // let all our tests start after this event.
@@ -801,6 +844,9 @@ async fn setup(
         .unwrap();
     committed_blocks.push(block_one);
 
+    // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
+    // which is called by the gossip_best_tip_block_hashes task once the chain tip changes.
+
     let (mut mempool_service, transaction_receiver) = Mempool::new(
         &MempoolConfig::default(),
         buffered_peer_set.clone(),
@@ -811,7 +857,36 @@ async fn setup(
         chain_tip_change.clone(),
     );
 
+    // Pretend we're close to tip
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+
+    let sync_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        sync_status.clone(),
+        chain_tip_change.clone(),
+        peer_set.clone(),
+    ));
+
+    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
+        transaction_receiver,
+        peer_set.clone(),
+    ));
+
+    // Make sure there is an additional request broadcasting the
+    // committed blocks to peers.
+    //
+    // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
+    for block in committed_blocks.iter().skip(1) {
+        peer_set
+            .expect_request(Request::AdvertiseBlock(block.hash()))
+            .await
+            .respond(Response::Nil);
+    }
+
     // Enable the mempool
+    // Note: this needs to be done after the mock peer set service has received the AdvertiseBlock
+    // request to ensure that the call to `last_tip_change` returns the chain tip block for block_one
+    // and not the genesis block, or else the transactions from the genesis block will be added to
+    // the mempool storage's rejection list and tests will fail.
     mempool_service.enable(&mut recent_syncs).await;
 
     // Add transactions to the mempool, skipping verification and broadcast
@@ -843,28 +918,6 @@ async fn setup(
     // We can't expect or unwrap because the returned Result does not implement Debug
     assert!(r.is_ok(), "unexpected setup channel send failure");
 
-    let sync_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
-        sync_status.clone(),
-        chain_tip_change,
-        peer_set.clone(),
-    ));
-
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
-        transaction_receiver,
-        peer_set.clone(),
-    ));
-
-    // Make sure there is an additional request broadcasting the
-    // committed blocks to peers.
-    //
-    // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
-    for block in committed_blocks.iter().skip(1) {
-        peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash()))
-            .await
-            .respond(Response::Nil);
-    }
-
     (
         inbound_service,
         mempool_service,
@@ -873,6 +926,7 @@ async fn setup(
         mock_tx_verifier,
         peer_set,
         state_service,
+        chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
     )

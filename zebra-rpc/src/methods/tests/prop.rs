@@ -18,7 +18,7 @@ use zebra_chain::{
         NetworkUpgrade,
     },
     serialization::{ZcashDeserialize, ZcashSerialize},
-    transaction::{self, Transaction, UnminedTx, UnminedTxId},
+    transaction::{self, Transaction, UnminedTx, VerifiedUnminedTx},
     transparent,
 };
 use zebra_node_services::mempool;
@@ -41,10 +41,11 @@ proptest! {
             let mut state: MockService<_, _, _, BoxError> = MockService::build().for_prop_tests();
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
             let hash = SentTransactionHash(transaction.hash());
 
@@ -93,10 +94,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let transaction_bytes = transaction
@@ -150,10 +152,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let transaction_bytes = transaction
@@ -215,10 +218,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let send_task = tokio::spawn(rpc.send_raw_transaction(non_hex_string));
@@ -269,10 +273,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let send_task = tokio::spawn(rpc.send_raw_transaction(hex::encode(random_bytes)));
@@ -308,7 +313,7 @@ proptest! {
     /// Make the mock mempool service return a list of transaction IDs, and check that the RPC call
     /// returns those IDs as hexadecimal strings.
     #[test]
-    fn mempool_transactions_are_sent_to_caller(transaction_ids in any::<HashSet<UnminedTxId>>()) {
+    fn mempool_transactions_are_sent_to_caller(transactions in any::<Vec<VerifiedUnminedTx>>()) {
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
@@ -321,23 +326,64 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let call_task = tokio::spawn(rpc.get_raw_mempool());
-            let mut expected_response: Vec<String> = transaction_ids
-                .iter()
-                .map(|id| id.mined_id().encode_hex())
-                .collect();
-            expected_response.sort();
 
-            mempool
-                .expect_request(mempool::Request::TransactionIds)
-                .await?
-                .respond(mempool::Response::TransactionIds(transaction_ids));
+
+            #[cfg(not(feature = "getblocktemplate-rpcs"))]
+            let expected_response = {
+                let transaction_ids: HashSet<_> = transactions
+                    .iter()
+                    .map(|tx| tx.transaction.id)
+                    .collect();
+
+                let mut expected_response: Vec<String> = transaction_ids
+                    .iter()
+                    .map(|id| id.mined_id().encode_hex())
+                    .collect();
+                expected_response.sort();
+
+                mempool
+                    .expect_request(mempool::Request::TransactionIds)
+                    .await?
+                    .respond(mempool::Response::TransactionIds(transaction_ids));
+
+                expected_response
+            };
+
+            // Note: this depends on `SHOULD_USE_ZCASHD_ORDER` being true.
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            let expected_response = {
+                let mut expected_response = transactions.clone();
+                expected_response.sort_by_cached_key(|tx| {
+                    // zcashd uses modified fee here but Zebra doesn't currently
+                    // support prioritizing transactions
+                    std::cmp::Reverse((
+                        i64::from(tx.miner_fee) as u128 * zebra_chain::block::MAX_BLOCK_BYTES as u128
+                            / tx.transaction.size as u128,
+                        // transaction hashes are compared in their serialized byte-order.
+                        tx.transaction.id.mined_id(),
+                    ))
+                });
+
+                let expected_response = expected_response
+                    .iter()
+                    .map(|tx| tx.transaction.id.mined_id().encode_hex())
+                    .collect();
+
+                mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await?
+                    .respond(mempool::Response::FullTransactions(transactions));
+
+                expected_response
+            };
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -376,10 +422,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let send_task = tokio::spawn(rpc.get_raw_transaction(non_hex_string, 0));
@@ -432,10 +479,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let send_task = tokio::spawn(rpc.get_raw_transaction(hex::encode(random_bytes), 0));
@@ -477,10 +525,11 @@ proptest! {
         // look for an error with a `NoChainTip`
         let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
             "RPC test",
+            network,
+            false,
             Buffer::new(mempool.clone(), 1),
             Buffer::new(state.clone(), 1),
             NoChainTip,
-            network,
         );
 
         let response = rpc.get_blockchain_info();
@@ -525,10 +574,11 @@ proptest! {
         // Start RPC with the mocked `ChainTip`
         let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
             "RPC test",
+            network,
+            false,
             Buffer::new(mempool.clone(), 1),
             Buffer::new(state.clone(), 1),
             chain_tip,
-            network,
         );
         let response = rpc.get_blockchain_info();
 
@@ -609,10 +659,11 @@ proptest! {
         runtime.block_on(async move {
             let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                network,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
-                network,
             );
 
             // Build the future to call the RPC
@@ -670,10 +721,11 @@ proptest! {
         runtime.block_on(async move {
             let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                network,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
-                network,
             );
 
             let address_strings = AddressStrings {
@@ -719,10 +771,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             // send a transaction
@@ -806,10 +859,11 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                Mainnet,
+                false,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
-                Mainnet,
             );
 
             let mut transactions_hash_set = HashSet::new();

@@ -45,7 +45,8 @@ pub fn transaction() -> (Transaction, Vec<u8>) {
 /// Returns a generated transparent lock time, and its canonical serialized bytes.
 pub fn lock_time() -> (LockTime, Vec<u8>) {
     let lock_time = LockTime::Time(DateTime::<Utc>::from_utc(
-        NaiveDateTime::from_timestamp(61, 0),
+        NaiveDateTime::from_timestamp_opt(61, 0)
+            .expect("in-range number of seconds and valid nanosecond"),
         Utc,
     ));
     let lock_time_bytes = lock_time.zcash_serialize_to_vec().unwrap();
@@ -157,22 +158,16 @@ fn multi_transaction_block(oversized: bool) -> Block {
         oversized,
         serialized_len > MAX_BLOCK_BYTES.try_into().unwrap(),
         "block is over-sized if requested:\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MAX_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MAX_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MAX_BLOCK_BYTES: {MAX_BLOCK_BYTES},",
     );
     assert!(
         serialized_len > MIN_LARGE_BLOCK_BYTES.try_into().unwrap(),
         "block is large\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MIN_LARGE_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MIN_LARGE_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MIN_LARGE_BLOCK_BYTES: {MIN_LARGE_BLOCK_BYTES},",
     );
 
     block
@@ -237,22 +232,16 @@ fn single_transaction_block_many_inputs(oversized: bool) -> Block {
         oversized,
         serialized_len > MAX_BLOCK_BYTES.try_into().unwrap(),
         "block is over-sized if requested:\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MAX_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MAX_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MAX_BLOCK_BYTES: {MAX_BLOCK_BYTES},",
     );
     assert!(
         serialized_len > MIN_LARGE_BLOCK_BYTES.try_into().unwrap(),
         "block is large\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MIN_LARGE_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MIN_LARGE_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MIN_LARGE_BLOCK_BYTES: {MIN_LARGE_BLOCK_BYTES},",
     );
 
     block
@@ -315,22 +304,16 @@ fn single_transaction_block_many_outputs(oversized: bool) -> Block {
         oversized,
         serialized_len > MAX_BLOCK_BYTES.try_into().unwrap(),
         "block is over-sized if requested:\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MAX_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MAX_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MAX_BLOCK_BYTES: {MAX_BLOCK_BYTES},",
     );
     assert!(
         serialized_len > MIN_LARGE_BLOCK_BYTES.try_into().unwrap(),
         "block is large\n\
-         oversized: {},\n\
-         serialized_len: {},\n\
-         MIN_LARGE_BLOCK_BYTES: {},",
-        oversized,
-        serialized_len,
-        MIN_LARGE_BLOCK_BYTES,
+         oversized: {oversized},\n\
+         serialized_len: {serialized_len},\n\
+         MIN_LARGE_BLOCK_BYTES: {MIN_LARGE_BLOCK_BYTES},",
     );
 
     block

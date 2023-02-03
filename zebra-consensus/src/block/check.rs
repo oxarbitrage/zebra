@@ -1,7 +1,8 @@
 //! Consensus check functions
 
-use chrono::{DateTime, Utc};
 use std::{collections::HashSet, sync::Arc};
+
+use chrono::{DateTime, Utc};
 
 use zebra_chain::{
     amount::{Amount, Error as AmountError, NonNegative},
@@ -57,24 +58,22 @@ pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>,
     Ok(first.clone())
 }
 
-/// Returns `Ok(())` if `hash` passes:
-///   - the target difficulty limit for `network` (PoWLimit), and
-///   - the difficulty filter,
-/// based on the fields in `header`.
+/// Returns `Ok(ExpandedDifficulty)` if the`difficulty_threshold` of `header` is at least as difficult as
+/// the target difficulty limit for `network` (PoWLimit)
 ///
-/// If the block is invalid, returns an error containing `height` and `hash`.
-pub fn difficulty_is_valid(
+/// If the header difficulty threshold is invalid, returns an error containing `height` and `hash`.
+pub fn difficulty_threshold_is_valid(
     header: &Header,
     network: Network,
     height: &Height,
     hash: &Hash,
-) -> Result<(), BlockError> {
+) -> Result<ExpandedDifficulty, BlockError> {
     let difficulty_threshold = header
         .difficulty_threshold
         .to_expanded()
         .ok_or(BlockError::InvalidDifficulty(*height, *hash))?;
 
-    // Note: the comparisons in this function are u256 integer comparisons, like
+    // Note: the comparison in this function is a u256 integer comparison, like
     // zcashd and bitcoin. Greater values represent *less* work.
 
     // The PowLimit check is part of `Threshold()` in the spec, but it doesn't
@@ -88,6 +87,26 @@ pub fn difficulty_is_valid(
             ExpandedDifficulty::target_difficulty_limit(network),
         ))?;
     }
+
+    Ok(difficulty_threshold)
+}
+
+/// Returns `Ok(())` if `hash` passes:
+///   - the target difficulty limit for `network` (PoWLimit), and
+///   - the difficulty filter,
+/// based on the fields in `header`.
+///
+/// If the block is invalid, returns an error containing `height` and `hash`.
+pub fn difficulty_is_valid(
+    header: &Header,
+    network: Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), BlockError> {
+    let difficulty_threshold = difficulty_threshold_is_valid(header, network, height, hash)?;
+
+    // Note: the comparison in this function is a u256 integer comparison, like
+    // zcashd and bitcoin. Greater values represent *less* work.
 
     // # Consensus
     //
@@ -126,7 +145,11 @@ pub fn subsidy_is_valid(block: &Block, network: Network) -> Result<(), BlockErro
     let coinbase = block.transactions.get(0).ok_or(SubsidyError::NoCoinbase)?;
 
     // Validate funding streams
-    let halving_div = subsidy::general::halving_divisor(height, network);
+    let Some(halving_div) = subsidy::general::halving_divisor(height, network) else {
+        // Far future halving, with no founders reward or funding streams
+        return Ok(());
+    };
+
     let canopy_activation_height = NetworkUpgrade::Canopy
         .activation_height(network)
         .expect("Canopy activation height is known");

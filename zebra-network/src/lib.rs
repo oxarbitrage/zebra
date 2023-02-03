@@ -60,6 +60,8 @@
 //! The [`isolated`] APIs provide anonymised TCP and [Tor](https://crates.io/crates/arti)
 //! connections to individual peers.
 //! These isolated connections can be used to send user-generated transactions anonymously.
+//! Tor connections are currently disabled until `arti-client`'s dependency `x25519-dalek v1.2.0`
+//! is updated to a higher version. See #5492.
 //!
 //! ### Individual Peer Connections
 //!
@@ -142,6 +144,7 @@ extern crate bitflags;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 mod address_book;
+pub mod address_book_peers;
 mod address_book_updater;
 mod config;
 pub mod constants;
@@ -152,10 +155,14 @@ mod peer_set;
 mod policies;
 mod protocol;
 
-#[cfg(feature = "tor")]
+// Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
+// #[cfg(feature = "tor")]
+#[cfg(tor)]
 pub use crate::isolated::tor::connect_isolated_tor;
 
-#[cfg(all(feature = "tor", any(test, feature = "proptest-impl")))]
+// Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
+// #[cfg(all(feature = "tor", any(test, feature = "proptest-impl")))]
+#[cfg(tor)]
 pub use crate::isolated::tor::connect_isolated_tor_with_inbound;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -165,18 +172,28 @@ pub use crate::isolated::{
 
 pub use crate::{
     address_book::AddressBook,
+    address_book_peers::AddressBookPeers,
     config::Config,
     isolated::{connect_isolated, connect_isolated_tcp_direct},
     meta_addr::PeerAddrState,
-    peer::{HandshakeError, PeerError, SharedPeerError},
+    peer::{Client, ConnectedAddr, ConnectionInfo, HandshakeError, PeerError, SharedPeerError},
     peer_set::init,
     policies::RetryLimit,
-    protocol::internal::{InventoryResponse, Request, Response},
+    protocol::{
+        external::{Version, VersionMessage},
+        internal::{InventoryResponse, Request, Response},
+    },
 };
 
-/// Types used in the definition of [`Request`] and [`Response`] messages.
+/// Types used in the definition of [`Request`], [`Response`], and [`VersionMessage`].
 pub mod types {
-    pub use crate::{meta_addr::MetaAddr, protocol::types::PeerServices};
+    pub use crate::{
+        meta_addr::MetaAddr,
+        protocol::{
+            external::{AddrInVersion, Nonce},
+            types::PeerServices,
+        },
+    };
 
     #[cfg(any(test, feature = "proptest-impl"))]
     pub use crate::protocol::external::InventoryHash;

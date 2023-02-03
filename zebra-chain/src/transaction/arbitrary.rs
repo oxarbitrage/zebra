@@ -12,6 +12,7 @@ use chrono::{TimeZone, Utc};
 use proptest::{
     arbitrary::any, array, collection::vec, option, prelude::*, test_runner::TestRunner,
 };
+use reddsa::{orchard::Binding, Signature};
 
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -19,10 +20,7 @@ use crate::{
     block::{self, arbitrary::MAX_PARTIAL_CHAIN_BLOCKS},
     orchard,
     parameters::{Network, NetworkUpgrade},
-    primitives::{
-        redpallas::{Binding, Signature},
-        Bctv14Proof, Groth16Proof, Halo2Proof, ZkSnarkProof,
-    },
+    primitives::{Bctv14Proof, Groth16Proof, Halo2Proof, ZkSnarkProof},
     sapling::{self, AnchorVariant, PerSpendAnchor, SharedAnchor},
     serialization::ZcashDeserializeInto,
     sprout, transparent,
@@ -346,16 +344,11 @@ impl Transaction {
             .add_transaction(self, outputs)
             .unwrap_or_else(|err| {
                 panic!(
-                    "unexpected chain value pool error: {:?}, \n\
-                     original chain value pools: {:?}, \n\
-                     transaction chain value change: {:?}, \n\
-                     input-only transaction chain value pools: {:?}, \n\
-                     calculated remaining transaction value: {:?}",
-                    err,
-                    chain_value_pools, // old value
-                    transaction_chain_value_pool_change,
-                    input_chain_value_pools,
-                    remaining_transaction_value,
+                    "unexpected chain value pool error: {err:?}, \n\
+                     original chain value pools: {chain_value_pools:?}, \n\
+                     transaction chain value change: {transaction_chain_value_pool_change:?}, \n\
+                     input-only transaction chain value pools: {input_chain_value_pools:?}, \n\
+                     calculated remaining transaction value: {remaining_transaction_value:?}",
                 )
             });
 
@@ -495,9 +488,8 @@ impl Transaction {
             .remaining_transaction_value()
             .unwrap_or_else(|err| {
                 panic!(
-                    "unexpected remaining transaction value: {:?}, \
-                     calculated remaining input value: {:?}",
-                    err, remaining_input_value
+                    "unexpected remaining transaction value: {err:?}, \
+                     calculated remaining input value: {remaining_input_value:?}"
                 )
             });
         assert_eq!(
@@ -534,8 +526,13 @@ impl Arbitrary for LockTime {
         prop_oneof![
             (block::Height::MIN.0..=LockTime::MAX_HEIGHT.0)
                 .prop_map(|n| LockTime::Height(block::Height(n))),
-            (LockTime::MIN_TIMESTAMP..=LockTime::MAX_TIMESTAMP)
-                .prop_map(|n| { LockTime::Time(Utc.timestamp(n as i64, 0)) })
+            (LockTime::MIN_TIMESTAMP..=LockTime::MAX_TIMESTAMP).prop_map(|n| {
+                LockTime::Time(
+                    Utc.timestamp_opt(n, 0)
+                        .single()
+                        .expect("in-range number of seconds and valid nanosecond"),
+                )
+            })
         ]
         .boxed()
     }
@@ -697,7 +694,7 @@ impl Arbitrary for orchard::ShieldedData {
                 any::<orchard::shielded_data::AuthorizedAction>(),
                 1..MAX_ARBITRARY_ITEMS,
             ),
-            any::<Signature<Binding>>(),
+            any::<BindingSignature>(),
         )
             .prop_map(
                 |(flags, value_balance, shared_anchor, proof, actions, binding_sig)| Self {
@@ -708,7 +705,7 @@ impl Arbitrary for orchard::ShieldedData {
                     actions: actions
                         .try_into()
                         .expect("arbitrary vector size range produces at least one action"),
-                    binding_sig,
+                    binding_sig: binding_sig.0,
                 },
             )
             .boxed()
@@ -717,7 +714,10 @@ impl Arbitrary for orchard::ShieldedData {
     type Strategy = BoxedStrategy<Self>;
 }
 
-impl Arbitrary for Signature<Binding> {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct BindingSignature(pub(crate) Signature<Binding>);
+
+impl Arbitrary for BindingSignature {
     type Parameters = ();
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
@@ -730,7 +730,7 @@ impl Arbitrary for Signature<Binding> {
                     if b == [0u8; 64] {
                         return None;
                     }
-                    Some(Signature::<Binding>::from(b))
+                    Some(BindingSignature(Signature::<Binding>::from(b)))
                 },
             )
             .boxed()
@@ -930,16 +930,7 @@ pub fn test_transactions(
         Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
     };
 
-    blocks.flat_map(|(&block_height, &block_bytes)| {
-        let block = block_bytes
-            .zcash_deserialize_into::<block::Block>()
-            .expect("block is structurally valid");
-
-        block
-            .transactions
-            .into_iter()
-            .map(move |transaction| (block::Height(block_height), transaction))
-    })
+    transactions_from_blocks(blocks)
 }
 
 /// Generate an iterator over fake V5 transactions.
@@ -950,18 +941,23 @@ pub fn fake_v5_transactions_for_network<'b>(
     network: Network,
     blocks: impl DoubleEndedIterator<Item = (&'b u32, &'b &'static [u8])> + 'b,
 ) -> impl DoubleEndedIterator<Item = Transaction> + 'b {
-    blocks.flat_map(move |(height, original_bytes)| {
-        let original_block = original_bytes
+    transactions_from_blocks(blocks)
+        .map(move |(height, transaction)| transaction_to_fake_v5(&transaction, network, height))
+}
+
+/// Generate an iterator over ([`block::Height`], [`Arc<Transaction>`]).
+pub fn transactions_from_blocks<'a>(
+    blocks: impl DoubleEndedIterator<Item = (&'a u32, &'a &'static [u8])> + 'a,
+) -> impl DoubleEndedIterator<Item = (block::Height, Arc<Transaction>)> + 'a {
+    blocks.flat_map(|(&block_height, &block_bytes)| {
+        let block = block_bytes
             .zcash_deserialize_into::<block::Block>()
             .expect("block is structurally valid");
 
-        original_block
+        block
             .transactions
             .into_iter()
-            .map(move |transaction| {
-                transaction_to_fake_v5(&transaction, network, block::Height(*height))
-            })
-            .map(Transaction::from)
+            .map(move |transaction| (block::Height(block_height), transaction))
     })
 }
 

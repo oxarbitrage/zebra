@@ -10,12 +10,15 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
+    sync::Arc,
     time::Duration,
 };
 
 use thiserror::Error;
 
-use zebra_chain::transaction::{self, Hash, UnminedTx, UnminedTxId, VerifiedUnminedTx};
+use zebra_chain::transaction::{
+    self, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
+};
 
 use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
 use super::{config, downloads::TransactionDownloadVerifyError, MempoolError};
@@ -40,7 +43,7 @@ mod verified_set;
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
 /// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// These rejections are only valid for the current tip.
+/// or lock times. These rejections are only valid for the current tip.
 ///
 /// Each committed block clears these rejections, because new blocks can supply missing inputs.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -77,6 +80,12 @@ pub enum SameEffectsTipRejectionError {
 pub enum SameEffectsChainRejectionError {
     #[error("best chain tip has reached transaction expiry height")]
     Expired,
+
+    #[error("transaction inputs were spent, or nullifiers were revealed, in the best chain")]
+    DuplicateSpend,
+
+    #[error("transaction was committed to the best chain")]
+    Mined,
 
     /// Otherwise valid transaction removed from mempool due to [ZIP-401] random
     /// eviction.
@@ -179,6 +188,13 @@ impl Storage {
 
         // First, check if we have a cached rejection for this transaction.
         if let Some(error) = self.rejection_error(&tx_id) {
+            tracing::trace!(
+                ?tx_id,
+                ?error,
+                stored_transaction_count = ?self.verified.transaction_count(),
+                "returning cached error for transaction",
+            );
+
             return Err(error);
         }
 
@@ -187,12 +203,25 @@ impl Storage {
         // Security: transactions must not get refreshed by new queries,
         // because that allows malicious peers to keep transactions live forever.
         if self.verified.contains(&tx_id) {
+            tracing::trace!(
+                ?tx_id,
+                stored_transaction_count = ?self.verified.transaction_count(),
+                "returning InMempool error for transaction that is already in the mempool",
+            );
+
             return Err(MempoolError::InMempool);
         }
 
         // Then, we try to insert into the pool. If this fails the transaction is rejected.
         let mut result = Ok(tx_id);
         if let Err(rejection_error) = self.verified.insert(tx) {
+            tracing::debug!(
+                ?tx_id,
+                ?rejection_error,
+                stored_transaction_count = ?self.verified.transaction_count(),
+                "insertion error for transaction",
+            );
+
             // We could return here, but we still want to check the mempool size
             self.reject(tx_id, rejection_error.clone().into());
             result = Err(rejection_error.into());
@@ -256,22 +285,89 @@ impl Storage {
             .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id))
     }
 
-    /// Remove transactions from the mempool via non-malleable [`transaction::Hash`].
+    /// Reject and remove transactions from the mempool via non-malleable [`transaction::Hash`].
+    /// - For v5 transactions, transactions are matched by TXID,
+    ///   using only the non-malleable transaction ID.
+    ///   This matches any transaction with the same effect on the blockchain state,
+    ///   even if its signatures and proofs are different.
+    /// - Returns the number of transactions which were removed.
+    /// - Removes from the 'verified' set, if present.
+    ///   Maintains the order in which the other unmined transactions have been inserted into the mempool.
     ///
-    /// For v5 transactions, transactions are matched by TXID,
-    /// using only the non-malleable transaction ID.
-    /// This matches any transaction with the same effect on the blockchain state,
-    /// even if its signatures and proofs are different.
+    /// Reject and remove transactions from the mempool that contain any outpoints or nullifiers in
+    /// the `spent_outpoints` or `nullifiers` collections that are passed in.
     ///
-    /// Returns the number of transactions which were removed.
-    ///
-    /// Removes from the 'verified' set, if present.
-    /// Maintains the order in which the other unmined transactions have been inserted into the mempool.
-    ///
-    /// Does not add or remove from the 'rejected' tracking set.
-    pub fn remove_same_effects(&mut self, mined_ids: &HashSet<transaction::Hash>) -> usize {
-        self.verified
-            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id.mined_id()))
+    /// Returns the number of transactions that were removed.
+    pub fn reject_and_remove_same_effects(
+        &mut self,
+        mined_ids: &HashSet<transaction::Hash>,
+        transactions: Vec<Arc<Transaction>>,
+    ) -> usize {
+        let num_removed_mined = self
+            .verified
+            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id.mined_id()));
+
+        let spent_outpoints: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.spent_outpoints())
+            .collect();
+        let sprout_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.sprout_nullifiers())
+            .collect();
+        let sapling_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.sapling_nullifiers())
+            .collect();
+        let orchard_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.orchard_nullifiers())
+            .collect();
+
+        let duplicate_spend_ids: HashSet<_> = self
+            .verified
+            .transactions()
+            .filter_map(|tx| {
+                (tx.transaction
+                    .spent_outpoints()
+                    .any(|outpoint| spent_outpoints.contains(&outpoint))
+                    || tx
+                        .transaction
+                        .sprout_nullifiers()
+                        .any(|nullifier| sprout_nullifiers.contains(nullifier))
+                    || tx
+                        .transaction
+                        .sapling_nullifiers()
+                        .any(|nullifier| sapling_nullifiers.contains(nullifier))
+                    || tx
+                        .transaction
+                        .orchard_nullifiers()
+                        .any(|nullifier| orchard_nullifiers.contains(nullifier)))
+                .then_some(tx.id)
+            })
+            .collect();
+
+        let num_removed_duplicate_spend = self
+            .verified
+            .remove_all_that(|tx| duplicate_spend_ids.contains(&tx.transaction.id));
+
+        for &mined_id in mined_ids {
+            self.reject(
+                // the reject and rejection_error fns that store and check `SameEffectsChainRejectionError`s
+                // only use the mined id, so using `Legacy` ids will apply to v5 transactions as well.
+                UnminedTxId::Legacy(mined_id),
+                SameEffectsChainRejectionError::Mined.into(),
+            );
+        }
+
+        for duplicate_spend_id in duplicate_spend_ids {
+            self.reject(
+                duplicate_spend_id,
+                SameEffectsChainRejectionError::DuplicateSpend.into(),
+            );
+        }
+
+        num_removed_mined + num_removed_duplicate_spend
     }
 
     /// Clears the whole mempool storage.
@@ -314,9 +410,21 @@ impl Storage {
         self.verified.transactions().map(|tx| tx.id)
     }
 
-    /// Returns the set of [`UnminedTx`]s in the mempool.
+    /// Returns an iterator over the [`UnminedTx`]s in the mempool.
+    //
+    // TODO: make the transactions() method return VerifiedUnminedTx,
+    //       and remove the full_transactions() method
     pub fn transactions(&self) -> impl Iterator<Item = &UnminedTx> {
         self.verified.transactions()
+    }
+
+    /// Returns an iterator over the [`VerifiedUnminedTx`] in the set.
+    ///
+    /// Each [`VerifiedUnminedTx`] contains an [`UnminedTx`],
+    /// and adds extra fields from the transaction verifier result.
+    #[allow(dead_code)]
+    pub fn full_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> + '_ {
+        self.verified.full_transactions()
     }
 
     /// Returns the number of transactions in the mempool.
@@ -500,7 +608,8 @@ impl Storage {
         }
 
         // expiry height is effecting data, so we match by non-malleable TXID
-        self.remove_same_effects(&txid_set);
+        self.verified
+            .remove_all_that(|tx| txid_set.contains(&tx.transaction.id.mined_id()));
 
         // also reject it
         for id in unmined_id_set.iter() {

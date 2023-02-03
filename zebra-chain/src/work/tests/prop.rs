@@ -1,11 +1,13 @@
 //! Randomised property tests for Proof of Work.
 
-use proptest::{arbitrary::any, prelude::*, test_runner::Config};
-
 use std::{env, sync::Arc};
 
-use crate::block::{self, Block};
-use crate::serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize};
+use proptest::{arbitrary::any, prelude::*, test_runner::Config};
+
+use crate::{
+    block::{self, Block},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+};
 
 use super::super::*;
 
@@ -71,12 +73,12 @@ prop_compose! {
     fn randomized_nonce(real_header: block::Header)
         (fake_nonce in proptest::array::uniform32(any::<u8>())
             .prop_filter("nonce must not be the actual nonce", move |fake_nonce| {
-                fake_nonce != &real_header.nonce
+                fake_nonce != &real_header.nonce.0
             })
         ) -> Arc<block::Header> {
 
         let mut fake_header = real_header;
-        fake_header.nonce = fake_nonce;
+        fake_header.nonce = fake_nonce.into();
 
         Arc::new(fake_header)
     }

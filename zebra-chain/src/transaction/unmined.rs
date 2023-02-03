@@ -17,9 +17,6 @@
 
 use std::{fmt, sync::Arc};
 
-#[cfg(any(test, feature = "proptest-impl"))]
-use proptest_derive::Arbitrary;
-
 use crate::{
     amount::{Amount, NonNegative},
     serialization::ZcashSerialize,
@@ -31,6 +28,15 @@ use crate::{
 };
 
 use UnminedTxId::*;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest_derive::Arbitrary;
+
+// Documentation-only
+#[allow(unused_imports)]
+use crate::block::MAX_BLOCK_BYTES;
+
+mod zip317;
 
 /// The minimum cost value for a transaction in the mempool.
 ///
@@ -49,6 +55,12 @@ use UnminedTxId::*;
 ///
 /// [ZIP-401]: https://zips.z.cash/zip-0401
 const MEMPOOL_TRANSACTION_COST_THRESHOLD: u64 = 4000;
+
+/// When a transaction pays a fee less than the conventional fee,
+/// this low fee penalty is added to its cost for mempool eviction.
+///
+/// See [VerifiedUnminedTx::eviction_weight()] for details.
+const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 16_000;
 
 /// A unique identifier for an unmined transaction, regardless of version.
 ///
@@ -193,21 +205,27 @@ impl UnminedTxId {
 /// (But it might still need semantic or contextual verification.)
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnminedTx {
-    /// A unique identifier for this unmined transaction.
-    pub id: UnminedTxId,
-
     /// The unmined transaction itself.
     pub transaction: Arc<Transaction>,
 
+    /// A unique identifier for this unmined transaction.
+    pub id: UnminedTxId,
+
     /// The size in bytes of the serialized transaction data
     pub size: usize,
+
+    /// The conventional fee for this transaction, as defined by [ZIP-317].
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
+    pub conventional_fee: Amount<NonNegative>,
 }
 
 impl fmt::Display for UnminedTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnminedTx")
-            .field("transaction", &self.transaction)
+            .field("transaction", &self.transaction.to_string())
             .field("serialized_size", &self.size)
+            .field("conventional_fee", &self.conventional_fee)
             .finish()
     }
 }
@@ -217,15 +235,15 @@ impl fmt::Display for UnminedTx {
 
 impl From<Transaction> for UnminedTx {
     fn from(transaction: Transaction) -> Self {
-        let size = transaction.zcash_serialized_size().expect(
-            "unexpected serialization failure: all structurally valid transactions have a size",
-        );
+        let size = transaction.zcash_serialized_size();
+        let conventional_fee = zip317::conventional_fee(&transaction);
 
         // The borrow is actually needed to avoid taking ownership
         #[allow(clippy::needless_borrow)]
         Self {
             id: (&transaction).into(),
             size,
+            conventional_fee,
             transaction: Arc::new(transaction),
         }
     }
@@ -233,42 +251,42 @@ impl From<Transaction> for UnminedTx {
 
 impl From<&Transaction> for UnminedTx {
     fn from(transaction: &Transaction) -> Self {
-        let size = transaction.zcash_serialized_size().expect(
-            "unexpected serialization failure: all structurally valid transactions have a size",
-        );
+        let size = transaction.zcash_serialized_size();
+        let conventional_fee = zip317::conventional_fee(transaction);
 
         Self {
             id: transaction.into(),
-            transaction: Arc::new(transaction.clone()),
             size,
+            conventional_fee,
+            transaction: Arc::new(transaction.clone()),
         }
     }
 }
 
 impl From<Arc<Transaction>> for UnminedTx {
     fn from(transaction: Arc<Transaction>) -> Self {
-        let size = transaction.zcash_serialized_size().expect(
-            "unexpected serialization failure: all structurally valid transactions have a size",
-        );
+        let size = transaction.zcash_serialized_size();
+        let conventional_fee = zip317::conventional_fee(&transaction);
 
         Self {
             id: transaction.as_ref().into(),
-            transaction,
             size,
+            conventional_fee,
+            transaction,
         }
     }
 }
 
 impl From<&Arc<Transaction>> for UnminedTx {
     fn from(transaction: &Arc<Transaction>) -> Self {
-        let size = transaction.zcash_serialized_size().expect(
-            "unexpected serialization failure: all structurally valid transactions have a size",
-        );
+        let size = transaction.zcash_serialized_size();
+        let conventional_fee = zip317::conventional_fee(transaction);
 
         Self {
             id: transaction.as_ref().into(),
-            transaction: transaction.clone(),
             size,
+            conventional_fee,
+            transaction: transaction.clone(),
         }
     }
 }
@@ -276,7 +294,7 @@ impl From<&Arc<Transaction>> for UnminedTx {
 /// A verified unmined transaction, and the corresponding transaction fee.
 ///
 /// This transaction has been fully verified, in the context of the mempool.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct VerifiedUnminedTx {
     /// The unmined transaction.
@@ -284,24 +302,65 @@ pub struct VerifiedUnminedTx {
 
     /// The transaction fee for this unmined transaction.
     pub miner_fee: Amount<NonNegative>,
+
+    /// The number of legacy signature operations in this transaction's
+    /// transparent inputs and outputs.
+    pub legacy_sigop_count: u64,
+
+    /// The number of unpaid actions for `transaction`,
+    /// as defined by [ZIP-317] for block production.
+    ///
+    /// The number of actions is limited by [`MAX_BLOCK_BYTES`], so it fits in a u32.
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
+    pub unpaid_actions: u32,
+
+    /// The fee weight ratio for `transaction`, as defined by [ZIP-317] for block production.
+    ///
+    /// This is not consensus-critical, so we use `f32` for efficient calculations
+    /// when the mempool holds a large number of transactions.
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
+    pub fee_weight_ratio: f32,
 }
 
 impl fmt::Display for VerifiedUnminedTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifiedUnminedTx")
-            .field("transaction", &self.transaction)
+            .field("transaction", &self.transaction.to_string())
             .field("miner_fee", &self.miner_fee)
+            .field("legacy_sigop_count", &self.legacy_sigop_count)
+            .field("unpaid_actions", &self.unpaid_actions)
+            .field("fee_weight_ratio", &self.fee_weight_ratio)
             .finish()
     }
 }
 
 impl VerifiedUnminedTx {
-    /// Create a new verified unmined transaction from a transaction and its fee.
-    pub fn new(transaction: UnminedTx, miner_fee: Amount<NonNegative>) -> Self {
+    /// Create a new verified unmined transaction from an unmined transaction,
+    /// its miner fee, and its legacy sigop count.
+    pub fn new(
+        transaction: UnminedTx,
+        miner_fee: Amount<NonNegative>,
+        legacy_sigop_count: u64,
+    ) -> Self {
+        let fee_weight_ratio = zip317::conventional_fee_weight_ratio(&transaction, miner_fee);
+        let unpaid_actions = zip317::unpaid_actions(&transaction, miner_fee);
+
         Self {
             transaction,
             miner_fee,
+            legacy_sigop_count,
+            fee_weight_ratio,
+            unpaid_actions,
         }
+    }
+
+    /// Returns `true` if the transaction pays at least the [ZIP-317] conventional fee.
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#mempool-size-limiting
+    pub fn pays_conventional_fee(&self) -> bool {
+        self.miner_fee >= self.transaction.conventional_fee
     }
 
     /// The cost in bytes of the transaction, as defined in [ZIP-401].
@@ -317,31 +376,34 @@ impl VerifiedUnminedTx {
     /// [ZIP-401]: https://zips.z.cash/zip-0401
     pub fn cost(&self) -> u64 {
         std::cmp::max(
-            self.transaction.size as u64,
+            u64::try_from(self.transaction.size).expect("fits in u64"),
             MEMPOOL_TRANSACTION_COST_THRESHOLD,
         )
     }
 
     /// The computed _eviction weight_ of a verified unmined transaction as part
-    /// of the mempool set.
+    /// of the mempool set, as defined in [ZIP-317] and [ZIP-401].
     ///
-    /// Consensus rule:
+    /// Standard rule:
     ///
     /// > Each transaction also has an eviction weight, which is cost +
     /// > low_fee_penalty, where low_fee_penalty is 16000 if the transaction pays
-    /// > a fee less than the conventional fee, otherwise 0. The conventional fee
-    /// > is currently defined as 1000 zatoshis
+    /// > a fee less than the conventional fee, otherwise 0.
     ///
+    /// > zcashd and zebrad limit the size of the mempool as described in [ZIP-401].
+    /// > This specifies a low fee penalty that is added to the "eviction weight" if the transaction
+    /// > pays a fee less than the conventional transaction fee. This threshold is
+    /// > modified to use the new conventional fee formula.
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#mempool-size-limiting
     /// [ZIP-401]: https://zips.z.cash/zip-0401
-    pub fn eviction_weight(self) -> u64 {
-        let conventional_fee = 1000;
+    pub fn eviction_weight(&self) -> u64 {
+        let mut cost = self.cost();
 
-        let low_fee_penalty = if u64::from(self.miner_fee) < conventional_fee {
-            16_000
-        } else {
-            0
-        };
+        if !self.pays_conventional_fee() {
+            cost += MEMPOOL_TRANSACTION_LOW_FEE_PENALTY
+        }
 
-        self.cost() + low_fee_penalty
+        cost
     }
 }

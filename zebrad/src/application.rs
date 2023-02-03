@@ -1,19 +1,29 @@
 //! Zebrad Abscissa Application
 
+mod entry_point;
+use self::entry_point::EntryPoint;
+
 use std::{fmt::Write as _, io::Write as _, process};
 
 use abscissa_core::{
-    application::{self, fatal_error, AppCell},
+    application::{self, AppCell},
     config::{self, Configurable},
     status_err,
     terminal::{component::Terminal, stderr, stdout, ColorChoice},
-    Application, Component, EntryPoint, FrameworkError, Shutdown, StandardPaths, Version,
+    Application, Component, FrameworkError, Shutdown, StandardPaths, Version,
 };
 
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::constants::{DATABASE_FORMAT_VERSION, LOCK_FILE_ERROR};
 
 use crate::{commands::ZebradCmd, components::tracing::Tracing, config::ZebradConfig};
+
+/// See <https://docs.rs/abscissa_core/latest/src/abscissa_core/application/exit.rs.html#7-10>
+/// Print a fatal error message and exit
+fn fatal_error(app_name: String, err: &dyn std::error::Error) -> ! {
+    status_err!("{} fatal error: {}", app_name, err);
+    process::exit(1)
+}
 
 /// Application state
 pub static APPLICATION: AppCell<ZebradApp> = AppCell::new();
@@ -62,30 +72,22 @@ pub fn app_version() -> Version {
                 // assume it's a cargo package version or a git tag with no hash
                 [_] | [_, _] => vergen_git_semver.parse().unwrap_or_else(|_| {
                     panic!(
-                        "VERGEN_GIT_SEMVER without a hash {:?} must be valid semver 2.0",
-                        vergen_git_semver
+                        "VERGEN_GIT_SEMVER without a hash {vergen_git_semver:?} must be valid semver 2.0"
                     )
                 }),
 
                 // it's the "git semver" format, which doesn't quite match SemVer 2.0
                 [hash, commit_count, tag] => {
-                    let semver_fix = format!("{}+{}.{}", tag, commit_count, hash);
+                    let semver_fix = format!("{tag}+{commit_count}.{hash}");
                     semver_fix.parse().unwrap_or_else(|_|
-                                                      panic!("Modified VERGEN_GIT_SEMVER {:?} -> {:?} -> {:?} must be valid. Note: CARGO_PKG_VERSION was {:?}.",
-                                                             vergen_git_semver,
-                                                             rparts,
-                                                             semver_fix,
-                                                             CARGO_PKG_VERSION))
+                                                      panic!("Modified VERGEN_GIT_SEMVER {vergen_git_semver:?} -> {rparts:?} -> {semver_fix:?} must be valid. Note: CARGO_PKG_VERSION was {CARGO_PKG_VERSION:?}."))
                 }
 
                 _ => unreachable!("split is limited to 3 parts"),
             }
         }
         _ => CARGO_PKG_VERSION.parse().unwrap_or_else(|_| {
-            panic!(
-                "CARGO_PKG_VERSION {:?} must be valid semver 2.0",
-                CARGO_PKG_VERSION
-            )
+            panic!("CARGO_PKG_VERSION {CARGO_PKG_VERSION:?} must be valid semver 2.0")
         }),
     }
 }
@@ -138,7 +140,7 @@ impl Default for ZebradApp {
 
 impl Application for ZebradApp {
     /// Entrypoint command for this application.
-    type Cmd = EntryPoint<ZebradCmd>;
+    type Cmd = EntryPoint;
 
     /// Application configuration.
     type Cfg = ZebradConfig;
@@ -270,13 +272,13 @@ impl Application for ZebradApp {
         let mut metadata_section = "Metadata:".to_string();
         for (k, v) in panic_metadata {
             builder = builder.add_issue_metadata(k, v.clone());
-            write!(&mut metadata_section, "\n{}: {}", k, &v)
+            write!(&mut metadata_section, "\n{k}: {}", &v)
                 .expect("unexpected failure writing to string");
         }
 
         builder = builder
             .theme(theme)
-            .panic_section(metadata_section)
+            .panic_section(metadata_section.clone())
             .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
             .issue_filter(|kind| match kind {
                 color_eyre::ErrorKind::NonRecoverable(error) => {
@@ -330,7 +332,7 @@ impl Application for ZebradApp {
 
         std::panic::set_hook(Box::new(move |panic_info| {
             let panic_report = panic_hook.panic_report(panic_info);
-            eprintln!("{}", panic_report);
+            eprintln!("{panic_report}");
 
             #[cfg(feature = "sentry")]
             {
@@ -352,7 +354,7 @@ impl Application for ZebradApp {
         //   when that crate is being used by itself?
         rayon::ThreadPoolBuilder::new()
             .num_threads(config.sync.parallel_cpu_threads)
-            .thread_name(|thread_index| format!("rayon {}", thread_index))
+            .thread_name(|thread_index| format!("rayon {thread_index}"))
             .build_global()
             .expect("unable to initialize rayon thread pool");
 
@@ -366,7 +368,7 @@ impl Application for ZebradApp {
         let default_filter = command
             .command
             .as_ref()
-            .map(|zcmd| zcmd.default_tracing_filter(command.verbose))
+            .map(|zcmd| zcmd.default_tracing_filter(command.verbose, command.help))
             .unwrap_or("warn");
         let is_server = command
             .command
@@ -376,6 +378,7 @@ impl Application for ZebradApp {
 
         // Ignore the configured tracing filter for short-lived utility commands
         let mut tracing_config = cfg_ref.tracing.clone();
+        let metrics_config = cfg_ref.metrics.clone();
         if is_server {
             // Override the default tracing filter based on the command-line verbosity.
             tracing_config.filter = tracing_config
@@ -387,6 +390,12 @@ impl Application for ZebradApp {
             tracing_config.flamegraph = None;
         }
         components.push(Box::new(Tracing::new(tracing_config)?));
+
+        // Log git metadata and platform info when zebrad starts up
+        if is_server {
+            tracing::info!("Diagnostic {}", metadata_section);
+            info!(config_path = ?command.config_path(), config = ?cfg_ref, "loaded zebrad config");
+        }
 
         // Activate the global span, so it's visible when we load the other
         // components. Space is at a premium here, so we use an empty message,
@@ -411,7 +420,7 @@ impl Application for ZebradApp {
         if is_server {
             components.push(Box::new(TokioComponent::new()?));
             components.push(Box::new(TracingEndpoint::new(cfg_ref)?));
-            components.push(Box::new(MetricsEndpoint::new(cfg_ref)?));
+            components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
         }
 
         self.state.components.register(components)
@@ -459,7 +468,11 @@ impl Application for ZebradApp {
         let _ = stderr().lock().flush();
 
         if let Err(e) = self.state().components.shutdown(self, shutdown) {
-            fatal_error(self, &e)
+            let app_name = self.name().to_string();
+
+            // Swap out a fake app so we can trigger the destructor on the original
+            let _ = std::mem::take(self);
+            fatal_error(app_name, &e);
         }
 
         // Swap out a fake app so we can trigger the destructor on the original

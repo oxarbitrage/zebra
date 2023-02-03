@@ -1,4 +1,9 @@
 //! Snapshot tests for Zebra JSON-RPC responses.
+//!
+//! To update these snapshots, run:
+//! ```sh
+//! cargo insta test --review
+//! ```
 
 use std::sync::Arc;
 
@@ -10,10 +15,12 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zebra_network::constants::USER_AGENT;
-use zebra_node_services::BoxError;
 use zebra_test::mock_service::MockService;
 
 use super::super::*;
+
+#[cfg(feature = "getblocktemplate-rpcs")]
+mod get_block_template_rpcs;
 
 /// Snapshot test for RPC methods responses.
 #[tokio::test(flavor = "multi_thread")]
@@ -36,23 +43,37 @@ async fn test_rpc_response_data_for_network(network: Network) {
         .map(|(_height, block_bytes)| block_bytes.zcash_deserialize_into().unwrap())
         .collect();
 
-    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut mempool: MockService<_, _, _, zebra_node_services::BoxError> =
+        MockService::build().for_unit_tests();
     // Create a populated state service
-    let (_state, read_state, latest_chain_tip, _chain_tip_change) =
+    #[cfg_attr(not(feature = "getblocktemplate-rpcs"), allow(unused_variables))]
+    let (state, read_state, latest_chain_tip, _chain_tip_change) =
         zebra_state::populated_state(blocks.clone(), network).await;
-
-    // Init RPC
-    let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
-        Buffer::new(mempool.clone(), 1),
-        read_state,
-        latest_chain_tip,
-        network,
-    );
 
     // Start snapshots of RPC responses.
     let mut settings = insta::Settings::clone_current();
     settings.set_snapshot_suffix(format!("{}_{}", network_string(network), blocks.len() - 1));
+
+    // Test getblocktemplate-rpcs snapshots
+    #[cfg(feature = "getblocktemplate-rpcs")]
+    get_block_template_rpcs::test_responses(
+        network,
+        mempool.clone(),
+        state,
+        read_state.clone(),
+        settings.clone(),
+    )
+    .await;
+
+    // Init RPC
+    let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
+        "RPC test",
+        network,
+        false,
+        Buffer::new(mempool.clone(), 1),
+        read_state,
+        latest_chain_tip,
+    );
 
     // `getinfo`
     let get_info = rpc.get_info().expect("We should have a GetInfo struct");
@@ -85,22 +106,29 @@ async fn test_rpc_response_data_for_network(network: Network) {
     // `getblock`, verbosity=0
     const BLOCK_HEIGHT: u32 = 1;
     let get_block = rpc
-        .get_block(BLOCK_HEIGHT.to_string(), 0u8)
+        .get_block(BLOCK_HEIGHT.to_string(), Some(0u8))
         .await
         .expect("We should have a GetBlock struct");
     snapshot_rpc_getblock(get_block, block_data.get(&BLOCK_HEIGHT).unwrap(), &settings);
 
     // `getblock`, verbosity=1
     let get_block = rpc
-        .get_block(BLOCK_HEIGHT.to_string(), 1u8)
+        .get_block(BLOCK_HEIGHT.to_string(), Some(1u8))
         .await
         .expect("We should have a GetBlock struct");
-    snapshot_rpc_getblock_verbose(get_block, &settings);
+    snapshot_rpc_getblock_verbose("2_args", get_block, &settings);
+
+    // `getblock`, no verbosity, defaults to 1
+    let get_block = rpc
+        .get_block(BLOCK_HEIGHT.to_string(), None)
+        .await
+        .expect("We should have a GetBlock struct");
+    snapshot_rpc_getblock_verbose("1_arg", get_block, &settings);
 
     // `getbestblockhash`
     let get_best_block_hash = rpc
         .get_best_block_hash()
-        .expect("We should have a GetBestBlockHash struct");
+        .expect("We should have a GetBlockHash struct");
     snapshot_rpc_getbestblockhash(get_best_block_hash, &settings);
 
     // `getrawmempool`
@@ -108,8 +136,17 @@ async fn test_rpc_response_data_for_network(network: Network) {
     // - a request to get all mempool transactions will be made by `getrawmempool` behind the scenes.
     // - as we have the mempool mocked we need to expect a request and wait for a response,
     // which will be an empty mempool in this case.
+    // Note: this depends on `SHOULD_USE_ZCASHD_ORDER` being true.
+    #[cfg(feature = "getblocktemplate-rpcs")]
     let mempool_req = mempool
-        .expect_request_that(|_request| true)
+        .expect_request_that(|request| matches!(request, mempool::Request::FullTransactions))
+        .map(|responder| {
+            responder.respond(mempool::Response::FullTransactions(vec![]));
+        });
+
+    #[cfg(not(feature = "getblocktemplate-rpcs"))]
+    let mempool_req = mempool
+        .expect_request_that(|request| matches!(request, mempool::Request::TransactionIds))
         .map(|responder| {
             responder.respond(mempool::Response::TransactionIds(
                 std::collections::HashSet::new(),
@@ -133,9 +170,11 @@ async fn test_rpc_response_data_for_network(network: Network) {
     // `getrawtransaction`
     //
     // - similar to `getrawmempool` described above, a mempool request will be made to get the requested
-    // transaction from the mempoo, response will be empty as we have this transaction in state
+    // transaction from the mempool, response will be empty as we have this transaction in state
     let mempool_req = mempool
-        .expect_request_that(|_request| true)
+        .expect_request_that(|request| {
+            matches!(request, mempool::Request::TransactionsByMinedId(_))
+        })
         .map(|responder| {
             responder.respond(mempool::Response::Transactions(vec![]));
         });
@@ -219,12 +258,16 @@ fn snapshot_rpc_getblock(block: GetBlock, block_data: &[u8], settings: &insta::S
 }
 
 /// Check `getblock` response with verbosity=1, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_getblock_verbose(block: GetBlock, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_block_verbose", block));
+fn snapshot_rpc_getblock_verbose(
+    variant: &'static str,
+    block: GetBlock,
+    settings: &insta::Settings,
+) {
+    settings.bind(|| insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block));
 }
 
 /// Snapshot `getbestblockhash` response, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_getbestblockhash(tip_hash: GetBestBlockHash, settings: &insta::Settings) {
+fn snapshot_rpc_getbestblockhash(tip_hash: GetBlockHash, settings: &insta::Settings) {
     settings.bind(|| insta::assert_json_snapshot!("get_best_block_hash", tip_hash));
 }
 

@@ -5,15 +5,14 @@ use std::{borrow::Borrow, convert::TryInto, io, sync::Arc};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
+use hex::FromHex;
+use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
 use crate::{
     amount,
     block::MAX_BLOCK_BYTES,
     parameters::{OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID, TX_V5_VERSION_GROUP_ID},
-    primitives::{
-        redpallas::{Binding, Signature, SpendAuth},
-        Groth16Proof, Halo2Proof, ZkSnarkProof,
-    },
+    primitives::{Groth16Proof, Halo2Proof, ZkSnarkProof},
     serialization::{
         zcash_deserialize_external_count, zcash_serialize_empty_list,
         zcash_serialize_external_count, AtLeastOne, ReadZcashExt, SerializationError,
@@ -252,7 +251,7 @@ impl ZcashDeserialize for Option<sapling::ShieldedData<SharedAnchor>> {
         //
         // # Consensus
         //
-        // > Elements of a Output description MUST be valid encodings of the types given above.
+        // > Elements of an Output description MUST be valid encodings of the types given above.
         //
         // https://zips.z.cash/protocol/protocol.pdf#outputdesc
         //
@@ -444,6 +443,19 @@ impl ZcashDeserialize for Option<orchard::ShieldedData> {
             actions,
             binding_sig,
         }))
+    }
+}
+
+impl<T: reddsa::SigType> ZcashSerialize for reddsa::Signature<T> {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_all(&<[u8; 64]>::from(*self)[..])?;
+        Ok(())
+    }
+}
+
+impl<T: reddsa::SigType> ZcashDeserialize for reddsa::Signature<T> {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        Ok(reader.read_64_bytes()?.into())
     }
 }
 
@@ -872,11 +884,16 @@ impl ZcashDeserialize for Transaction {
                 }
                 // Denoted as `nConsensusBranchId` in the spec.
                 // Convert it to a NetworkUpgrade
+                //
+                // Clippy 1.64 is wrong here, this lazy evaluation is necessary, constructors are functions. This is fixed in 1.66.
+                #[allow(clippy::unnecessary_lazy_evaluations)]
                 let network_upgrade =
                     NetworkUpgrade::from_branch_id(limited_reader.read_u32::<LittleEndian>()?)
-                        .ok_or(SerializationError::Parse(
-                            "expected a valid network upgrade from the consensus branch id",
-                        ))?;
+                        .ok_or_else(|| {
+                            SerializationError::Parse(
+                                "expected a valid network upgrade from the consensus branch id",
+                            )
+                        })?;
 
                 // Denoted as `lock_time` in the spec.
                 let lock_time = LockTime::zcash_deserialize(&mut limited_reader)?;
@@ -984,9 +1001,25 @@ impl TrustedPreallocate for transparent::Output {
 /// A serialized transaction.
 ///
 /// Stores bytes that are guaranteed to be deserializable into a [`Transaction`].
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+///
+/// Sorts in lexicographic order of the transaction's serialized data.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SerializedTransaction {
     bytes: Vec<u8>,
+}
+
+impl fmt::Display for SerializedTransaction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&hex::encode(&self.bytes))
+    }
+}
+
+impl fmt::Debug for SerializedTransaction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("SerializedTransaction")
+            .field(&hex::encode(&self.bytes))
+            .finish()
+    }
 }
 
 /// Build a [`SerializedTransaction`] by serializing a block.
@@ -1011,5 +1044,15 @@ impl AsRef<[u8]> for SerializedTransaction {
 impl From<Vec<u8>> for SerializedTransaction {
     fn from(bytes: Vec<u8>) -> Self {
         Self { bytes }
+    }
+}
+
+impl FromHex for SerializedTransaction {
+    type Error = <Vec<u8> as FromHex>::Error;
+
+    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
+        let bytes = <Vec<u8>>::from_hex(hex)?;
+
+        Ok(bytes.into())
     }
 }

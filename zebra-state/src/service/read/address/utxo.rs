@@ -1,4 +1,15 @@
 //! Transparent address index UTXO queries.
+//!
+//! In the functions in this module:
+//!
+//! The block write task commits blocks to the finalized state before updating
+//! `chain` with a cached copy of the best non-finalized chain from
+//! `NonFinalizedState.chain_set`. Then the block commit task can commit additional blocks to
+//! the finalized state after we've cloned the `chain`.
+//!
+//! This means that some blocks can be in both:
+//! - the cached [`Chain`], and
+//! - the shared finalized [`ZebraDb`] reference.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -8,11 +19,11 @@ use std::{
 use zebra_chain::{block::Height, parameters::Network, transaction, transparent};
 
 use crate::{
-    service::{finalized_state::ZebraDb, non_finalized_state::Chain},
+    service::{
+        finalized_state::ZebraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
+    },
     BoxError, OutputLocation, TransactionLocation,
 };
-
-use super::FINALIZED_ADDRESS_INDEX_RETRIES;
 
 /// The full range of address heights.
 ///
@@ -83,7 +94,7 @@ impl AddressUtxos {
 ///
 /// If the addresses do not exist in the non-finalized `chain` or finalized `db`,
 /// returns an empty list.
-pub fn transparent_utxos<C>(
+pub fn address_utxos<C>(
     network: Network,
     chain: Option<C>,
     db: &ZebraDb,
@@ -97,10 +108,12 @@ where
 
     // Retry the finalized UTXO query if it was interrupted by a finalizing block,
     // and the non-finalized chain doesn't overlap the changed heights.
-    for attempt in 0..=FINALIZED_ADDRESS_INDEX_RETRIES {
+    //
+    // TODO: refactor this into a generic retry(finalized_closure, process_and_check_closure) fn
+    for attempt in 0..=FINALIZED_STATE_QUERY_RETRIES {
         debug!(?attempt, ?address_count, "starting address UTXO query");
 
-        let (finalized_utxos, finalized_tip_range) = finalized_transparent_utxos(db, &addresses);
+        let (finalized_utxos, finalized_tip_range) = finalized_address_utxos(db, &addresses);
 
         debug!(
             finalized_utxo_count = ?finalized_utxos.len(),
@@ -162,7 +175,7 @@ where
 /// If the addresses do not exist in the finalized `db`, returns an empty list.
 //
 // TODO: turn the return type into a struct?
-fn finalized_transparent_utxos(
+fn finalized_address_utxos(
     db: &ZebraDb,
     addresses: &HashSet<transparent::Address>,
 ) -> (
@@ -176,7 +189,7 @@ fn finalized_transparent_utxos(
     // Check if the finalized state changed while we were querying it
     let start_finalized_tip = db.finalized_tip_height();
 
-    let finalized_utxos = db.partial_finalized_transparent_utxos(addresses);
+    let finalized_utxos = db.partial_finalized_address_utxos(addresses);
 
     let end_finalized_tip = db.finalized_tip_height();
 
@@ -234,10 +247,7 @@ where
 
     // # Correctness
     //
-    // The StateService commits blocks to the finalized state before updating the latest chain,
-    // and it can commit additional blocks after we've cloned this `chain` variable.
-    //
-    // But we can compensate for deleted UTXOs by applying the overlapping non-finalized UTXO changes.
+    // We can compensate for deleted UTXOs by applying the overlapping non-finalized UTXO changes.
 
     // Check if the finalized and non-finalized states match or overlap
     let required_min_non_finalized_root = finalized_tip_range.start().0 + 1;

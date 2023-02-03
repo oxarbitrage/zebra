@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use zebra_chain::{amount, block, orchard, sapling, sprout, transparent};
+use zebra_state::ValidateContextError;
 
 use crate::{block::MAX_BLOCK_SIGOPS, BoxError};
 
@@ -148,7 +149,7 @@ pub enum TransactionError {
 
     #[error("Orchard bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash")]
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    RedPallas(zebra_chain::primitives::redpallas::Error),
+    RedPallas(zebra_chain::primitives::reddsa::Error),
 
     // temporary error type until #1186 is fixed
     #[error("Downcast from BoxError to redjubjub::Error failed")]
@@ -177,13 +178,38 @@ pub enum TransactionError {
 
     #[error("must have at least one active orchard flag")]
     NotEnoughFlags,
+
+    #[error("could not find a mempool transaction input UTXO in the best chain")]
+    TransparentInputNotFound,
+
+    #[error("could not validate nullifiers and anchors on best chain")]
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    // This error variant is at least 128 bytes
+    ValidateNullifiersAndAnchorsError(Box<ValidateContextError>),
+
+    #[error("could not validate mempool transaction lock time on best chain")]
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    // TODO: turn this into a typed error
+    ValidateMempoolLockTimeError(String),
 }
 
+impl From<ValidateContextError> for TransactionError {
+    fn from(err: ValidateContextError) -> Self {
+        TransactionError::ValidateNullifiersAndAnchorsError(Box::new(err))
+    }
+}
+
+// TODO: use a dedicated variant and From impl for each concrete type, and update callers (#5732)
 impl From<BoxError> for TransactionError {
     fn from(mut err: BoxError) -> Self {
         // TODO: handle redpallas::Error, ScriptInvalid, InvalidSignature
         match err.downcast::<zebra_chain::primitives::redjubjub::Error>() {
             Ok(e) => return TransactionError::RedJubjub(*e),
+            Err(e) => err = e,
+        }
+
+        match err.downcast::<ValidateContextError>() {
+            Ok(e) => return (*e).into(),
             Err(e) => err = e,
         }
 
@@ -194,15 +220,8 @@ impl From<BoxError> for TransactionError {
         }
 
         TransactionError::InternalDowncastError(format!(
-            "downcast to known transaction error type failed, original error: {:?}",
-            err,
+            "downcast to known transaction error type failed, original error: {err:?}",
         ))
-    }
-}
-
-impl From<SubsidyError> for BlockError {
-    fn from(err: SubsidyError) -> BlockError {
-        BlockError::Transaction(TransactionError::Subsidy(err))
     }
 }
 
@@ -277,4 +296,18 @@ pub enum BlockError {
         hash: zebra_chain::block::Hash,
         source: amount::Error,
     },
+}
+
+impl From<SubsidyError> for BlockError {
+    fn from(err: SubsidyError) -> BlockError {
+        BlockError::Transaction(TransactionError::Subsidy(err))
+    }
+}
+
+impl BlockError {
+    /// Returns `true` if this is definitely a duplicate request.
+    /// Some duplicate requests might not be detected, and therefore return `false`.
+    pub fn is_duplicate_request(&self) -> bool {
+        matches!(self, BlockError::AlreadyInChain(..))
+    }
 }

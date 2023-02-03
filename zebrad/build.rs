@@ -28,6 +28,7 @@ fn disable_non_reproducible(_config: &mut Config) {
      */
 }
 
+/// Process entry point for `zebrad`'s build script
 #[allow(clippy::print_stderr)]
 fn main() {
     let mut config = Config::default();
@@ -47,10 +48,7 @@ fn main() {
     match vergen(config.clone()) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!(
-                "git error in vergen build script: skipping git env vars: {:?}",
-                e,
-            );
+            eprintln!("git error in vergen build script: skipping git env vars: {e:?}",);
             *config.git_mut().enabled_mut() = false;
             vergen(config).expect("non-git vergen should succeed");
         }

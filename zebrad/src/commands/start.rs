@@ -81,7 +81,7 @@ use crate::{
     components::{
         inbound::{self, InboundSetupData},
         mempool::{self, Mempool},
-        sync::{self, show_block_chain_progress},
+        sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{RuntimeRun, TokioComponent},
         ChainSync, Inbound,
     },
@@ -90,7 +90,7 @@ use crate::{
 };
 
 /// `start` subcommand
-#[derive(Command, Debug, Options)]
+#[derive(Command, Debug, Options, Default)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
     #[options(free, help = "tracing filters which override the zebrad.toml config")]
@@ -100,11 +100,25 @@ pub struct StartCmd {
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
         let config = app_config().clone();
-        info!(?config);
 
         info!("initializing node state");
+        let (_, max_checkpoint_height) = zebra_consensus::chain::init_checkpoint_list(
+            config.consensus.clone(),
+            config.network.network,
+        );
+
+        info!("opening database, this may take a few minutes");
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zebra_state::init(config.state.clone(), config.network.network);
+            zebra_state::spawn_init(
+                config.state.clone(),
+                config.network.network,
+                max_checkpoint_height,
+                config.sync.checkpoint_verify_concurrency_limit
+                    * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+            )
+            .await?;
+
         let state = ServiceBuilder::new()
             .buffer(Self::state_buffer_bound())
             .service(state_service);
@@ -161,11 +175,18 @@ impl StartCmd {
             .service(mempool);
 
         // Launch RPC server
-        let (rpc_task_handle, rpc_tx_queue_task_handle) = RpcServer::spawn(
+        let (rpc_task_handle, rpc_tx_queue_task_handle, rpc_server) = RpcServer::spawn(
             config.rpc,
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            config.mining,
+            #[cfg(not(feature = "getblocktemplate-rpcs"))]
+            (),
             app_version(),
             mempool.clone(),
             read_only_state_service,
+            chain_verifier.clone(),
+            sync_status.clone(),
+            address_book.clone(),
             latest_chain_tip.clone(),
             config.network.network,
         );
@@ -335,6 +356,14 @@ impl StartCmd {
         // startup tasks
         groth16_download_handle.abort();
         old_databases_task_handle.abort();
+
+        // Wait until the RPC server shuts down.
+        // This can take around 150 seconds.
+        //
+        // Without this shutdown, Zebra's RPC unit tests sometimes crashed with memory errors.
+        if let Some(rpc_server) = rpc_server {
+            rpc_server.shutdown_blocking();
+        }
 
         exit_status
     }

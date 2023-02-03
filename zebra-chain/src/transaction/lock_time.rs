@@ -1,12 +1,14 @@
 //! Transaction LockTime.
 
-use std::{convert::TryInto, io};
+use std::io;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::block::{self, Height};
-use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
+use crate::{
+    block::{self, Height},
+    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+};
 
 /// A Bitcoin-style `locktime`, representing either a block height or an epoch
 /// time.
@@ -71,7 +73,11 @@ impl LockTime {
     //
     // TODO: replace Utc.timestamp with DateTime32 (#2211)
     pub fn min_lock_time_timestamp() -> LockTime {
-        LockTime::Time(Utc.timestamp(Self::MIN_TIMESTAMP, 0))
+        LockTime::Time(
+            Utc.timestamp_opt(Self::MIN_TIMESTAMP, 0)
+                .single()
+                .expect("in-range number of seconds and valid nanosecond"),
+        )
     }
 
     /// Returns the maximum [`LockTime::Time`], as a [`LockTime`].
@@ -81,7 +87,16 @@ impl LockTime {
     //
     // TODO: replace Utc.timestamp with DateTime32 (#2211)
     pub fn max_lock_time_timestamp() -> LockTime {
-        LockTime::Time(Utc.timestamp(Self::MAX_TIMESTAMP, 0))
+        LockTime::Time(
+            Utc.timestamp_opt(Self::MAX_TIMESTAMP, 0)
+                .single()
+                .expect("in-range number of seconds and valid nanosecond"),
+        )
+    }
+
+    /// Returns `true` if this lock time is a [`LockTime::Time`], or `false` if it is a [`LockTime::Height`].
+    pub fn is_time(&self) -> bool {
+        matches!(self, LockTime::Time(_))
     }
 }
 
@@ -108,7 +123,11 @@ impl ZcashDeserialize for LockTime {
             Ok(LockTime::Height(block::Height(n)))
         } else {
             // This can't panic, because all u32 values are valid `Utc.timestamp`s.
-            Ok(LockTime::Time(Utc.timestamp(n.into(), 0)))
+            Ok(LockTime::Time(
+                Utc.timestamp_opt(n.into(), 0)
+                    .single()
+                    .expect("in-range number of seconds and valid nanosecond"),
+            ))
         }
     }
 }

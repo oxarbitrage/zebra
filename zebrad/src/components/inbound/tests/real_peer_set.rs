@@ -1,6 +1,6 @@
 //! Inbound service tests with a real peer set.
 
-use std::{iter, net::SocketAddr, sync::Arc};
+use std::{iter, net::SocketAddr};
 
 use futures::FutureExt;
 use indexmap::IndexSet;
@@ -13,7 +13,7 @@ use tower::{
 };
 
 use zebra_chain::{
-    block::{self, Block},
+    block::{self, Height},
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{AuthDigest, Hash as TxHash, Transaction, UnminedTx, UnminedTxId, WtxId},
@@ -103,15 +103,13 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
         matches!(block_gossip_result, None),
-        "unexpected error or panic in block gossip task: {:?}",
-        block_gossip_result,
+        "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -188,15 +186,13 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
         matches!(block_gossip_result, None),
-        "unexpected error or panic in block gossip task: {:?}",
-        block_gossip_result,
+        "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -245,8 +241,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
                 for tx in &txs {
                     assert!(
                         response_txs.contains(&Missing(*tx)),
-                        "expected {:?}, but it was not in the response",
-                        tx
+                        "expected {tx:?}, but it was not in the response"
                     );
                 }
                 assert_eq!(response_txs.len(), txs.len());
@@ -295,10 +290,8 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
 
                 assert!(
                     expected.iter().any(|expected| expected == &actual),
-                    "unexpected response: {:?} \
-                     expected one of: {:?}",
-                    actual,
-                    expected,
+                    "unexpected response: {actual:?} \
+                     expected one of: {expected:?}",
                 );
             }
         } else {
@@ -313,15 +306,13 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
         matches!(block_gossip_result, None),
-        "unexpected error or panic in block gossip task: {:?}",
-        block_gossip_result,
+        "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -415,10 +406,8 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
 
                 assert!(
                     expected.iter().any(|expected| expected == &actual),
-                    "unexpected response: {:?} \
-                     expected one of: {:?}",
-                    actual,
-                    expected,
+                    "unexpected response: {actual:?} \
+                     expected one of: {expected:?}",
                 );
             }
         } else {
@@ -467,15 +456,13 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
         matches!(block_gossip_result, None),
-        "unexpected error or panic in block gossip task: {:?}",
-        block_gossip_result,
+        "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -582,15 +569,13 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
         matches!(block_gossip_result, None),
-        "unexpected error or panic in block gossip task: {:?}",
-        block_gossip_result,
+        "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
         matches!(tx_gossip_result, None),
-        "unexpected error or panic in transaction gossip task: {:?}",
-        tx_gossip_result,
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
     Ok(())
@@ -607,10 +592,7 @@ async fn setup(
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
-    Buffer<
-        BoxService<zebra_network::Request, zebra_network::Response, BoxError>,
-        zebra_network::Request,
-    >,
+    Buffer<zebra_network::Client, zebra_network::Request>,
     // inbound service
     BoxCloneService<zebra_network::Request, zebra_network::Response, BoxError>,
     // outbound peer set (only has the connected peer)
@@ -621,7 +603,7 @@ async fn setup(
     Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
     Buffer<BoxService<zebra_state::Request, zebra_state::Response, BoxError>, zebra_state::Request>,
     // mocked services
-    MockService<Arc<Block>, block::Hash, PanicAssertion, VerifyChainError>,
+    MockService<zebra_consensus::Request, block::Hash, PanicAssertion, VerifyChainError>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     // real tasks
     JoinHandle<Result<(), BlockGossipError>>,
@@ -645,9 +627,10 @@ async fn setup(
         .service(inbound_service);
 
     // State
+    // UTXO verification doesn't matter for these tests.
     let state_config = StateConfig::ephemeral();
     let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zebra_state::init(state_config, network);
+        zebra_state::init(state_config, network, Height::MAX, 0);
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network

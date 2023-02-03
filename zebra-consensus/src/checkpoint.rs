@@ -34,7 +34,16 @@ use zebra_chain::{
 };
 use zebra_state::{self as zs, FinalizedBlock};
 
-use crate::{block::VerifyBlockError, error::BlockError, BoxError};
+use crate::{
+    block::VerifyBlockError,
+    checkpoint::types::{
+        Progress,
+        Progress::*,
+        TargetHeight::{self, *},
+    },
+    error::BlockError,
+    BoxError,
+};
 
 pub(crate) mod list;
 mod types;
@@ -42,9 +51,9 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use zebra_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
+
 pub use list::CheckpointList;
-use types::{Progress, Progress::*};
-use types::{TargetHeight, TargetHeight::*};
 
 /// An unverified block, which is in the queue for checkpoint verification.
 #[derive(Debug)]
@@ -83,25 +92,6 @@ type QueuedBlockList = Vec<QueuedBlock>;
 /// downloads. When the verifier services process blocks, they reduce memory
 /// usage by committing blocks to the disk state. (Or dropping invalid blocks.)
 pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
-
-/// We limit the maximum number of blocks in each checkpoint. Each block uses a
-/// constant amount of memory for the supporting data structures and futures.
-///
-/// We choose a checkpoint gap that allows us to verify one checkpoint for
-/// every `ObtainTips` or `ExtendTips` response.
-///
-/// `zcashd`'s maximum `FindBlocks` response size is 500 hashes. `zebrad` uses
-/// 1 hash to verify the tip, and discards 1-2 hashes to work around `zcashd`
-/// bugs. So the most efficient gap is slightly less than 500 blocks.
-pub const MAX_CHECKPOINT_HEIGHT_GAP: usize = 400;
-
-/// We limit the memory usage and download contention for each checkpoint,
-/// based on the cumulative size of the serialized blocks in the chain.
-///
-/// Deserialized blocks (in memory) are slightly larger than serialized blocks
-/// (on the network or disk). But they should be within a constant factor of the
-/// serialized size.
-pub const MAX_CHECKPOINT_BYTE_COUNT: u64 = 32 * 1024 * 1024;
 
 /// Convert a tip into its hash and matching progress.
 fn progress_from_tip(
@@ -880,7 +870,7 @@ pub enum VerifyCheckpointError {
     #[error(transparent)]
     CheckpointList(BoxError),
     #[error(transparent)]
-    VerifyBlock(BoxError),
+    VerifyBlock(VerifyBlockError),
     #[error("too many queued blocks at this height")]
     QueuedLimit,
     #[error("the block hash does not match the chained checkpoint hash, expected {expected:?} found {found:?}")]
@@ -894,7 +884,7 @@ pub enum VerifyCheckpointError {
 
 impl From<VerifyBlockError> for VerifyCheckpointError {
     fn from(err: VerifyBlockError) -> VerifyCheckpointError {
-        VerifyCheckpointError::VerifyBlock(err.into())
+        VerifyCheckpointError::VerifyBlock(err)
     }
 }
 
@@ -907,6 +897,20 @@ impl From<BlockError> for VerifyCheckpointError {
 impl From<equihash::Error> for VerifyCheckpointError {
     fn from(err: equihash::Error) -> VerifyCheckpointError {
         VerifyCheckpointError::VerifyBlock(err.into())
+    }
+}
+
+impl VerifyCheckpointError {
+    /// Returns `true` if this is definitely a duplicate request.
+    /// Some duplicate requests might not be detected, and therefore return `false`.
+    pub fn is_duplicate_request(&self) -> bool {
+        match self {
+            VerifyCheckpointError::AlreadyVerified { .. } => true,
+            // TODO: make this duplicate-incomplete
+            VerifyCheckpointError::NewerRequest { .. } => true,
+            VerifyCheckpointError::VerifyBlock(block_error) => block_error.is_duplicate_request(),
+            _ => false,
+        }
     }
 }
 

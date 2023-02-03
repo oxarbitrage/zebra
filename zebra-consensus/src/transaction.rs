@@ -23,6 +23,7 @@ use zebra_chain::{
     parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
     sapling,
+    serialization::DateTime32,
     transaction::{
         self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
     },
@@ -117,7 +118,7 @@ pub enum Request {
 
 /// The response type for the transaction verifier service.
 /// Responses identify the transaction that was verified.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Response {
     /// A response to a block transaction verification request.
     Block {
@@ -175,10 +176,10 @@ impl Request {
     }
 
     /// The unverified mempool transaction, if this is a mempool request.
-    pub fn into_mempool_transaction(self) -> Option<UnminedTx> {
+    pub fn mempool_transaction(&self) -> Option<UnminedTx> {
         match self {
             Request::Block { .. } => None,
-            Request::Mempool { transaction, .. } => Some(transaction),
+            Request::Mempool { transaction, .. } => Some(transaction.clone()),
         }
     }
 
@@ -249,7 +250,9 @@ impl Response {
 
     /// The miner fee for the transaction in this response.
     ///
-    /// Coinbase transactions do not have a miner fee.
+    /// Coinbase transactions do not have a miner fee,
+    /// and they don't need UTXOs to calculate their value balance,
+    /// because they don't spend any inputs.
     pub fn miner_fee(&self) -> Option<Amount<NonNegative>> {
         match self {
             Response::Block { miner_fee, .. } => *miner_fee,
@@ -259,15 +262,12 @@ impl Response {
 
     /// The number of legacy transparent signature operations in this transaction's
     /// inputs and outputs.
-    ///
-    /// Zebra does not check the legacy sigop count for mempool transactions,
-    /// because it is a standard rule (not a consensus rule).
-    pub fn legacy_sigop_count(&self) -> Option<u64> {
+    pub fn legacy_sigop_count(&self) -> u64 {
         match self {
             Response::Block {
                 legacy_sigop_count, ..
-            } => Some(*legacy_sigop_count),
-            Response::Mempool { .. } => None,
+            } => *legacy_sigop_count,
+            Response::Mempool { transaction, .. } => transaction.legacy_sigop_count,
         }
     }
 
@@ -305,19 +305,17 @@ where
         let span = tracing::debug_span!("tx", ?tx_id);
 
         async move {
-            tracing::trace!(?req);
+            tracing::trace!(?tx_id, ?req, "got tx verify request");
 
-            // Do basic checks first
-            if let Some(block_time) = req.block_time() {
-                check::lock_time_has_passed(&tx, req.height(), block_time)?;
-            }
-
+            // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
 
+            // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
                 return Err(TransactionError::CoinbaseInMempool);
             }
+
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
             } else if !tx.is_valid_non_coinbase() {
@@ -344,6 +342,25 @@ where
 
             check::spend_conflicts(&tx)?;
 
+            tracing::trace!(?tx_id, "passed quick checks");
+
+            if let Some(block_time) = req.block_time() {
+                check::lock_time_has_passed(&tx, req.height(), block_time)?;
+            } else {
+                // Skip the state query if we don't need the time for this check.
+                let next_median_time_past = if tx.lock_time_is_time() {
+                    // This state query is much faster than loading UTXOs from the database,
+                    // so it doesn't need to be executed in parallel
+                    let state = state.clone();
+                    Some(Self::mempool_best_chain_next_median_time_past(state).await?.to_chrono())
+                } else {
+                    None
+                };
+
+                // This consensus check makes sure Zebra produces valid block templates.
+                check::lock_time_has_passed(&tx, req.height(), next_median_time_past)?;
+            }
+
             // "The consensus rules applied to valueBalance, vShieldedOutput, and bindingSig
             // in non-coinbase transactions MUST also be applied to coinbase transactions."
             //
@@ -355,12 +372,17 @@ where
             // https://zips.z.cash/zip-0213#specification
 
             // Load spent UTXOs from state.
-            let (spent_utxos, spent_outputs) =
-                Self::spent_utxos(tx.clone(), req.known_utxos(), state).await?;
+            // The UTXOs are required for almost all the async checks.
+            let load_spent_utxos_fut =
+                Self::spent_utxos(tx.clone(), req.known_utxos(), req.is_mempool(), state.clone());
+            let (spent_utxos, spent_outputs) = load_spent_utxos_fut.await?;
 
             let cached_ffi_transaction =
                 Arc::new(CachedFfiTransaction::new(tx.clone(), spent_outputs));
-            let async_checks = match tx.as_ref() {
+
+            tracing::trace!(?tx_id, "got state UTXOs");
+
+            let mut async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -391,9 +413,28 @@ where
                 )?,
             };
 
+            if let Some(unmined_tx) = req.mempool_transaction() {
+                let check_anchors_and_revealed_nullifiers_query = state
+                    .clone()
+                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+                        unmined_tx,
+                    ))
+                    .map(|res| {
+                        assert!(res? == zs::Response::ValidBestChainTipNullifiersAndAnchors, "unexpected response to CheckBestChainTipNullifiersAndAnchors request");
+                        Ok(())
+                    }
+                );
+
+                async_checks.push(check_anchors_and_revealed_nullifiers_query);
+            }
+
+            tracing::trace!(?tx_id, "awaiting async checks...");
+
             // If the Groth16 parameter download hangs,
             // Zebra will timeout here, waiting for the async checks.
             async_checks.check().await?;
+
+            tracing::trace!(?tx_id, "finished async checks");
 
             // Get the `value_balance` to calculate the transaction fee.
             let value_balance = tx.value_balance(&spent_utxos);
@@ -401,7 +442,7 @@ where
             // Calculate the fee only for non-coinbase transactions.
             let mut miner_fee = None;
             if !tx.is_coinbase() {
-                // TODO: deduplicate this code with remaining_transaction_value (#TODO: open ticket)
+                // TODO: deduplicate this code with remaining_transaction_value()?
                 miner_fee = match value_balance {
                     Ok(vb) => match vb.remaining_transaction_value() {
                         Ok(tx_rtv) => Some(tx_rtv),
@@ -411,11 +452,13 @@ where
                 };
             }
 
+            let legacy_sigop_count = cached_ffi_transaction.legacy_sigop_count()?;
+
             let rsp = match req {
                 Request::Block { .. } => Response::Block {
                     tx_id,
                     miner_fee,
-                    legacy_sigop_count: cached_ffi_transaction.legacy_sigop_count()?,
+                    legacy_sigop_count,
                 },
                 Request::Mempool { transaction, .. } => Response::Mempool {
                     transaction: VerifiedUnminedTx::new(
@@ -423,12 +466,17 @@ where
                         miner_fee.expect(
                             "unexpected mempool coinbase transaction: should have already rejected",
                         ),
+                        legacy_sigop_count,
                     ),
                 },
             };
 
             Ok(rsp)
         }
+        .inspect(move |result| {
+            // Hide the transaction data to avoid filling the logs
+            tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
+        })
         .instrument(span)
         .boxed()
     }
@@ -439,7 +487,28 @@ where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send + 'static,
 {
-    /// Get the UTXOs that are being spent by the given transaction.
+    /// Fetches the median-time-past of the *next* block after the best state tip.
+    ///
+    /// This is used to verify that the lock times of mempool transactions
+    /// can be included in any valid next block.
+    async fn mempool_best_chain_next_median_time_past(
+        state: Timeout<ZS>,
+    ) -> Result<DateTime32, TransactionError> {
+        let query = state
+            .clone()
+            .oneshot(zs::Request::BestChainNextMedianTimePast);
+
+        if let zebra_state::Response::BestChainNextMedianTimePast(median_time_past) = query
+            .await
+            .map_err(|e| TransactionError::ValidateMempoolLockTimeError(e.to_string()))?
+        {
+            Ok(median_time_past)
+        } else {
+            unreachable!("Request::BestChainNextMedianTimePast always responds with BestChainNextMedianTimePast")
+        }
+    }
+
+    /// Wait for the UTXOs that are being spent by the given transaction.
     ///
     /// `known_utxos` are additional UTXOs known at the time of validation (i.e.
     /// from previous transactions in the block).
@@ -449,6 +518,7 @@ where
     async fn spent_utxos(
         tx: Arc<Transaction>,
         known_utxos: Arc<HashMap<transparent::OutPoint, OrderedUtxo>>,
+        is_mempool: bool,
         state: Timeout<ZS>,
     ) -> Result<
         (
@@ -463,9 +533,20 @@ where
         for input in inputs {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
                 tracing::trace!("awaiting outpoint lookup");
+                // Currently, Zebra only supports known UTXOs in block transactions.
+                // But it might support them in the mempool in future.
                 let utxo = if let Some(output) = known_utxos.get(outpoint) {
                     tracing::trace!("UXTO in known_utxos, discarding query");
                     output.utxo.clone()
+                } else if is_mempool {
+                    let query = state
+                        .clone()
+                        .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
+                    if let zebra_state::Response::UnspentBestChainUtxo(utxo) = query.await? {
+                        utxo.ok_or(TransactionError::TransparentInputNotFound)?
+                    } else {
+                        unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
+                    }
                 } else {
                     let query = state
                         .clone()
@@ -693,7 +774,6 @@ where
             let upgrade = request.upgrade(network);
 
             let script_checks = (0..inputs.len())
-                .into_iter()
                 .map(move |input_index| {
                     let request = script::Request {
                         upgrade,
@@ -940,7 +1020,7 @@ where
                 //
                 // https://zips.z.cash/protocol/protocol.pdf#actiondesc
                 //
-                // This is validated by the verifier, inside the [`primitives::redpallas`] module.
+                // This is validated by the verifier, inside the [`reddsa`] crate.
                 // It calls [`pallas::Affine::from_bytes`] to parse R and
                 // that enforces the canonical encoding.
                 //
@@ -949,11 +1029,13 @@ where
                 // description while adding the resulting future to
                 // our collection of async checks that (at a
                 // minimum) must pass for the transaction to verify.
-                async_checks.push(
-                    primitives::redpallas::VERIFIER
-                        .clone()
-                        .oneshot((action.rk, spend_auth_sig, &shielded_sighash).into()),
-                );
+                async_checks.push(primitives::redpallas::VERIFIER.clone().oneshot(
+                    primitives::redpallas::Item::from_spendauth(
+                        action.rk,
+                        spend_auth_sig,
+                        &shielded_sighash,
+                    ),
+                ));
             }
 
             let bvk = orchard_shielded_data.binding_verification_key();
@@ -982,15 +1064,17 @@ where
             //
             // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
             //
-            // This is validated by the verifier, inside the `redpallas` crate.
+            // This is validated by the verifier, inside the `reddsa` crate.
             // It calls [`pallas::Affine::from_bytes`] to parse R and
             // that enforces the canonical encoding.
 
-            async_checks.push(
-                primitives::redpallas::VERIFIER
-                    .clone()
-                    .oneshot((bvk, orchard_shielded_data.binding_sig, &shielded_sighash).into()),
-            );
+            async_checks.push(primitives::redpallas::VERIFIER.clone().oneshot(
+                primitives::redpallas::Item::from_binding(
+                    bvk,
+                    orchard_shielded_data.binding_sig,
+                    &shielded_sighash,
+                ),
+            ));
         }
 
         Ok(async_checks)

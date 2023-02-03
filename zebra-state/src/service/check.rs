@@ -7,15 +7,24 @@ use chrono::Duration;
 use zebra_chain::{
     block::{self, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
-    parameters::POW_AVERAGING_WINDOW,
     parameters::{Network, NetworkUpgrade},
     work::difficulty::CompactDifficulty,
 };
 
-use crate::{constants, BoxError, PreparedBlock, ValidateContextError};
+use crate::{
+    service::{
+        block_iter::any_ancestor_blocks, check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
+        finalized_state::ZebraDb, non_finalized_state::NonFinalizedState,
+    },
+    BoxError, PreparedBlock, ValidateContextError,
+};
 
 // use self as check
 use super::check;
+
+// These types are used in doc links
+#[allow(unused_imports)]
+use crate::service::non_finalized_state::Chain;
 
 pub(crate) mod anchors;
 pub(crate) mod difficulty;
@@ -25,7 +34,7 @@ pub(crate) mod utxo;
 #[cfg(test)]
 mod tests;
 
-use difficulty::{AdjustedDifficulty, POW_MEDIAN_BLOCK_SPAN};
+pub(crate) use difficulty::AdjustedDifficulty;
 
 /// Check that the `prepared` block is contextually valid for `network`, based
 /// on the `finalized_tip_height` and `relevant_chain`.
@@ -38,8 +47,7 @@ use difficulty::{AdjustedDifficulty, POW_MEDIAN_BLOCK_SPAN};
 ///
 /// # Panics
 ///
-/// If the state contains less than 28
-/// (`POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN`) blocks.
+/// If the state contains less than 28 ([`POW_ADJUSTMENT_BLOCK_SPAN`]) blocks.
 #[tracing::instrument(skip(prepared, finalized_tip_height, relevant_chain))]
 pub(crate) fn block_is_valid_for_recent_chain<C>(
     prepared: &PreparedBlock,
@@ -56,11 +64,9 @@ where
         .expect("finalized state must contain at least one block to do contextual validation");
     check::block_is_not_orphaned(finalized_tip_height, prepared.height)?;
 
-    // The maximum number of blocks used by contextual checks
-    const MAX_CONTEXT_BLOCKS: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
     let relevant_chain: Vec<_> = relevant_chain
         .into_iter()
-        .take(MAX_CONTEXT_BLOCKS)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
         .collect();
 
     let parent_block = relevant_chain
@@ -74,14 +80,14 @@ where
 
     // skip this check during tests if we don't have enough blocks in the chain
     #[cfg(test)]
-    if relevant_chain.len() < POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN {
+    if relevant_chain.len() < POW_ADJUSTMENT_BLOCK_SPAN {
         return Ok(());
     }
     // process_queued also checks the chain length, so we can skip this assertion during testing
     // (tests that want to check this code should use the correct number of blocks)
     assert_eq!(
         relevant_chain.len(),
-        POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN,
+        POW_ADJUSTMENT_BLOCK_SPAN,
         "state must contain enough blocks to do proof of work contextual validation, \
          and validation must receive the exact number of required blocks"
     );
@@ -94,7 +100,7 @@ where
     });
     let difficulty_adjustment =
         AdjustedDifficulty::new_from_block(&prepared.block, network, relevant_data);
-    check::difficulty_threshold_is_valid(
+    check::difficulty_threshold_and_time_are_valid(
         prepared.block.header.difficulty_threshold,
         difficulty_adjustment,
     )?;
@@ -227,7 +233,7 @@ fn height_one_more_than_parent_height(
 ///
 /// These checks are performed together, because the time field is used to
 /// calculate the expected difficulty adjustment.
-fn difficulty_threshold_is_valid(
+fn difficulty_threshold_and_time_are_valid(
     difficulty_threshold: CompactDifficulty,
     difficulty_adjustment: AdjustedDifficulty,
 ) -> Result<(), ValidateContextError> {
@@ -237,7 +243,7 @@ fn difficulty_threshold_is_valid(
     let network = difficulty_adjustment.network();
     let median_time_past = difficulty_adjustment.median_time_past();
     let block_time_max =
-        median_time_past + Duration::seconds(difficulty::BLOCK_MAX_TIME_SINCE_MEDIAN);
+        median_time_past + Duration::seconds(difficulty::BLOCK_MAX_TIME_SINCE_MEDIAN.into());
 
     // # Consensus
     //
@@ -289,15 +295,23 @@ fn difficulty_threshold_is_valid(
 }
 
 /// Check if zebra is following a legacy chain and return an error if so.
+///
+/// `nu5_activation_height` should be `NetworkUpgrade::Nu5.activation_height(network)`, and
+/// `max_legacy_chain_blocks` should be [`MAX_LEGACY_CHAIN_BLOCKS`](crate::constants::MAX_LEGACY_CHAIN_BLOCKS).
+/// They are only changed from the defaults for testing.
 pub(crate) fn legacy_chain<I>(
     nu5_activation_height: block::Height,
     ancestors: I,
     network: Network,
+    max_legacy_chain_blocks: usize,
 ) -> Result<(), BoxError>
 where
     I: Iterator<Item = Arc<Block>>,
 {
-    for (count, block) in ancestors.enumerate() {
+    let mut ancestors = ancestors.peekable();
+    let tip_height = ancestors.peek().and_then(|block| block.coinbase_height());
+
+    for (index, block) in ancestors.enumerate() {
         // Stop checking if the chain reaches Canopy. We won't find any more V5 transactions,
         // so the rest of our checks are useless.
         //
@@ -312,9 +326,14 @@ where
         }
 
         // If we are past our NU5 activation height, but there are no V5 transactions in recent blocks,
-        // the Zebra instance that verified those blocks had no NU5 activation height.
-        if count >= constants::MAX_LEGACY_CHAIN_BLOCKS {
-            return Err("giving up after checking too many blocks".into());
+        // the last Zebra instance that updated this cached state had no NU5 activation height.
+        if index >= max_legacy_chain_blocks {
+            return Err(format!(
+                "could not find any transactions in recent blocks: \
+                 checked {index} blocks back from {:?}",
+                tip_height.expect("database contains valid blocks"),
+            )
+            .into());
         }
 
         // If a transaction `network_upgrade` field is different from the network upgrade calculated
@@ -322,7 +341,9 @@ where
         // network upgrade heights.
         block
             .check_transaction_network_upgrade_consistency(network)
-            .map_err(|_| "inconsistent network upgrade found in transaction")?;
+            .map_err(|error| {
+                format!("inconsistent network upgrade found in transaction: {error:?}")
+            })?;
 
         // If we find at least one transaction with a valid `network_upgrade` field, the Zebra instance that
         // verified those blocks used the same network upgrade heights. (Up to this point in the chain.)
@@ -335,6 +356,34 @@ where
             return Ok(());
         }
     }
+
+    Ok(())
+}
+
+/// Perform initial contextual validity checks for the configured network,
+/// based on the committed finalized and non-finalized state.
+///
+/// Additional contextual validity checks are performed by the non-finalized [`Chain`].
+pub(crate) fn initial_contextual_validity(
+    finalized_state: &ZebraDb,
+    non_finalized_state: &NonFinalizedState,
+    prepared: &PreparedBlock,
+) -> Result<(), ValidateContextError> {
+    let relevant_chain = any_ancestor_blocks(
+        non_finalized_state,
+        finalized_state,
+        prepared.block.header.previous_block_hash,
+    );
+
+    // Security: check proof of work before any other checks
+    check::block_is_valid_for_recent_chain(
+        prepared,
+        non_finalized_state.network,
+        finalized_state.finalized_tip_height(),
+        relevant_chain,
+    )?;
+
+    check::nullifier::no_duplicates_in_finalized_chain(prepared, finalized_state)?;
 
     Ok(())
 }

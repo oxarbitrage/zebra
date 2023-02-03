@@ -145,7 +145,8 @@ proptest! {
             }
 
             // Send a request to all peers
-            let _ = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+            std::mem::drop(response_future);
 
             // Check how many peers received the request
             let mut received = 0;
@@ -213,7 +214,8 @@ proptest! {
                 let number_of_peers_to_broadcast = peer_set.number_of_peers_to_broadcast();
 
                 // Send a request to all peers we have now
-                let _ = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+                let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+                std::mem::drop(response_future);
 
                 // Check how many peers received the request
                 let mut received = 0;
@@ -273,7 +275,8 @@ proptest! {
             }
 
             // this will panic as expected
-            let _ = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+            let response_future = peer_set.route_broadcast(Request::AdvertiseBlock(block_hash));
+            std::mem::drop(response_future);
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -299,7 +302,7 @@ where
     let poll_result = peer_set.ready().now_or_never();
     let all_peers_are_outdated = harnesses
         .iter()
-        .all(|harness| harness.version() < minimum_version);
+        .all(|harness| harness.remote_version() < minimum_version);
 
     if all_peers_are_outdated {
         prop_assert!(matches!(poll_result, None));
@@ -309,7 +312,7 @@ where
 
     let mut number_of_connected_peers = 0;
     for harness in harnesses {
-        let is_outdated = harness.version() < minimum_version;
+        let is_outdated = harness.remote_version() < minimum_version;
         let is_connected = harness.wants_connection_heartbeats();
 
         prop_assert!(

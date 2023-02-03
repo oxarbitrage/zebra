@@ -1,7 +1,8 @@
 //! Randomised property tests for the mempool.
 
-use proptest::collection::vec;
-use proptest::prelude::*;
+use std::{env, fmt};
+
+use proptest::{collection::vec, prelude::*};
 use proptest_derive::Arbitrary;
 
 use chrono::Duration;
@@ -10,6 +11,7 @@ use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
     block,
+    fmt::DisplayToDebug,
     parameters::{Network, NetworkUpgrade},
     transaction::VerifiedUnminedTx,
 };
@@ -32,24 +34,33 @@ type MockState = MockService<zs::Request, zs::Response, PropTestAssertion>;
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PropTestAssertion, TransactionError>;
 
-const CHAIN_LENGTH: usize = 10;
+const CHAIN_LENGTH: usize = 5;
+
+const DEFAULT_MEMPOOL_PROPTEST_CASES: u32 = 8;
 
 proptest! {
+    // The mempool tests can generate very verbose logs, so we use fewer cases by
+    // default. Set the PROPTEST_CASES env var to override this default.
+    #![proptest_config(proptest::test_runner::Config::with_cases(env::var("PROPTEST_CASES")
+                                          .ok()
+                                          .and_then(|v| v.parse().ok())
+                                          .unwrap_or(DEFAULT_MEMPOOL_PROPTEST_CASES)))]
+
     /// Test if the mempool storage is cleared on a chain reset.
     #[test]
-    fn storage_is_cleared_on_chain_reset(
+    fn storage_is_cleared_on_single_chain_reset(
         network in any::<Network>(),
-        transaction in any::<VerifiedUnminedTx>(),
-        chain_tip in any::<ChainTipBlock>(),
+        transaction in any::<DisplayToDebug<VerifiedUnminedTx>>(),
+        chain_tip in any::<DisplayToDebug<ChainTipBlock>>(),
     ) {
         let (runtime, _init_guard) = zebra_test::init_async();
 
         runtime.block_on(async move {
             let (
                 mut mempool,
-                mut peer_set,
-                mut state_service,
-                mut tx_verifier,
+                _peer_set,
+                _state_service,
+                _tx_verifier,
                 mut recent_syncs,
                 mut chain_tip_sender,
             ) = setup(network);
@@ -61,7 +72,7 @@ proptest! {
             // Insert a dummy transaction.
             mempool
                 .storage()
-                .insert(transaction)
+                .insert(transaction.0)
                 .expect("Inserting a transaction should succeed");
 
             // The first call to `poll_ready` shouldn't clear the storage yet.
@@ -70,16 +81,15 @@ proptest! {
             prop_assert_eq!(mempool.storage().transaction_count(), 1);
 
             // Simulate a chain reset.
-            chain_tip_sender.set_finalized_tip(chain_tip);
+            chain_tip_sender.set_finalized_tip(chain_tip.0);
 
             // This time a call to `poll_ready` should clear the storage.
             mempool.dummy_call().await;
 
             prop_assert_eq!(mempool.storage().transaction_count(), 0);
 
-            peer_set.expect_no_requests().await?;
-            state_service.expect_no_requests().await?;
-            tx_verifier.expect_no_requests().await?;
+            // The services might or might not get requests,
+            // depending on how many transactions get re-queued, and if they need downloading.
 
             Ok(())
         })?;
@@ -87,20 +97,20 @@ proptest! {
 
     /// Test if the mempool storage is cleared on multiple chain resets.
     #[test]
-    fn storage_is_cleared_on_chain_resets(
+    fn storage_is_cleared_on_multiple_chain_resets(
         network in any::<Network>(),
-        mut previous_chain_tip in any::<ChainTipBlock>(),
-        mut transactions in vec(any::<VerifiedUnminedTx>(), 0..CHAIN_LENGTH),
-        fake_chain_tips in vec(any::<FakeChainTip>(), 0..CHAIN_LENGTH),
+        mut previous_chain_tip in any::<DisplayToDebug<ChainTipBlock>>(),
+        mut transactions in vec(any::<DisplayToDebug<VerifiedUnminedTx>>(), 0..CHAIN_LENGTH),
+        fake_chain_tips in vec(any::<DisplayToDebug<FakeChainTip>>(), 0..CHAIN_LENGTH),
     ) {
         let (runtime, _init_guard) = zebra_test::init_async();
 
         runtime.block_on(async move {
             let (
                 mut mempool,
-                mut peer_set,
-                mut state_service,
-                mut tx_verifier,
+                _peer_set,
+                _state_service,
+                _tx_verifier,
                 mut recent_syncs,
                 mut chain_tip_sender,
             ) = setup(network);
@@ -110,7 +120,7 @@ proptest! {
             mempool.enable(&mut recent_syncs).await;
 
             // Set the initial chain tip.
-            chain_tip_sender.set_best_non_finalized_tip(previous_chain_tip.clone());
+            chain_tip_sender.set_best_non_finalized_tip(previous_chain_tip.0.clone());
 
             // Call the mempool so that it is aware of the initial chain tip.
             mempool.dummy_call().await;
@@ -136,7 +146,7 @@ proptest! {
                 // Insert the dummy transaction into the mempool.
                 mempool
                     .storage()
-                    .insert(transaction.clone())
+                    .insert(transaction.0.clone())
                     .expect("Inserting a transaction should succeed");
 
                 // Set the new chain tip.
@@ -145,7 +155,7 @@ proptest! {
                 // Call the mempool so that it is aware of the new chain tip.
                 mempool.dummy_call().await;
 
-                match fake_chain_tip {
+                match fake_chain_tip.0 {
                     FakeChainTip::Grow(_) => {
                         // The mempool should not be empty because we had a regular chain growth.
                         prop_assert_ne!(mempool.storage().transaction_count(), 0);
@@ -158,12 +168,11 @@ proptest! {
                 }
 
                 // Remember the current chain tip so that the next one can refer to it.
-                previous_chain_tip = chain_tip;
+                previous_chain_tip = chain_tip.into();
             }
 
-            peer_set.expect_no_requests().await?;
-            state_service.expect_no_requests().await?;
-            tx_verifier.expect_no_requests().await?;
+            // The services might or might not get requests,
+            // depending on how many transactions get re-queued, and if they need downloading.
 
             Ok(())
         })?;
@@ -264,10 +273,21 @@ fn setup(
 }
 
 /// A helper enum for simulating either a chain reset or growth.
-#[derive(Arbitrary, Debug, Clone)]
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
 enum FakeChainTip {
     Grow(ChainTipBlock),
     Reset(ChainTipBlock),
+}
+
+impl fmt::Display for FakeChainTip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (mut f, inner) = match self {
+            FakeChainTip::Grow(inner) => (f.debug_tuple("FakeChainTip::Grow"), inner),
+            FakeChainTip::Reset(inner) => (f.debug_tuple("FakeChainTip::Reset"), inner),
+        };
+
+        f.field(&inner).finish()
+    }
 }
 
 impl FakeChainTip {
@@ -288,6 +308,7 @@ impl FakeChainTip {
                     hash: chain_tip_block.hash,
                     height,
                     time: previous.time + mock_block_time_delta,
+                    transactions: chain_tip_block.transactions.clone(),
                     transaction_hashes: chain_tip_block.transaction_hashes.clone(),
                     previous_block_hash: previous.hash,
                 }

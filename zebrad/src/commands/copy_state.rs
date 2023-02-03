@@ -111,13 +111,16 @@ impl CopyStateCmd {
         );
 
         let source_start_time = Instant::now();
+
+        // We're not verifying UTXOs here, so we don't need the maximum checkpoint height.
+        //
         // TODO: use ReadStateService for the source?
         let (
             mut source_state,
             _source_read_only_state_service,
             _source_latest_chain_tip,
             _source_chain_tip_change,
-        ) = old_zs::init(source_config.clone(), network);
+        ) = old_zs::spawn_init(source_config.clone(), network, Height::MAX, 0).await?;
 
         let elapsed = source_start_time.elapsed();
         info!(?elapsed, "finished initializing source state service");
@@ -128,6 +131,8 @@ impl CopyStateCmd {
         );
 
         let target_start_time = Instant::now();
+        // We're not verifying UTXOs here, so we don't need the maximum checkpoint height.
+        //
         // TODO: call Options::PrepareForBulkLoad()
         // See "What's the fastest way to load data into RocksDB?" in
         // https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ
@@ -136,7 +141,7 @@ impl CopyStateCmd {
             _target_read_only_state_service,
             _target_latest_chain_tip,
             _target_chain_tip_change,
-        ) = new_zs::init(target_config.clone(), network);
+        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0).await?;
 
         let elapsed = target_start_time.elapsed();
         info!(?elapsed, "finished initializing target state service");
@@ -152,10 +157,7 @@ impl CopyStateCmd {
             old_zs::Response::Tip(Some(source_tip)) => source_tip,
             old_zs::Response::Tip(None) => Err("empty source state: no blocks to copy")?,
 
-            response => Err(format!(
-                "unexpected response to Tip request: {:?}",
-                response,
-            ))?,
+            response => Err(format!("unexpected response to Tip request: {response:?}",))?,
         };
         let source_tip_height = source_tip.0 .0;
 
@@ -167,10 +169,7 @@ impl CopyStateCmd {
         let initial_target_tip = match initial_target_tip {
             new_zs::Response::Tip(target_tip) => target_tip,
 
-            response => Err(format!(
-                "unexpected response to Tip request: {:?}",
-                response,
-            ))?,
+            response => Err(format!("unexpected response to Tip request: {response:?}",))?,
         };
         let min_target_height = initial_target_tip
             .map(|target_tip| target_tip.0 .0 + 1)
@@ -216,15 +215,13 @@ impl CopyStateCmd {
                     trace!(?height, %source_block, "read source block");
                     source_block
                 }
-                old_zs::Response::Block(None) => Err(format!(
-                    "unexpected missing source block, height: {}",
-                    height,
-                ))?,
+                old_zs::Response::Block(None) => {
+                    Err(format!("unexpected missing source block, height: {height}",))?
+                }
 
                 response => Err(format!(
-                    "unexpected response to Block request, height: {}, \n \
-                     response: {:?}",
-                    height, response,
+                    "unexpected response to Block request, height: {height}, \n \
+                     response: {response:?}",
                 ))?,
             };
             let source_block_hash = source_block.hash();
@@ -243,9 +240,8 @@ impl CopyStateCmd {
                     target_block_commit_hash
                 }
                 response => Err(format!(
-                    "unexpected response to CommitFinalizedBlock request, height: {}\n \
-                     response: {:?}",
-                    height, response,
+                    "unexpected response to CommitFinalizedBlock request, height: {height}\n \
+                     response: {response:?}",
                 ))?,
             };
 
@@ -260,15 +256,13 @@ impl CopyStateCmd {
                     trace!(?height, %target_block, "read target block");
                     target_block
                 }
-                new_zs::Response::Block(None) => Err(format!(
-                    "unexpected missing target block, height: {}",
-                    height,
-                ))?,
+                new_zs::Response::Block(None) => {
+                    Err(format!("unexpected missing target block, height: {height}",))?
+                }
 
                 response => Err(format!(
-                    "unexpected response to Block request, height: {},\n \
-                     response: {:?}",
-                    height, response,
+                    "unexpected response to Block request, height: {height},\n \
+                     response: {response:?}",
                 ))?,
             };
             let target_block_data_hash = target_block.hash();
@@ -289,18 +283,12 @@ impl CopyStateCmd {
             {
                 Err(format!(
                     "unexpected mismatch between source and target blocks,\n \
-                     max copy height: {:?},\n \
-                     source hash: {:?},\n \
-                     target commit hash: {:?},\n \
-                     target data hash: {:?},\n \
-                     source block: {:?},\n \
-                     target block: {:?}",
-                    max_copy_height,
-                    source_block_hash,
-                    target_block_commit_hash,
-                    target_block_data_hash,
-                    source_block,
-                    target_block,
+                     max copy height: {max_copy_height:?},\n \
+                     source hash: {source_block_hash:?},\n \
+                     target commit hash: {target_block_commit_hash:?},\n \
+                     target data hash: {target_block_data_hash:?},\n \
+                     source block: {source_block:?},\n \
+                     target block: {target_block:?}",
                 ))?;
             }
 
@@ -330,10 +318,7 @@ impl CopyStateCmd {
             new_zs::Response::Tip(Some(target_tip)) => target_tip,
             new_zs::Response::Tip(None) => Err("empty target state: expected written blocks")?,
 
-            response => Err(format!(
-                "unexpected response to Tip request: {:?}",
-                response,
-            ))?,
+            response => Err(format!("unexpected response to Tip request: {response:?}",))?,
         };
         let final_target_tip_height = final_target_tip.0 .0;
         let final_target_tip_hash = final_target_tip.1;
@@ -347,8 +332,7 @@ impl CopyStateCmd {
             old_zs::Response::Depth(source_depth) => source_depth,
 
             response => Err(format!(
-                "unexpected response to Depth request: {:?}",
-                response,
+                "unexpected response to Depth request: {response:?}",
             ))?,
         };
 
@@ -361,16 +345,11 @@ impl CopyStateCmd {
             if source_tip != final_target_tip || target_tip_source_depth != expected_target_depth {
                 Err(format!(
                     "unexpected mismatch between source and target tips,\n \
-                     max copy height: {:?},\n \
-                     source tip: {:?},\n \
-                     target tip: {:?},\n \
-                     actual target tip depth in source: {:?},\n \
-                     expect target tip depth in source: {:?}",
-                    max_copy_height,
-                    source_tip,
-                    final_target_tip,
-                    target_tip_source_depth,
-                    expected_target_depth,
+                     max copy height: {max_copy_height:?},\n \
+                     source tip: {source_tip:?},\n \
+                     target tip: {final_target_tip:?},\n \
+                     actual target tip depth in source: {target_tip_source_depth:?},\n \
+                     expect target tip depth in source: {expected_target_depth:?}",
                 ))?;
             } else {
                 info!(
@@ -386,16 +365,11 @@ impl CopyStateCmd {
             if target_tip_source_depth != expected_target_depth {
                 Err(format!(
                     "unexpected mismatch between source and target tips,\n \
-                     max copy height: {:?},\n \
-                     source tip: {:?},\n \
-                     target tip: {:?},\n \
-                     actual target tip depth in source: {:?},\n \
-                     expect target tip depth in source: {:?}",
-                    max_copy_height,
-                    source_tip,
-                    final_target_tip,
-                    target_tip_source_depth,
-                    expected_target_depth,
+                     max copy height: {max_copy_height:?},\n \
+                     source tip: {source_tip:?},\n \
+                     target tip: {final_target_tip:?},\n \
+                     actual target tip depth in source: {target_tip_source_depth:?},\n \
+                     expect target tip depth in source: {expected_target_depth:?}",
                 ))?;
             } else {
                 info!(

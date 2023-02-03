@@ -215,7 +215,12 @@ impl Config {
                 // the full list of IP addresses will be shown in the log message
                 let debug_span = debug_span!("", remote_ip_addrs = ?ip_addrs);
                 let _span_guard = debug_span.enter();
+
+                // This log is needed for user debugging, but it's annoying during tests.
+                #[cfg(not(test))]
                 info!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
+                #[cfg(test)]
+                debug!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
 
                 for ip in &ip_addrs {
                     // Count each initial peer, recording the seed config and resolved IP address.
@@ -326,8 +331,7 @@ impl<'de> Deserialize<'de> for Config {
             Err(_) => match config.listen_addr.parse::<IpAddr>() {
                 Ok(ip) => Ok(SocketAddr::new(ip, config.network.default_port())),
                 Err(err) => Err(de::Error::custom(format!(
-                    "{}; Hint: addresses can be a IPv4, IPv6 (with brackets), or a DNS name, the port is optional",
-                    err
+                    "{err}; Hint: addresses can be a IPv4, IPv6 (with brackets), or a DNS name, the port is optional"
                 ))),
             },
         }?;

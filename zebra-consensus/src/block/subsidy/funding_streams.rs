@@ -2,18 +2,17 @@
 //!
 //! [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 
+use std::{collections::HashMap, str::FromStr};
+
 use zebra_chain::{
     amount::{Amount, Error, NonNegative},
     block::Height,
     parameters::{Network, NetworkUpgrade::*},
-    serialization::ZcashSerialize,
     transaction::Transaction,
-    transparent::{Address, Output, Script},
+    transparent::{self, Script},
 };
 
 use crate::{block::subsidy::general::block_subsidy, parameters::subsidy::*};
-
-use std::{collections::HashMap, str::FromStr};
 
 #[cfg(test)]
 mod tests;
@@ -105,54 +104,75 @@ fn funding_stream_address_index(height: Height, network: Network) -> usize {
 }
 
 /// Return the address corresponding to given height, network and funding stream receiver.
+///
+/// This function only returns transparent addresses, because the current Zcash funding streams
+/// only use transparent addresses,
 pub fn funding_stream_address(
     height: Height,
     network: Network,
     receiver: FundingStreamReceiver,
-) -> Address {
+) -> transparent::Address {
     let index = funding_stream_address_index(height, network);
     let address = &FUNDING_STREAM_ADDRESSES
         .get(&network)
         .expect("there is always another hash map as value for a given valid network")
         .get(&receiver)
         .expect("in the inner hash map there is always a vector of strings with addresses")[index];
-    Address::from_str(address).expect("Address should deserialize")
+    transparent::Address::from_str(address).expect("address should deserialize")
 }
 
-/// Given a funding stream address, create a script and check if it is the same
+/// Return a human-readable name and a specification URL for the funding stream `receiver`.
+pub fn funding_stream_recipient_info(
+    receiver: FundingStreamReceiver,
+) -> (&'static str, &'static str) {
+    let name = FUNDING_STREAM_NAMES
+        .get(&receiver)
+        .expect("all funding streams have a name");
+
+    (name, FUNDING_STREAM_SPECIFICATION)
+}
+
+/// Given a funding stream P2SH address, create a script and check if it is the same
 /// as the given lock_script as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub fn check_script_form(lock_script: &Script, address: Address) -> bool {
-    let mut address_hash = address
-        .zcash_serialize_to_vec()
-        .expect("we should get address bytes here");
+pub fn check_script_form(lock_script: &Script, address: transparent::Address) -> bool {
+    assert!(
+        address.is_script_hash(),
+        "incorrect funding stream address constant: {address} \
+         Zcash only supports transparent 'pay to script hash' (P2SH) addresses",
+    );
 
-    address_hash = address_hash[2..22].to_vec();
-    address_hash.insert(0, OpCode::Push20Bytes as u8);
-    address_hash.insert(0, OpCode::Hash160 as u8);
-    address_hash.insert(address_hash.len(), OpCode::Equal as u8);
-    if lock_script.as_raw_bytes().len() == address_hash.len()
-        && *lock_script == Script::new(&address_hash)
-    {
-        return true;
-    }
-    false
+    // Verify a Bitcoin P2SH single or multisig address.
+    let standard_script_hash = new_coinbase_script(address);
+
+    lock_script == &standard_script_hash
 }
 
-/// Returns a list of outputs in `Transaction`, which have a script address equal to `Address`.
-pub fn filter_outputs_by_address(transaction: &Transaction, address: Address) -> Vec<Output> {
+/// Returns a new funding stream coinbase output lock script, which pays to the P2SH `address`.
+pub fn new_coinbase_script(address: transparent::Address) -> Script {
+    assert!(
+        address.is_script_hash(),
+        "incorrect coinbase script address: {address} \
+         Funding streams only support transparent 'pay to script hash' (P2SH) addresses",
+    );
+
+    // > The “prescribed way” to pay a transparent P2SH address is to use a standard P2SH script
+    // > of the form OP_HASH160 fs.RedeemScriptHash(height) OP_EQUAL as the scriptPubKey.
+    //
+    // [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
+    address.create_script_from_address()
+}
+
+/// Returns a list of outputs in `transaction`, which have a script address equal to `address`.
+pub fn filter_outputs_by_address(
+    transaction: &Transaction,
+    address: transparent::Address,
+) -> Vec<transparent::Output> {
     transaction
         .outputs()
         .iter()
         .filter(|o| check_script_form(&o.lock_script, address))
         .cloned()
         .collect()
-}
-
-/// Script opcodes needed to compare the `lock_script` with the funding stream reward address.
-pub enum OpCode {
-    Equal = 0x87,
-    Hash160 = 0xa9,
-    Push20Bytes = 0x14,
 }

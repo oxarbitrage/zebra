@@ -21,19 +21,16 @@ use thiserror::Error;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
-use zebra_chain::{
-    amount::Amount,
-    block::{self, Block},
-    parameters::Network,
-    transparent,
-    work::equihash,
-};
+use zebra_chain::{amount::Amount, block, parameters::Network, transparent, work::equihash};
 use zebra_state as zs;
 
 use crate::{error::*, transaction as tx, BoxError};
 
 pub mod check;
-mod subsidy;
+pub mod request;
+pub mod subsidy;
+
+pub use request::Request;
 
 #[cfg(test)]
 mod tests;
@@ -71,10 +68,27 @@ pub enum VerifyBlockError {
     Time(zebra_chain::block::BlockTimeError),
 
     #[error("unable to commit block after semantic verification")]
+    // TODO: make this into a concrete type, and add it to is_duplicate_request() (#2908)
     Commit(#[source] BoxError),
+
+    #[cfg(feature = "getblocktemplate-rpcs")]
+    #[error("unable to validate block proposal: failed semantic verification (proof of work is not checked for proposals)")]
+    // TODO: make this into a concrete type (see #5732)
+    ValidateProposal(#[source] BoxError),
 
     #[error("invalid transaction")]
     Transaction(#[from] TransactionError),
+}
+
+impl VerifyBlockError {
+    /// Returns `true` if this is definitely a duplicate request.
+    /// Some duplicate requests might not be detected, and therefore return `false`.
+    pub fn is_duplicate_request(&self) -> bool {
+        match self {
+            VerifyBlockError::Block { source, .. } => source.is_duplicate_request(),
+            _ => false,
+        }
+    }
 }
 
 /// The maximum allowed number of legacy signature check operations in a block.
@@ -93,6 +107,7 @@ where
     V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     V::Future: Send + 'static,
 {
+    /// Creates a new BlockVerifier
     pub fn new(network: Network, state_service: S, transaction_verifier: V) -> Self {
         Self {
             network,
@@ -102,7 +117,7 @@ where
     }
 }
 
-impl<S, V> Service<Arc<Block>> for BlockVerifier<S, V>
+impl<S, V> Service<Request> for BlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
@@ -121,10 +136,12 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, block: Arc<Block>) -> Self::Future {
+    fn call(&mut self, request: Request) -> Self::Future {
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network;
+
+        let block = request.block();
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
@@ -159,10 +176,17 @@ where
                 Err(BlockError::MaxHeight(height, hash, block::Height::MAX))?;
             }
 
-            // Do the difficulty checks first, to raise the threshold for
-            // attacks that use any other fields.
-            check::difficulty_is_valid(&block.header, network, &height, &hash)?;
-            check::equihash_solution_is_valid(&block.header)?;
+            // > The block data MUST be validated and checked against the server's usual
+            // > acceptance rules (excluding the check for a valid proof-of-work).
+            // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
+            if request.is_proposal() {
+                check::difficulty_threshold_is_valid(&block.header, network, &height, &hash)?;
+            } else {
+                // Do the difficulty checks first, to raise the threshold for
+                // attacks that use any other fields.
+                check::difficulty_is_valid(&block.header, network, &height, &hash)?;
+                check::equihash_solution_is_valid(&block.header)?;
+            }
 
             // Next, check the Merkle root validity, to ensure that
             // the header binds to the transactions in the blocks.
@@ -225,13 +249,10 @@ where
 
                 assert!(
                     matches!(response, tx::Response::Block { .. }),
-                    "unexpected response from transaction verifier: {:?}",
-                    response
+                    "unexpected response from transaction verifier: {response:?}"
                 );
 
-                legacy_sigop_count += response
-                    .legacy_sigop_count()
-                    .expect("block transaction responses must have a legacy sigop count");
+                legacy_sigop_count += response.legacy_sigop_count();
 
                 // Coinbase transactions consume the miner fee,
                 // so they don't add any value to the block's total miner fee.
@@ -269,6 +290,23 @@ where
                 new_outputs,
                 transaction_hashes,
             };
+
+            // Return early for proposal requests when getblocktemplate-rpcs feature is enabled
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            if request.is_proposal() {
+                return match state_service
+                    .ready()
+                    .await
+                    .map_err(VerifyBlockError::ValidateProposal)?
+                    .call(zs::Request::CheckBlockProposalValidity(prepared_block))
+                    .await
+                    .map_err(VerifyBlockError::ValidateProposal)?
+                {
+                    zs::Response::ValidBlockProposal => Ok(hash),
+                    _ => unreachable!("wrong response for CheckBlockProposalValidity"),
+                };
+            }
+
             match state_service
                 .ready()
                 .await

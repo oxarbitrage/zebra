@@ -2,24 +2,22 @@
 //!
 //! It is used when Zebra is a long way behind the current chain tip.
 
-use std::{cmp::max, collections::HashSet, pin::Pin, sync::Arc, task::Poll, time::Duration};
+use std::{cmp::max, collections::HashSet, pin::Pin, task::Poll, time::Duration};
 
 use color_eyre::eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexSet;
-use tokio::time::sleep;
+use serde::{Deserialize, Serialize};
+use tokio::{sync::watch, time::sleep};
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, retry::Retry, timeout::Timeout,
     Service, ServiceExt,
 };
 
 use zebra_chain::{
-    block::{self, Block, Height},
+    block::{self, Height},
     chain_tip::ChainTip,
     parameters::genesis_hash,
-};
-use zebra_consensus::{
-    chain::VerifyChainError, BlockError, VerifyBlockError, VerifyCheckpointError,
 };
 use zebra_network as zn;
 use zebra_state as zs;
@@ -39,6 +37,7 @@ mod tests;
 
 use downloads::{AlwaysHedge, Downloads};
 
+pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
 pub use gossip::{gossip_best_tip_block_hashes, BlockGossipError};
 pub use progress::show_block_chain_progress;
 pub use recent_sync_lengths::RecentSyncLengths;
@@ -81,10 +80,7 @@ pub const MIN_CHECKPOINT_CONCURRENCY_LIMIT: usize = zebra_consensus::MAX_CHECKPO
 /// The default for the user-specified lookahead limit.
 ///
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
-///
-/// TODO: increase to `MAX_CHECKPOINT_HEIGHT_GAP * 5`, after we implement orchard batching
-pub const DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT: usize =
-    zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP * 3;
+pub const DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT: usize = MAX_TIPS_RESPONSE_HASH_COUNT * 2;
 
 /// A lower bound on the user-specified concurrency limit.
 ///
@@ -123,7 +119,9 @@ pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 ///
 /// If this timeout is set too low, the syncer will sometimes get stuck in a
 /// failure loop.
-pub(super) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// We set the timeout so that it requires under 1 Mbps bandwidth for a full 2 MB block.
+pub(super) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Controls how long we wait for a block verify request to complete.
 ///
@@ -152,8 +150,22 @@ pub(super) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// If this timeout is set too low, the syncer will sometimes get stuck in a
 /// failure loop.
 ///
-/// TODO: reduce to `6 * 60`, after we implement orchard batching?
-pub(super) const BLOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// We've observed spurious 15 minute timeouts when a lot of blocks are being committed to
+/// the state. But there are also some blocks that seem to hang entirely, and never return.
+///
+/// So we allow about half the spurious timeout, which might cause some re-downloads.
+pub(super) const BLOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+
+/// A shorter timeout used for the first few blocks after the final checkpoint.
+///
+/// This is a workaround for bug #5125, where the first fully validated blocks
+/// after the final checkpoint fail with a timeout, due to a UTXO race condition.
+const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// The number of blocks after the final checkpoint that get the shorter timeout.
+///
+/// We've only seen this error on the first few blocks after the final checkpoint.
+const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: i32 = 100;
 
 /// Controls how long we wait to restart syncing after finishing a sync run.
 ///
@@ -189,6 +201,83 @@ const SYNC_RESTART_DELAY: Duration = Duration::from_secs(67);
 /// a denial of service on those peers.
 const GENESIS_TIMEOUT_RETRY: Duration = Duration::from_secs(5);
 
+/// Sync configuration section.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    /// The number of parallel block download requests.
+    ///
+    /// This is set to a low value by default, to avoid task and
+    /// network contention. Increasing this value may improve
+    /// performance on machines with a fast network connection.
+    #[serde(alias = "max_concurrent_block_requests")]
+    pub download_concurrency_limit: usize,
+
+    /// The number of blocks submitted in parallel to the checkpoint verifier.
+    ///
+    /// Increasing this limit increases the buffer size, so it reduces
+    /// the impact of an individual block request failing. However, it
+    /// also increases memory and CPU usage if block validation stalls,
+    /// or there are some large blocks in the pipeline.
+    ///
+    /// The block size limit is 2MB, so in theory, this could represent multiple
+    /// gigabytes of data, if we downloaded arbitrary blocks. However,
+    /// because we randomly load balance outbound requests, and separate
+    /// block download from obtaining block hashes, an adversary would
+    /// have to control a significant fraction of our peers to lead us
+    /// astray.
+    ///
+    /// For reliable checkpoint syncing, Zebra enforces a
+    /// [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`](MIN_CHECKPOINT_CONCURRENCY_LIMIT).
+    ///
+    /// This is set to a high value by default, to avoid verification pipeline stalls.
+    /// Decreasing this value reduces RAM usage.
+    #[serde(alias = "lookahead_limit")]
+    pub checkpoint_verify_concurrency_limit: usize,
+
+    /// The number of blocks submitted in parallel to the full verifier.
+    ///
+    /// This is set to a low value by default, to avoid verification timeouts on large blocks.
+    /// Increasing this value may improve performance on machines with many cores.
+    pub full_verify_concurrency_limit: usize,
+
+    /// The number of threads used to verify signatures, proofs, and other CPU-intensive code.
+    ///
+    /// Set to `0` by default, which uses one thread per available CPU core.
+    /// For details, see [the `rayon` documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
+    pub parallel_cpu_threads: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            // 2/3 of the default outbound peer limit.
+            download_concurrency_limit: 50,
+
+            // A few max-length checkpoints.
+            checkpoint_verify_concurrency_limit: DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT,
+
+            // This default is deliberately very low, so Zebra can verify a few large blocks in under 60 seconds,
+            // even on machines with only a few cores.
+            //
+            // This lets users see the committed block height changing in every progress log,
+            // and avoids hangs due to out-of-order verifications flooding the CPUs.
+            //
+            // TODO:
+            // - limit full verification concurrency based on block transaction counts?
+            // - move more disk work to blocking tokio threads,
+            //   and CPU work to the rayon thread pool inside blocking tokio threads
+            full_verify_concurrency_limit: 20,
+
+            // Use one thread per CPU.
+            //
+            // If this causes tokio executor starvation, move CPU-intensive tasks to rayon threads,
+            // or reserve a few cores for tokio threads, based on `num_cpus()`.
+            parallel_cpu_threads: 0,
+        }
+    }
+}
+
 /// Helps work around defects in the bitcoin protocol by checking whether
 /// the returned hashes actually extend a chain tip.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -211,7 +300,7 @@ where
         + Clone
         + 'static,
     ZS::Future: Send,
-    ZV: Service<Arc<Block>, Response = block::Hash, Error = BoxError>
+    ZV: Service<zebra_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
         + Clone
@@ -266,6 +355,10 @@ where
 
     /// The lengths of recent sync responses.
     recent_syncs: RecentSyncLengths,
+
+    /// Receiver that is `true` when the downloader is past the lookahead limit.
+    /// This is based on the downloaded block height and the state tip height.
+    past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -288,7 +381,7 @@ where
         + Clone
         + 'static,
     ZS::Future: Send,
-    ZV: Service<Arc<Block>, Response = block::Hash, Error = BoxError>
+    ZV: Service<zebra_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
         + Clone
@@ -345,6 +438,7 @@ where
         }
 
         let tip_network = Timeout::new(peers.clone(), TIPS_RESPONSE_TIMEOUT);
+
         // The Hedge middleware is the outermost layer, hedging requests
         // between two retry-wrapped networks.  The innermost timeout
         // layer is relatively unimportant, because slow requests will
@@ -371,26 +465,33 @@ where
 
         let (sync_status, recent_syncs) = SyncStatus::new();
 
+        let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
+        let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
+
+        let downloads = Box::pin(Downloads::new(
+            block_network,
+            verifier,
+            latest_chain_tip.clone(),
+            past_lookahead_limit_sender,
+            max(
+                checkpoint_verify_concurrency_limit,
+                full_verify_concurrency_limit,
+            ),
+            max_checkpoint_height,
+        ));
+
         let new_syncer = Self {
             genesis_hash: genesis_hash(config.network.network),
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
             tip_network,
-            downloads: Box::pin(Downloads::new(
-                block_network,
-                verifier,
-                latest_chain_tip.clone(),
-                // TODO: change the download lookahead for full verification?
-                max(
-                    checkpoint_verify_concurrency_limit,
-                    full_verify_concurrency_limit,
-                ),
-            )),
+            downloads,
             state,
             latest_chain_tip,
             prospective_tips: HashSet::new(),
             recent_syncs,
+            past_lookahead_limit_receiver,
         };
 
         (new_syncer, sync_status)
@@ -451,7 +552,14 @@ where
             }
             self.update_metrics();
 
-            while self.downloads.in_flight() >= self.lookahead_limit(extra_hashes.len()) {
+            // Pause new downloads while the syncer or downloader are past their lookahead limits.
+            //
+            // To avoid a deadlock or long waits for blocks to expire, we ignore the download
+            // lookahead limit when there are only a small number of blocks waiting.
+            while self.downloads.in_flight() >= self.lookahead_limit(extra_hashes.len())
+                || (self.downloads.in_flight() >= self.lookahead_limit(extra_hashes.len()) / 2
+                    && self.past_lookahead_limit_receiver.cloned_watch_data())
+            {
                 trace!(
                     tips.len = self.prospective_tips.len(),
                     in_flight = self.downloads.in_flight(),
@@ -863,7 +971,7 @@ where
     }
 
     /// The configured lookahead limit, based on the currently verified height,
-    /// and the number of hashes we haven't queued yet..
+    /// and the number of hashes we haven't queued yet.
     fn lookahead_limit(&self, new_hashes: usize) -> usize {
         let max_checkpoint_height: usize = self
             .max_checkpoint_height
@@ -896,6 +1004,7 @@ where
     /// Handles a response for a requested block.
     ///
     /// See [`Self::handle_response`] for more details.
+    #[allow(unknown_lints)]
     fn handle_block_response(
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
@@ -913,6 +1022,7 @@ where
     /// Handles a response to block hash submission, passing through any extra hashes.
     ///
     /// See [`Self::handle_response`] for more details.
+    #[allow(unknown_lints)]
     fn handle_hash_response(
         response: Result<IndexSet<block::Hash>, BlockDownloadVerifyError>,
     ) -> Result<IndexSet<block::Hash>, BlockDownloadVerifyError> {
@@ -928,6 +1038,7 @@ where
     /// so that the synchronization can continue normally.
     ///
     /// Returns `Err` if an unexpected error occurred, to force the synchronizer to restart.
+    #[allow(unknown_lints)]
     fn handle_response<T>(
         response: Result<T, BlockDownloadVerifyError>,
     ) -> Result<(), BlockDownloadVerifyError> {
@@ -981,21 +1092,8 @@ where
     fn should_restart_sync(e: &BlockDownloadVerifyError) -> bool {
         match e {
             // Structural matches: downcasts
-            BlockDownloadVerifyError::Invalid {
-                error: VerifyChainError::Checkpoint(VerifyCheckpointError::AlreadyVerified { .. }),
-                ..
-            } => {
+            BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
                 debug!(error = ?e, "block was already verified, possibly from a previous sync run, continuing");
-                false
-            }
-            BlockDownloadVerifyError::Invalid {
-                error:
-                    VerifyChainError::Block(VerifyBlockError::Block {
-                        source: BlockError::AlreadyInChain(_, _),
-                    }),
-                ..
-            } => {
-                debug!(error = ?e, "block is already in chain, possibly from a previous sync run, continuing");
                 false
             }
 
@@ -1023,16 +1121,22 @@ where
             }
 
             // String matches
-            BlockDownloadVerifyError::Invalid {
-                error: VerifyChainError::Block(VerifyBlockError::Commit(ref source)),
-                ..
-            } if format!("{:?}", source).contains("block is already committed to the state") => {
+            //
+            // We want to match VerifyChainError::Block(VerifyBlockError::Commit(ref source)),
+            // but that type is boxed.
+            // TODO:
+            // - turn this check into a function on VerifyChainError, like is_duplicate_request()
+            BlockDownloadVerifyError::Invalid { error, .. }
+                if format!("{error:?}").contains("block is already committed to the state")
+                    || format!("{error:?}")
+                        .contains("block has already been sent to be committed to the state") =>
+            {
                 // TODO: improve this by checking the type (#2908)
-                debug!(error = ?e, "block is already committed, possibly from a previous sync run, continuing");
+                debug!(error = ?e, "block is already committed or pending a commit, possibly from a previous sync run, continuing");
                 false
             }
             BlockDownloadVerifyError::DownloadFailed { ref error, .. }
-                if format!("{:?}", error).contains("NotFound") =>
+                if format!("{error:?}").contains("NotFound") =>
             {
                 // Covers these errors:
                 // - NotFoundResponse
@@ -1054,10 +1158,11 @@ where
                 //
                 // TODO: add a proper test and remove this
                 // https://github.com/ZcashFoundation/zebra/issues/2909
-                let err_str = format!("{:?}", e);
+                let err_str = format!("{e:?}");
                 if err_str.contains("AlreadyVerified")
                     || err_str.contains("AlreadyInChain")
                     || err_str.contains("block is already committed to the state")
+                    || err_str.contains("block has already been sent to be committed to the state")
                     || err_str.contains("NotFound")
                 {
                     error!(?e,

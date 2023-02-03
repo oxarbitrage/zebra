@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 
 use crate::{
+    fmt::HexDebug,
     serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
@@ -58,7 +59,7 @@ pub struct Header {
     /// this field cannot be parsed without the network and height. Use
     /// [`Block::commitment`](super::Block::commitment) to get the parsed
     /// [`Commitment`](super::Commitment).
-    pub commitment_bytes: [u8; 32],
+    pub commitment_bytes: HexDebug<[u8; 32]>,
 
     /// The block timestamp is a Unix epoch time (UTC) when the miner
     /// started hashing the header (according to the miner).
@@ -77,7 +78,7 @@ pub struct Header {
     /// An arbitrary field that miners can change to modify the header
     /// hash in order to produce a hash less than or equal to the
     /// target threshold.
-    pub nonce: [u8; 32],
+    pub nonce: HexDebug<[u8; 32]>,
 
     /// The Equihash solution.
     pub solution: Solution,
@@ -145,6 +146,12 @@ const BLOCK_HEADER_LENGTH: usize =
 ///
 /// A CountedHeader has BLOCK_HEADER_LENGTH bytes + 1 or more bytes for the transaction count
 pub(crate) const MIN_COUNTED_HEADER_LEN: usize = BLOCK_HEADER_LENGTH + 1;
+
+/// The Zcash accepted block version.
+///
+/// The consensus rules do not force the block version to be this value but just equal or greater than it.
+/// However, it is suggested that submitted block versions to be of this exact value.
+pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
     fn max_allocation() -> u64 {
