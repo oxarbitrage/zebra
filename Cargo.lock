@@ -313,8 +313,8 @@ dependencies = [
  "blake2s_simd",
  "byteorder",
  "crossbeam-channel",
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "lazy_static",
  "log",
  "num_cpus",
@@ -486,8 +486,8 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62250ece575fa9b22068b3a8d59586f01d426dd7785522efd97632959e71c986"
 dependencies = [
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "pairing",
  "rand_core 0.6.4",
  "subtle",
@@ -1325,6 +1325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded41244b729663b1e574f1b4fb731469f69f79c17667b5d776b16cda0479449"
+dependencies = [
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "fixed-hash"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1600,8 +1610,19 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dfbfb3a6cfbd390d5c9564ab283a0349b9b9fcd46a706c1eb10e0db70bfbac7"
 dependencies = [
- "ff",
+ "ff 0.12.0",
  "memuse",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "group"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
+dependencies = [
+ "ff 0.13.0",
  "rand_core 0.6.4",
  "subtle",
 ]
@@ -1659,8 +1680,8 @@ checksum = "85e10bf9924da1754e443641c9e7f9f00483749f8fb837fde696ef6ed6e2f079"
 dependencies = [
  "arrayvec",
  "bitvec",
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "halo2_proofs",
  "lazy_static",
  "pasta_curves",
@@ -1676,8 +1697,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cff771b9a2445cd2545c9ef26d863c290fbb44ae440c825a20eb7156f67a949a"
 dependencies = [
  "blake2b_simd",
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "pasta_curves",
  "rand_core 0.6.4",
  "rayon",
@@ -2135,8 +2156,8 @@ checksum = "a575df5f985fe1cd5b2b05664ff6accfc46559032b954529fd225a2168d27b0f"
 dependencies = [
  "bitvec",
  "bls12_381",
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "rand_core 0.6.4",
  "subtle",
 ]
@@ -2642,9 +2663,9 @@ dependencies = [
  "aes",
  "bitvec",
  "blake2b_simd",
- "ff",
+ "ff 0.12.0",
  "fpe",
- "group",
+ "group 0.12.1",
  "halo2_gadgets",
  "halo2_proofs",
  "hex",
@@ -2715,7 +2736,7 @@ version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135590d8bdba2b31346f9cd1fb2a912329f5135e832a4f422942eb6ead8b6b3b"
 dependencies = [
- "group",
+ "group 0.12.1",
 ]
 
 [[package]]
@@ -2810,8 +2831,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "369d7785168ad7ff0cbe467d968ca3e19a927d8536b11ef9c21b4e454b15ba42"
 dependencies = [
  "blake2b_simd",
- "ff",
- "group",
+ "ff 0.12.0",
+ "group 0.12.1",
  "lazy_static",
  "rand 0.8.5",
  "static_assertions",
@@ -3365,7 +3386,7 @@ checksum = "4cc8038c8b7e481bdf688d0585d4897ed0e9e0cee10aa365dde51238c20e4182"
 dependencies = [
  "blake2b_simd",
  "byteorder",
- "group",
+ "group 0.12.1",
  "jubjub",
  "pasta_curves",
  "rand_core 0.6.4",
@@ -3382,7 +3403,7 @@ checksum = "c56c56c88c633d5ccc03ec3931a0d3991c2ae8d92c049ece060d41f6662a818c"
 dependencies = [
  "blake2b_simd",
  "byteorder",
- "group",
+ "group 0.12.1",
  "hex",
  "jubjub",
  "pasta_curves",
@@ -5335,9 +5356,9 @@ dependencies = [
  "byteorder",
  "chacha20poly1305",
  "equihash",
- "ff",
+ "ff 0.12.0",
  "fpe",
- "group",
+ "group 0.12.1",
  "hdwallet",
  "hex",
  "incrementalmerkletree",
@@ -5371,9 +5392,9 @@ dependencies = [
  "bls12_381",
  "byteorder",
  "equihash",
- "ff",
+ "ff 0.12.0",
  "fpe",
- "group",
+ "group 0.12.1",
  "hdwallet",
  "hex",
  "incrementalmerkletree",
@@ -5403,7 +5424,7 @@ dependencies = [
  "blake2b_simd",
  "bls12_381",
  "directories",
- "group",
+ "group 0.12.1",
  "jubjub",
  "lazy_static",
  "minreq",
@@ -5455,7 +5476,7 @@ dependencies = [
  "ed25519-zebra",
  "equihash",
  "futures",
- "group",
+ "group 0.13.0",
  "halo2_proofs",
  "hex",
  "humantime",
