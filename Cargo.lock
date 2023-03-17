@@ -5374,6 +5374,39 @@ dependencies = [
  "ff",
  "fpe",
  "group",
+ "hex",
+ "incrementalmerkletree",
+ "jubjub",
+ "lazy_static",
+ "memuse",
+ "nonempty",
+ "orchard",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "sha2",
+ "subtle",
+ "zcash_address",
+ "zcash_encoding",
+ "zcash_note_encryption",
+]
+
+[[package]]
+name = "zcash_primitives"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec8aed1d098e9f1b2bcd957ceab4188bf343cea30e7d0327fa49cea6ec44b167"
+dependencies = [
+ "aes",
+ "bip0039",
+ "bitvec",
+ "blake2b_simd",
+ "blake2s_simd",
+ "bls12_381",
+ "byteorder",
+ "equihash",
+ "ff",
+ "fpe",
+ "group",
  "hdwallet",
  "hex",
  "incrementalmerkletree",
@@ -5492,7 +5525,7 @@ dependencies = [
  "zcash_encoding",
  "zcash_history",
  "zcash_note_encryption",
- "zcash_primitives 0.9.1",
+ "zcash_primitives 0.10.2",
  "zebra-test",
 ]
 
