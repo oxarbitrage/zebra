@@ -10,14 +10,15 @@ use zebra_chain::{
     block, chain_tip::ChainTip, parameters::Network, serialization::ZcashDeserializeInto,
 };
 
-use super::{BlockHeightPairAcrossNetworkUpgrades, PeerSetBuilder, PeerVersions};
 use crate::{
     constants::CURRENT_NETWORK_PROTOCOL_VERSION,
     peer::{ClientTestHarness, LoadTrackedClient, MinimumPeerVersion, ReceiveRequestAttempt},
     peer_set::PeerSet,
     protocol::external::types::Version,
-    Request,
+    PeerSocketAddr, Request,
 };
+
+use super::{BlockHeightPairAcrossNetworkUpgrades, PeerSetBuilder, PeerVersions};
 
 proptest! {
     /// Check if discovered outdated peers are immediately dropped by the [`PeerSet`].
@@ -41,6 +42,7 @@ proptest! {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version)
+                .max_conns_per_ip(usize::MAX)
                 .build();
 
             check_if_only_up_to_date_peers_are_live(
@@ -71,6 +73,7 @@ proptest! {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version.clone())
+                .max_conns_per_ip(usize::MAX)
                 .build();
 
             check_if_only_up_to_date_peers_are_live(
@@ -121,6 +124,7 @@ proptest! {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version.clone())
+                .max_conns_per_ip(usize::MAX)
                 .build();
 
             // Get the total number of active peers
@@ -196,11 +200,12 @@ proptest! {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version.clone())
+                .max_conns_per_ip(usize::MAX)
                 .build();
 
             // Remove peers, test broadcast until there is only 1 peer left in the peerset
             for port in 1u16..total_number_of_peers as u16 {
-                peer_set.remove(&SocketAddr::new([127, 0, 0, 1].into(), port));
+                peer_set.remove(&SocketAddr::new([127, 0, 0, 1].into(), port).into());
                 handles.remove(0);
 
                 // poll the peers
@@ -266,11 +271,12 @@ proptest! {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version.clone())
+                .max_conns_per_ip(usize::MAX)
                 .build();
 
             // Remove peers
             for port in 1u16..=total_number_of_peers as u16 {
-                peer_set.remove(&SocketAddr::new([127, 0, 0, 1].into(), port));
+                peer_set.remove(&SocketAddr::new([127, 0, 0, 1].into(), port).into());
                 handles.remove(0);
             }
 
@@ -294,7 +300,7 @@ fn check_if_only_up_to_date_peers_are_live<D, C>(
     minimum_version: Version,
 ) -> Result<usize, TestCaseError>
 where
-    D: Discover<Key = SocketAddr, Service = LoadTrackedClient> + Unpin,
+    D: Discover<Key = PeerSocketAddr, Service = LoadTrackedClient> + Unpin,
     D::Error: Into<BoxError>,
     C: ChainTip,
 {
@@ -305,7 +311,7 @@ where
         .all(|harness| harness.remote_version() < minimum_version);
 
     if all_peers_are_outdated {
-        prop_assert!(matches!(poll_result, None));
+        prop_assert!(poll_result.is_none());
     } else {
         prop_assert!(matches!(poll_result, Some(Ok(_))));
     }

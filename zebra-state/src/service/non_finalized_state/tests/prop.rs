@@ -6,7 +6,7 @@ use zebra_test::prelude::*;
 
 use zebra_chain::{
     amount::NonNegative,
-    block::{self, arbitrary::allow_all_transparent_coinbase_spends, Block},
+    block::{self, arbitrary::allow_all_transparent_coinbase_spends, Block, Height},
     fmt::DisplayToDebug,
     history_tree::{HistoryTree, NonEmptyHistoryTree},
     parameters::NetworkUpgrade::*,
@@ -17,7 +17,7 @@ use zebra_chain::{
 
 use crate::{
     arbitrary::Prepare,
-    request::ContextuallyValidBlock,
+    request::ContextuallyVerifiedBlock,
     service::{
         arbitrary::PreparedChain,
         finalized_state::FinalizedState,
@@ -47,15 +47,15 @@ fn push_genesis_chain() -> Result<()> {
         |((chain, count, network, empty_tree) in PreparedChain::default())| {
             prop_assert!(empty_tree.is_none());
 
-            let mut only_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), empty_tree, ValueBalance::zero());
+            let mut only_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, ValueBalance::zero());
             // contains the block value pool changes and chain value pool balances for each height
             let mut chain_values = BTreeMap::new();
 
             chain_values.insert(None, (None, only_chain.chain_value_pools.into()));
 
-            for block in chain.iter().take(count).cloned() {
+            for block in chain.iter().take(count).skip(1).cloned() {
                 let block =
-                    ContextuallyValidBlock::with_block_and_spent_utxos(
+                ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                         block,
                         only_chain.unspent_utxos(),
                     )
@@ -72,7 +72,7 @@ fn push_genesis_chain() -> Result<()> {
                 chain_values.insert(block.height.into(), (block.chain_value_pool_change.into(), only_chain.chain_value_pools.into()));
             }
 
-            prop_assert_eq!(only_chain.blocks.len(), count);
+            prop_assert_eq!(only_chain.blocks.len(), count - 1);
         });
 
     Ok(())
@@ -99,12 +99,12 @@ fn push_history_tree_chain() -> Result<()> {
         let count = std::cmp::min(count, chain.len() - 1);
         let chain = &chain[1..];
 
-        let mut only_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
+        let mut only_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
 
         for block in chain
             .iter()
             .take(count)
-            .map(ContextuallyValidBlock::test_with_zero_chain_pool_change) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change) {
                 only_chain = only_chain.push(block)?;
             }
 
@@ -143,14 +143,15 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // correspond to the blocks in the original chain before the fork.
         let mut partial_chain = Chain::new(
             network,
+            Height(0),
             Default::default(),
             Default::default(),
             Default::default(),
             empty_tree.clone(),
             ValueBalance::zero(),
         );
-        for block in chain.iter().take(fork_at_count).cloned() {
-            let block = ContextuallyValidBlock::with_block_and_spent_utxos(
+        for block in chain.iter().take(fork_at_count).skip(1).cloned() {
+            let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                 block,
                 partial_chain.unspent_utxos(),
             )?;
@@ -162,20 +163,19 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // This chain will be forked.
         let mut full_chain = Chain::new(
             network,
+            Height(0),
             Default::default(),
             Default::default(),
             Default::default(),
-            empty_tree.clone(),
+            empty_tree,
             ValueBalance::zero(),
         );
+
         for block in chain.iter().cloned() {
             let block =
-                ContextuallyValidBlock::with_block_and_spent_utxos(block, full_chain.unspent_utxos())?;
-            full_chain = full_chain
-                .push(block.clone())
-                .expect("full chain push is valid");
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, full_chain.unspent_utxos())?;
 
-            // Check some other properties of generated chains.
+            // Check some properties of the genesis block and don't push it to the chain.
             if block.height == block::Height(0) {
                 prop_assert_eq!(
                     block
@@ -186,27 +186,23 @@ fn forked_equals_pushed_genesis() -> Result<()> {
                         .filter_map(|i| i.outpoint())
                         .count(),
                     0,
-                    "unexpected transparent prevout input at height {:?}: \
-                            genesis transparent outputs must be ignored, \
-                            so there can not be any spends in the genesis block",
-                    block.height,
+                    "Unexpected transparent prevout input at height 0. Genesis transparent outputs \
+                        must be ignored, so there can not be any spends in the genesis block.",
                 );
+            } else {
+                full_chain = full_chain
+                    .push(block)
+                    .expect("full chain push is valid");
             }
         }
 
         // Use [`fork_at_count`] as the fork tip.
-        let fork_tip_hash = chain[fork_at_count - 1].hash;
+        let fork_tip_height = fork_at_count - 1;
+        let fork_tip_hash = chain[fork_tip_height].hash;
 
         // Fork the chain.
         let mut forked = full_chain
-            .fork(
-                fork_tip_hash,
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                empty_tree,
-            )
-            .expect("fork works")
+            .fork(fork_tip_hash)
             .expect("hash is present");
 
         // This check is redundant, but it's useful for debugging.
@@ -220,7 +216,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // same original full chain.
         for block in chain.iter().skip(fork_at_count).cloned() {
             let block =
-                ContextuallyValidBlock::with_block_and_spent_utxos(block, forked.unspent_utxos())?;
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, forked.unspent_utxos())?;
             forked = forked.push(block).expect("forked chain push is valid");
         }
 
@@ -254,31 +250,24 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
         // use `fork_at_count` as the fork tip
         let fork_tip_hash = chain[fork_at_count - 1].hash;
 
-        let mut full_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero());
-        let mut partial_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero());
+        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero());
+        let mut partial_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
 
         for block in chain
             .iter()
             .take(fork_at_count)
-            .map(ContextuallyValidBlock::test_with_zero_chain_pool_change) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change) {
                 partial_chain = partial_chain.push(block)?;
             }
 
         for block in chain
             .iter()
-            .map(ContextuallyValidBlock::test_with_zero_chain_pool_change) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change) {
                 full_chain = full_chain.push(block.clone())?;
             }
 
         let mut forked = full_chain
-            .fork(
-                fork_tip_hash,
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                finalized_tree,
-            )
-            .expect("fork works")
+            .fork(fork_tip_hash)
             .expect("hash is present");
 
         // the first check is redundant, but it's useful for debugging
@@ -290,7 +279,7 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
         for block in chain
             .iter()
             .skip(fork_at_count)
-            .map(ContextuallyValidBlock::test_with_zero_chain_pool_change) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_chain_pool_change) {
                 forked = forked.push(block)?;
         }
 
@@ -318,38 +307,41 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
 
         prop_assert!(empty_tree.is_none());
 
-        // use `end_count` as the number of non-finalized blocks at the end of the chain
-        let finalized_count = chain.len() - end_count;
+        // TODO: fix this test or the code so the full_chain temporary trees aren't overwritten
+        let chain = chain.iter()
+            .filter(|block| block.height != Height(0))
+            .map(ContextuallyVerifiedBlock::test_with_zero_spent_utxos);
+
+        // use `end_count` as the number of non-finalized blocks at the end of the chain,
+        // make sure this test pushes at least 1 block in the partial chain.
+        let finalized_count = 1.max(chain.clone().count() - end_count);
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), empty_tree, fake_value_pool);
+        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, fake_value_pool);
         for block in chain
-            .iter()
-            .take(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .clone()
+            .take(finalized_count) {
                 full_chain = full_chain.push(block)?;
             }
 
         let mut partial_chain = Chain::new(
             network,
-            full_chain.sprout_note_commitment_tree.clone(),
-            full_chain.sapling_note_commitment_tree.clone(),
-            full_chain.orchard_note_commitment_tree.clone(),
-            full_chain.history_tree.clone(),
+            full_chain.non_finalized_tip_height(),
+            full_chain.sprout_note_commitment_tree(),
+            full_chain.sapling_note_commitment_tree(),
+            full_chain.orchard_note_commitment_tree(),
+            full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
         );
         for block in chain
-            .iter()
-            .skip(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .clone()
+            .skip(finalized_count) {
                 partial_chain = partial_chain.push(block.clone())?;
             }
 
         for block in chain
-            .iter()
-            .skip(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .skip(finalized_count) {
                 full_chain = full_chain.push(block.clone())?;
             }
 
@@ -357,8 +349,18 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
             full_chain.pop_root();
         }
 
+        // Make sure the temporary trees from finalized tip forks are removed.
+        // TODO: update the test or the code so this extra step isn't needed?
+        full_chain.pop_root();
+        partial_chain.pop_root();
+
         prop_assert_eq!(full_chain.blocks.len(), partial_chain.blocks.len());
-        prop_assert!(full_chain.eq_internal_state(&partial_chain));
+        prop_assert!(
+            full_chain.eq_internal_state(&partial_chain),
+            "\n\
+             full chain:\n{full_chain:#?}\n\n\
+             partial chain:\n{partial_chain:#?}\n",
+        );
     });
 
     Ok(())
@@ -393,34 +395,35 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(network, Default::default(), Default::default(), Default::default(), finalized_tree, fake_value_pool);
+        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, fake_value_pool);
         for block in chain
             .iter()
             .take(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_spent_utxos) {
                 full_chain = full_chain.push(block)?;
             }
 
         let mut partial_chain = Chain::new(
             network,
-            full_chain.sprout_note_commitment_tree.clone(),
-            full_chain.sapling_note_commitment_tree.clone(),
-            full_chain.orchard_note_commitment_tree.clone(),
-            full_chain.history_tree.clone(),
+            Height(finalized_count.try_into().unwrap()),
+            full_chain.sprout_note_commitment_tree(),
+            full_chain.sapling_note_commitment_tree(),
+            full_chain.orchard_note_commitment_tree(),
+            full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
         );
 
         for block in chain
             .iter()
             .skip(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_spent_utxos) {
                 partial_chain = partial_chain.push(block.clone())?;
             }
 
         for block in chain
             .iter()
             .skip(finalized_count)
-            .map(ContextuallyValidBlock::test_with_zero_spent_utxos) {
+            .map(ContextuallyVerifiedBlock::test_with_zero_spent_utxos) {
                 full_chain= full_chain.push(block.clone())?;
             }
 
@@ -428,8 +431,18 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
             full_chain.pop_root();
         }
 
+        // Make sure the temporary trees from finalized tip forks are removed.
+        // TODO: update the test or the code so this extra step isn't needed?
+        full_chain.pop_root();
+        partial_chain.pop_root();
+
         prop_assert_eq!(full_chain.blocks.len(), partial_chain.blocks.len());
-        prop_assert!(full_chain.eq_internal_state(&partial_chain));
+        prop_assert!(
+            full_chain.eq_internal_state(&partial_chain),
+            "\n\
+             full chain:\n{full_chain:#?}\n\n\
+             partial chain:\n{partial_chain:#?}\n",
+        );
     });
 
     Ok(())
@@ -447,7 +460,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
                                .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
     |((chain, valid_count, network, mut bad_block) in (PreparedChain::default(), any::<bool>(), any::<bool>())
       .prop_flat_map(|((chain, valid_count, network, _history_tree), is_nu5, is_v5)| {
-          let next_height = chain[valid_count - 1].height;
+          let next_height = chain[valid_count].height;
           (
               Just(chain),
               Just(valid_count),
@@ -465,7 +478,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
       }
       ))| {
         let mut state = NonFinalizedState::new(network);
-        let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+        let finalized_state = FinalizedState::new(&Config::ephemeral(), network, #[cfg(feature = "elasticsearch")] None);
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
         finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -473,7 +486,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
         // use `valid_count` as the number of valid blocks before an invalid block
         let valid_tip_height = chain[valid_count - 1].height;
         let valid_tip_hash = chain[valid_count - 1].hash;
-        let mut chain = chain.iter().take(valid_count).cloned();
+        let mut chain = chain.iter().take(valid_count).skip(1).cloned();
 
         prop_assert!(state.eq_internal_state(&state));
 
@@ -570,8 +583,8 @@ fn different_blocks_different_chains() -> Result<()> {
             Default::default()
         };
 
-        let chain1 = Chain::new(Network::Mainnet, Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool());
-        let chain2 = Chain::new(Network::Mainnet, Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool());
+        let chain1 = Chain::new(Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool());
+        let chain2 = Chain::new(Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool());
 
         let block1 = vec1[1].clone().prepare().test_with_zero_spent_utxos();
         let block2 = vec2[1].clone().prepare().test_with_zero_spent_utxos();
@@ -606,16 +619,12 @@ fn different_blocks_different_chains() -> Result<()> {
                 chain1.spent_utxos = chain2.spent_utxos.clone();
 
                 // note commitment trees
-                chain1.sprout_note_commitment_tree = chain2.sprout_note_commitment_tree.clone();
                 chain1.sprout_trees_by_anchor = chain2.sprout_trees_by_anchor.clone();
                 chain1.sprout_trees_by_height = chain2.sprout_trees_by_height.clone();
-                chain1.sapling_note_commitment_tree = chain2.sapling_note_commitment_tree.clone();
                 chain1.sapling_trees_by_height = chain2.sapling_trees_by_height.clone();
-                chain1.orchard_note_commitment_tree = chain2.orchard_note_commitment_tree.clone();
                 chain1.orchard_trees_by_height = chain2.orchard_trees_by_height.clone();
 
                 // history trees
-                chain1.history_tree = chain2.history_tree.clone();
                 chain1.history_trees_by_height = chain2.history_trees_by_height.clone();
 
                 // anchors

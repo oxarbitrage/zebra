@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use zebra_chain::{
     amount::NonNegative,
-    block::Block,
+    block::{Block, Height},
     history_tree::NonEmptyHistoryTree,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashDeserializeInto,
@@ -27,6 +27,7 @@ fn construct_empty() {
     let _init_guard = zebra_test::init();
     let _chain = Chain::new(
         Network::Mainnet,
+        Height(0),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -43,6 +44,7 @@ fn construct_single() -> Result<()> {
 
     let mut chain = Chain::new(
         Network::Mainnet,
+        Height(0),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -63,6 +65,9 @@ fn construct_many() -> Result<()> {
 
     let mut block: Arc<Block> =
         zebra_test::vectors::BLOCK_MAINNET_434873_BYTES.zcash_deserialize_into()?;
+    let initial_height = block
+        .coinbase_height()
+        .expect("Block 434873 should have its height in its coinbase tx.");
     let mut blocks = vec![];
 
     while blocks.len() < 100 {
@@ -73,6 +78,7 @@ fn construct_many() -> Result<()> {
 
     let mut chain = Chain::new(
         Network::Mainnet,
+        (initial_height - 1).expect("Initial height should be at least 1."),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -99,6 +105,7 @@ fn ord_matches_work() -> Result<()> {
 
     let mut lesser_chain = Chain::new(
         Network::Mainnet,
+        Height(0),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -109,6 +116,7 @@ fn ord_matches_work() -> Result<()> {
 
     let mut bigger_chain = Chain::new(
         Network::Mainnet,
+        Height(0),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -151,7 +159,12 @@ fn best_chain_wins_for_network(network: Network) -> Result<()> {
     let expected_hash = block2.hash();
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     state.commit_new_chain(block2.prepare(), &finalized_state)?;
     state.commit_new_chain(child.prepare(), &finalized_state)?;
@@ -189,7 +202,12 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     let child = block1.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -198,13 +216,12 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     state.commit_block(block2.clone().prepare(), &finalized_state)?;
     state.commit_block(child.prepare(), &finalized_state)?;
 
-    let finalized_with_trees = state.finalize();
-    let finalized = finalized_with_trees.finalized;
-    assert_eq!(block1, finalized.block);
+    let finalized = state.finalize().inner_block();
 
-    let finalized_with_trees = state.finalize();
-    let finalized = finalized_with_trees.finalized;
-    assert_eq!(block2, finalized.block);
+    assert_eq!(block1, finalized);
+
+    let finalized = state.finalize().inner_block();
+    assert_eq!(block2, finalized);
 
     assert!(state.best_chain().is_none());
 
@@ -242,7 +259,12 @@ fn commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(
     let child2 = block2.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -289,7 +311,12 @@ fn shorter_chain_can_be_best_chain_for_network(network: Network) -> Result<()> {
     let short_chain_block = block1.make_fake_child().set_work(3);
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -336,7 +363,12 @@ fn longer_chain_with_more_work_wins_for_network(network: Network) -> Result<()> 
     let short_chain_block = block1.make_fake_child().set_work(3);
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -381,7 +413,12 @@ fn equal_length_goes_to_more_work_for_network(network: Network) -> Result<()> {
     let expected_hash = more_work_child.hash();
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -425,7 +462,12 @@ fn history_tree_is_updated_for_network_upgrade(
     );
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     state
         .commit_new_chain(prev_block.clone().prepare(), &finalized_state)
@@ -434,12 +476,12 @@ fn history_tree_is_updated_for_network_upgrade(
     let chain = state.best_chain().unwrap();
     if network_upgrade == NetworkUpgrade::Heartwood {
         assert!(
-            chain.history_tree.as_ref().is_none(),
+            chain.history_block_commitment_tree().as_ref().is_none(),
             "history tree must not exist yet"
         );
     } else {
         assert!(
-            chain.history_tree.as_ref().is_some(),
+            chain.history_block_commitment_tree().as_ref().is_some(),
             "history tree must already exist"
         );
     }
@@ -453,11 +495,16 @@ fn history_tree_is_updated_for_network_upgrade(
 
     let chain = state.best_chain().unwrap();
     assert!(
-        chain.history_tree.as_ref().is_some(),
+        chain.history_block_commitment_tree().as_ref().is_some(),
         "history tree must have been (re)created"
     );
     assert_eq!(
-        chain.history_tree.as_ref().as_ref().unwrap().size(),
+        chain
+            .history_block_commitment_tree()
+            .as_ref()
+            .as_ref()
+            .unwrap()
+            .size(),
         1,
         "history tree must have a single node"
     );
@@ -466,8 +513,8 @@ fn history_tree_is_updated_for_network_upgrade(
     let tree = NonEmptyHistoryTree::from_block(
         Network::Mainnet,
         activation_block.clone(),
-        &chain.sapling_note_commitment_tree.root(),
-        &chain.orchard_note_commitment_tree.root(),
+        &chain.sapling_note_commitment_tree().root(),
+        &chain.orchard_note_commitment_tree().root(),
     )
     .unwrap();
 
@@ -480,7 +527,12 @@ fn history_tree_is_updated_for_network_upgrade(
         .unwrap();
 
     assert!(
-        state.best_chain().unwrap().history_tree.as_ref().is_some(),
+        state
+            .best_chain()
+            .unwrap()
+            .history_block_commitment_tree()
+            .as_ref()
+            .is_some(),
         "history tree must still exist"
     );
 
@@ -511,7 +563,12 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
     );
 
     let mut state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(&Config::ephemeral(), network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     state
         .commit_new_chain(prev_block.clone().prepare(), &finalized_state)
@@ -541,8 +598,8 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
     let tree = NonEmptyHistoryTree::from_block(
         Network::Mainnet,
         activation_block.clone(),
-        &chain.sapling_note_commitment_tree.root(),
-        &chain.orchard_note_commitment_tree.root(),
+        &chain.sapling_note_commitment_tree().root(),
+        &chain.orchard_note_commitment_tree().root(),
     )
     .unwrap();
 

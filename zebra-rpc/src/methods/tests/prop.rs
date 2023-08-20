@@ -41,8 +41,10 @@ proptest! {
             let mut state: MockService<_, _, _, BoxError> = MockService::build().for_prop_tests();
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -75,7 +77,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -94,8 +96,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -135,7 +139,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -152,8 +156,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -194,7 +200,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -218,8 +224,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -247,7 +255,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -273,8 +281,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -302,7 +312,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -326,8 +336,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -380,7 +392,10 @@ proptest! {
                 mempool
                     .expect_request(mempool::Request::FullTransactions)
                     .await?
-                    .respond(mempool::Response::FullTransactions(transactions));
+                    .respond(mempool::Response::FullTransactions {
+                        transactions,
+                        last_seen_tip_hash: [0; 32].into(),
+                    });
 
                 expected_response
             };
@@ -396,7 +411,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -422,8 +437,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -451,7 +468,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -479,8 +496,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -508,7 +527,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -525,8 +544,10 @@ proptest! {
         // look for an error with a `NoChainTip`
         let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
             "RPC test",
+            "RPC test",
             network,
             false,
+            true,
             Buffer::new(mempool.clone(), 1),
             Buffer::new(state.clone(), 1),
             NoChainTip,
@@ -540,7 +561,7 @@ proptest! {
 
         // The queue task should continue without errors or panics
         let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-        prop_assert!(matches!(rpc_tx_queue_task_result, None));
+        prop_assert!(rpc_tx_queue_task_result.is_none());
 
         runtime.block_on(async move {
             mempool.expect_no_requests().await?;
@@ -574,8 +595,10 @@ proptest! {
         // Start RPC with the mocked `ChainTip`
         let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
             "RPC test",
+            "RPC test",
             network,
             false,
+            true,
             Buffer::new(mempool.clone(), 1),
             Buffer::new(state.clone(), 1),
             chain_tip,
@@ -618,7 +641,7 @@ proptest! {
 
         // The queue task should continue without errors or panics
         let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-        prop_assert!(matches!(rpc_tx_queue_task_result, None));
+        prop_assert!(rpc_tx_queue_task_result.is_none());
 
         // check no requests were made during this test
         runtime.block_on(async move {
@@ -659,8 +682,10 @@ proptest! {
         runtime.block_on(async move {
             let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 network,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
@@ -721,8 +746,10 @@ proptest! {
         runtime.block_on(async move {
             let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 network,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
@@ -771,8 +798,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -839,7 +868,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;
@@ -859,8 +888,10 @@ proptest! {
 
             let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
                 "RPC test",
+                "RPC test",
                 Mainnet,
                 false,
+                true,
                 Buffer::new(mempool.clone(), 1),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
@@ -938,7 +969,7 @@ proptest! {
 
             // The queue task should continue without errors or panics
             let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
-            prop_assert!(matches!(rpc_tx_queue_task_result, None));
+            prop_assert!(rpc_tx_queue_task_result.is_none());
 
             Ok::<_, TestCaseError>(())
         })?;

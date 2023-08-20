@@ -254,7 +254,7 @@ async fn continuous_blockchain(
     //   - checkpoints start at genesis
     //   - checkpoints end at the end of the range (there's no point in having extra blocks)
     let expected_max_height = block::Height((blockchain_len - 1).try_into().unwrap());
-    let checkpoint_list = vec![
+    let checkpoint_list = [
         &blockchain[0],
         &blockchain[blockchain_len / 3],
         &blockchain[blockchain_len / 2],
@@ -326,7 +326,7 @@ async fn continuous_blockchain(
 
                     // SPANDOC: Add block directly to the state {?height}
                     ready_state_service
-                        .call(zebra_state::Request::CommitFinalizedBlock(
+                        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
                             block.clone().into(),
                         ))
                         .await
@@ -504,7 +504,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     // Change the header hash
     let mut bad_block0 = good_block0.clone();
     let bad_block0_mut = Arc::make_mut(&mut bad_block0);
-    Arc::make_mut(&mut bad_block0_mut.header).version = 0;
+    Arc::make_mut(&mut bad_block0_mut.header).version = 5;
 
     // Make a checkpoint list containing the genesis block checkpoint
     let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =

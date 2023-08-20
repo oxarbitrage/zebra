@@ -10,7 +10,7 @@ use std::{collections::HashMap, time::Duration};
 use lazy_static::lazy_static;
 use regex::Regex;
 
-// XXX should these constants be split into protocol also?
+// TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
 
 use zebra_chain::{
@@ -67,6 +67,23 @@ pub const INBOUND_PEER_LIMIT_MULTIPLIER: usize = 5;
 /// See [`INBOUND_PEER_LIMIT_MULTIPLIER`] for details.
 pub const OUTBOUND_PEER_LIMIT_MULTIPLIER: usize = 3;
 
+/// The default maximum number of peer connections Zebra will keep for a given IP address
+/// before it drops any additional peer connections with that IP.
+///
+/// This will be used as `Config.max_connections_per_ip` if no valid value is provided.
+///
+/// Note: Zebra will currently avoid initiating outbound connections where it
+///       has recently had a successful handshake with any address
+///       on that IP. Zebra will not initiate more than 1 outbound connection
+///       to an IP based on the default configuration, but it will accept more inbound
+///       connections to an IP.
+pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
+
+/// The default peerset target size.
+///
+/// This will be used as `Config.peerset_initial_target_size` if no valid value is provided.
+pub const DEFAULT_PEERSET_INITIAL_TARGET_SIZE: usize = 25;
+
 /// The buffer size for the peer set.
 ///
 /// This should be greater than 1 to avoid sender contention, but also reasonably
@@ -83,12 +100,34 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
 /// and receiving a response from a remote peer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The timeout for handshakes when connecting to new peers.
+/// The timeout for connections and handshakes when connecting to new peers.
+///
+/// Outbound TCP connections must complete within this timeout,
+/// then the handshake messages get an additional `HANDSHAKE_TIMEOUT` to complete.
+/// (Inbound TCP accepts can't have a timeout, because they are handled by the OS.)
 ///
 /// This timeout should remain small, because it helps stop slow peers getting
 /// into the peer set. This is particularly important for network-constrained
 /// nodes, and on testnet.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The maximum time difference for two address book changes to be considered concurrent.
+///
+/// This prevents simultaneous or nearby important changes or connection progress
+/// being overridden by less important changes.
+///
+/// This timeout should be less than:
+/// - the [peer reconnection delay](MIN_PEER_RECONNECTION_DELAY), and
+/// - the [peer keepalive/heartbeat interval](HEARTBEAT_INTERVAL).
+///
+/// But more than:
+/// - the amount of time between connection events and address book updates,
+///   even under heavy load (in tests, we have observed delays up to 500ms),
+/// - the delay between an outbound connection failing,
+///   and the [CandidateSet](crate::peer_set::CandidateSet) registering the failure, and
+/// - the delay between the application closing a connection,
+///   and any remaining positive changes from the peer.
+pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
 
 /// We expect to receive a message from a live peer at least once in this time duration.
 ///
@@ -122,6 +161,22 @@ pub const INVENTORY_ROTATION_INTERVAL: Duration = Duration::from_secs(53);
 /// don't synchronise with other crawls.
 pub const DEFAULT_CRAWL_NEW_PEER_INTERVAL: Duration = Duration::from_secs(61);
 
+/// The peer address disk cache update interval.
+///
+/// This should be longer than [`DEFAULT_CRAWL_NEW_PEER_INTERVAL`],
+/// but shorter than [`MAX_PEER_ACTIVE_FOR_GOSSIP`].
+///
+/// We use a short interval so Zebra instances which are restarted frequently
+/// still have useful caches.
+pub const PEER_DISK_CACHE_UPDATE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The maximum number of addresses in the peer disk cache.
+///
+/// This is chosen to be less than the number of active peers,
+/// and approximately the same as the number of seed peers returned by DNS.
+/// It is a tradeoff between fingerprinting attacks, DNS pollution risk, and cache pollution risk.
+pub const MAX_PEER_DISK_CACHE_SIZE: usize = 75;
+
 /// The maximum duration since a peer was last seen to consider it reachable.
 ///
 /// This is used to prevent Zebra from gossiping addresses that are likely unreachable. Peers that
@@ -149,14 +204,48 @@ pub const MAX_RECENT_PEER_AGE: Duration32 = Duration32::from_days(3);
 /// Using a prime number makes sure that heartbeats don't synchronise with crawls.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 
-/// The minimum time between successive calls to
+/// The minimum time between outbound peer connections, implemented by
 /// [`CandidateSet::next`][crate::peer_set::CandidateSet::next].
 ///
 /// ## Security
 ///
-/// Zebra resists distributed denial of service attacks by making sure that new peer connections
-/// are initiated at least [`MIN_PEER_CONNECTION_INTERVAL`] apart.
-pub const MIN_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(25);
+/// Zebra resists distributed denial of service attacks by making sure that new outbound peer
+/// connections are only initiated after this minimum time has elapsed.
+///
+/// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
+pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The minimum time between _successful_ inbound peer connections, implemented by
+/// `peer_set::initialize::accept_inbound_connections`.
+///
+/// To support multiple peers connecting simultaneously, this is less than the
+/// [`HANDSHAKE_TIMEOUT`].
+///
+/// ## Security
+///
+/// Zebra resists distributed denial of service attacks by limiting the inbound connection rate.
+/// After a _successful_ inbound connection, new inbound peer connections are only accepted,
+/// and our side of the handshake initiated, after this minimum time has elapsed.
+///
+/// The inbound interval is much longer than the outbound interval, because Zebra does not
+/// control the selection or reconnections of inbound peers.
+pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The minimum time between _failed_ inbound peer connections, implemented by
+/// `peer_set::initialize::accept_inbound_connections`.
+///
+/// This is a tradeoff between:
+/// - the memory, CPU, and network usage of each new connection attempt, and
+/// - denying service to honest peers due to an attack which makes many inbound connections.
+///
+/// Attacks that reach this limit should be managed using a firewall or intrusion prevention system.
+///
+/// ## Security
+///
+/// Zebra resists distributed denial of service attacks by limiting the inbound connection rate.
+/// After a _failed_ inbound connection, new inbound peer connections are only accepted,
+/// and our side of the handshake initiated, after this minimum time has elapsed.
+pub const MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The minimum time between successive calls to
 /// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
@@ -235,15 +324,6 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-/// The User-Agent string provided by the node.
-///
-/// This must be a valid [BIP 14] user agent.
-///
-/// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
-//
-// TODO: generate this from crate metadata (#2375)
-pub const USER_AGENT: &str = "/Zebra:1.0.0-rc.4/";
-
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
 ///
@@ -272,6 +352,28 @@ pub const EWMA_DECAY_TIME_NANOS: f64 = 200.0 * NANOS_PER_SECOND;
 
 /// The number of nanoseconds in one second.
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+
+/// The duration it takes for the drop probability of an overloaded connection to
+/// reach [`MIN_OVERLOAD_DROP_PROBABILITY`].
+///
+/// Peer connections that receive multiple overloads have a higher probability of being dropped.
+///
+/// The probability of a connection being dropped gradually decreases during this interval
+/// until it reaches the default drop probability ([`MIN_OVERLOAD_DROP_PROBABILITY`]).
+///
+/// Increasing this number increases the rate at which connections are dropped.
+pub const OVERLOAD_PROTECTION_INTERVAL: Duration = MIN_INBOUND_PEER_CONNECTION_INTERVAL;
+
+/// The minimum probability of dropping a peer connection when it receives an
+/// [`Overloaded`](crate::PeerError::Overloaded) error.
+pub const MIN_OVERLOAD_DROP_PROBABILITY: f32 = 0.05;
+
+/// The maximum probability of dropping a peer connection when it receives an
+/// [`Overloaded`](crate::PeerError::Overloaded) error.
+pub const MAX_OVERLOAD_DROP_PROBABILITY: f32 = 0.5;
+
+/// The minimum interval between logging peer set status updates.
+pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 lazy_static! {
     /// The minimum network protocol version accepted by this crate for each network,
@@ -324,9 +426,6 @@ pub mod magics {
 
 #[cfg(test)]
 mod tests {
-
-    use std::convert::TryFrom;
-
     use zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING;
 
     use super::*;
@@ -363,18 +462,20 @@ mod tests {
                 "The EWMA decay time should be higher than the request timeout, so timed out peers are penalised by the EWMA.");
 
         assert!(
-            u32::try_from(MAX_ADDRS_IN_ADDRESS_BOOK).expect("fits in u32")
-                * MIN_PEER_CONNECTION_INTERVAL
-                < MIN_PEER_RECONNECTION_DELAY,
-            "each peer should get at least one connection attempt in each connection interval",
+            MIN_PEER_RECONNECTION_DELAY.as_secs() as f32
+                / (u32::try_from(MAX_ADDRS_IN_ADDRESS_BOOK).expect("fits in u32")
+                    * MIN_OUTBOUND_PEER_CONNECTION_INTERVAL)
+                    .as_secs() as f32
+                >= 0.2,
+            "some peers should get a connection attempt in each connection interval",
         );
 
         assert!(
-            MIN_PEER_RECONNECTION_DELAY.as_secs()
+            MIN_PEER_RECONNECTION_DELAY.as_secs() as f32
                 / (u32::try_from(MAX_ADDRS_IN_ADDRESS_BOOK).expect("fits in u32")
-                    * MIN_PEER_CONNECTION_INTERVAL)
-                    .as_secs()
-                <= 2,
+                    * MIN_OUTBOUND_PEER_CONNECTION_INTERVAL)
+                    .as_secs() as f32
+                <= 2.0,
             "each peer should only have a few connection attempts in each connection interval",
         );
     }

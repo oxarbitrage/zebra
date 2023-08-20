@@ -6,10 +6,7 @@ use futures::FutureExt;
 use indexmap::IndexSet;
 use tokio::{sync::oneshot, task::JoinHandle};
 use tower::{
-    buffer::Buffer,
-    builder::ServiceBuilder,
-    util::{BoxCloneService, BoxService},
-    ServiceExt,
+    buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
 };
 
 use zebra_chain::{
@@ -18,10 +15,10 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
     transaction::{AuthDigest, Hash as TxHash, Transaction, UnminedTx, UnminedTxId, WtxId},
 };
-use zebra_consensus::{chain::VerifyChainError, error::TransactionError, transaction};
+use zebra_consensus::{error::TransactionError, router::RouterError, transaction};
 use zebra_network::{
-    connect_isolated_tcp_direct_with_inbound, types::InventoryHash, Config as NetworkConfig,
-    InventoryResponse, PeerError, Request, Response, SharedPeerError,
+    canonical_peer_addr, connect_isolated_tcp_direct_with_inbound, types::InventoryHash, CacheDir,
+    Config as NetworkConfig, InventoryResponse, PeerError, Request, Response, SharedPeerError,
 };
 use zebra_node_services::mempool;
 use zebra_state::Config as StateConfig;
@@ -67,7 +64,10 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
     let response = request.await;
     match response.as_ref() {
         Ok(Response::Peers(single_peer)) if single_peer.len() == 1 => {
-            assert_eq!(single_peer.first().unwrap().addr(), listen_addr)
+            assert_eq!(
+                single_peer.first().unwrap().addr(),
+                canonical_peer_addr(listen_addr)
+            )
         }
         Ok(Response::Peers(_peer_list)) => unreachable!(
             "`Peers` response should contain a single peer, \
@@ -86,7 +86,10 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
     let response = request.await;
     match response.as_ref() {
         Ok(Response::Peers(single_peer)) if single_peer.len() == 1 => {
-            assert_eq!(single_peer.first().unwrap().addr(), listen_addr)
+            assert_eq!(
+                single_peer.first().unwrap().addr(),
+                canonical_peer_addr(listen_addr)
+            )
         }
         Ok(Response::Peers(_peer_list)) => unreachable!(
             "`Peers` response should contain a single peer, \
@@ -102,13 +105,13 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
-        matches!(block_gossip_result, None),
+        block_gossip_result.is_none(),
         "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
-        matches!(tx_gossip_result, None),
+        tx_gossip_result.is_none(),
         "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
@@ -185,13 +188,13 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
-        matches!(block_gossip_result, None),
+        block_gossip_result.is_none(),
         "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
-        matches!(tx_gossip_result, None),
+        tx_gossip_result.is_none(),
         "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
@@ -305,13 +308,13 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
-        matches!(block_gossip_result, None),
+        block_gossip_result.is_none(),
         "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
-        matches!(tx_gossip_result, None),
+        tx_gossip_result.is_none(),
         "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
@@ -455,13 +458,13 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
-        matches!(block_gossip_result, None),
+        block_gossip_result.is_none(),
         "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
-        matches!(tx_gossip_result, None),
+        tx_gossip_result.is_none(),
         "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
@@ -568,13 +571,13 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
 
     let block_gossip_result = block_gossip_task_handle.now_or_never();
     assert!(
-        matches!(block_gossip_result, None),
+        block_gossip_result.is_none(),
         "unexpected error or panic in block gossip task: {block_gossip_result:?}",
     );
 
     let tx_gossip_result = tx_gossip_task_handle.now_or_never();
     assert!(
-        matches!(tx_gossip_result, None),
+        tx_gossip_result.is_none(),
         "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
     );
 
@@ -594,7 +597,12 @@ async fn setup(
     // connected peer which responds with isolated_peer_response
     Buffer<zebra_network::Client, zebra_network::Request>,
     // inbound service
-    BoxCloneService<zebra_network::Request, zebra_network::Response, BoxError>,
+    LoadShed<
+        Buffer<
+            BoxService<zebra_network::Request, zebra_network::Response, BoxError>,
+            zebra_network::Request,
+        >,
+    >,
     // outbound peer set (only has the connected peer)
     Buffer<
         BoxService<zebra_network::Request, zebra_network::Response, BoxError>,
@@ -603,7 +611,7 @@ async fn setup(
     Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
     Buffer<BoxService<zebra_state::Request, zebra_state::Response, BoxError>, zebra_state::Request>,
     // mocked services
-    MockService<zebra_consensus::Request, block::Hash, PanicAssertion, VerifyChainError>,
+    MockService<zebra_consensus::Request, block::Hash, PanicAssertion, RouterError>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     // real tasks
     JoinHandle<Result<(), BlockGossipError>>,
@@ -620,11 +628,11 @@ async fn setup(
     // Inbound
     let (setup_tx, setup_rx) = oneshot::channel();
     let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx);
+    // TODO: add a timeout just above the service, if needed
     let inbound_service = ServiceBuilder::new()
-        .boxed_clone()
         .load_shed()
         .buffer(10)
-        .service(inbound_service);
+        .service(BoxService::new(inbound_service));
 
     // State
     // UTXO verification doesn't matter for these tests.
@@ -641,6 +649,7 @@ async fn setup(
         // Stop Zebra making outbound connections
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
+        cache_dir: CacheDir::disabled(),
 
         ..NetworkConfig::default()
     };
@@ -648,15 +657,13 @@ async fn setup(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
+        "Zebra user agent".to_string(),
     )
     .await;
 
     // Inbound listener
-    let listen_addr = address_book
-        .lock()
-        .unwrap()
-        .local_listener_meta_addr()
-        .addr();
+    let listen_addr = address_book.lock().unwrap().local_listener_socket_addr();
+
     assert_ne!(
         listen_addr.port(),
         0,

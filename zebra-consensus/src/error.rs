@@ -8,7 +8,10 @@
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use zebra_chain::{amount, block, orchard, sapling, sprout, transparent};
+use zebra_chain::{
+    amount, block, orchard, sapling, sprout,
+    transparent::{self, MIN_TRANSPARENT_COINBASE_MATURITY},
+};
 use zebra_state::ValidateContextError;
 
 use crate::{block::MAX_BLOCK_SIGOPS, BoxError};
@@ -20,6 +23,7 @@ use proptest_derive::Arbitrary;
 const MAX_EXPIRY_HEIGHT: block::Height = block::Height::MAX_EXPIRY_HEIGHT;
 
 #[derive(Error, Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum SubsidyError {
     #[error("no coinbase transaction in block")]
     NoCoinbase,
@@ -36,6 +40,7 @@ pub enum SubsidyError {
 
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+#[allow(missing_docs)]
 pub enum TransactionError {
     #[error("first transaction must be coinbase")]
     CoinbasePosition,
@@ -128,12 +133,12 @@ pub enum TransactionError {
     #[error("spend description cv and rk MUST NOT be of small order")]
     SmallOrder,
 
-    // XXX: the underlying error is bellman::VerificationError, but it does not implement
+    // TODO: the underlying error is bellman::VerificationError, but it does not implement
     // Arbitrary as required here.
     #[error("spend proof MUST be valid given a primary input formed from the other fields except spendAuthSig")]
     Groth16(String),
 
-    // XXX: the underlying error is io::Error, but it does not implement Clone as required here.
+    // TODO: the underlying error is io::Error, but it does not implement Clone as required here.
     #[error("Groth16 proof is malformed")]
     MalformedGroth16(String),
 
@@ -185,17 +190,46 @@ pub enum TransactionError {
     #[error("could not validate nullifiers and anchors on best chain")]
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     // This error variant is at least 128 bytes
-    ValidateNullifiersAndAnchorsError(Box<ValidateContextError>),
+    ValidateContextError(Box<ValidateContextError>),
 
     #[error("could not validate mempool transaction lock time on best chain")]
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     // TODO: turn this into a typed error
     ValidateMempoolLockTimeError(String),
+
+    #[error(
+        "immature transparent coinbase spend: \
+        attempt to spend {outpoint:?} at {spend_height:?}, \
+        but spends are invalid before {min_spend_height:?}, \
+        which is {MIN_TRANSPARENT_COINBASE_MATURITY:?} blocks \
+        after it was created at {created_height:?}"
+    )]
+    #[non_exhaustive]
+    ImmatureTransparentCoinbaseSpend {
+        outpoint: transparent::OutPoint,
+        spend_height: block::Height,
+        min_spend_height: block::Height,
+        created_height: block::Height,
+    },
+
+    #[error(
+        "unshielded transparent coinbase spend: {outpoint:?} \
+         must be spent in a transaction which only has shielded outputs"
+    )]
+    #[non_exhaustive]
+    UnshieldedTransparentCoinbaseSpend {
+        outpoint: transparent::OutPoint,
+        min_spend_height: block::Height,
+    },
+
+    #[error("failed to verify ZIP-317 transaction rules, transaction was not inserted to mempool")]
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    Zip317(#[from] zebra_chain::transaction::zip317::Error),
 }
 
 impl From<ValidateContextError> for TransactionError {
     fn from(err: ValidateContextError) -> Self {
-        TransactionError::ValidateNullifiersAndAnchorsError(Box::new(err))
+        TransactionError::ValidateContextError(Box::new(err))
     }
 }
 
@@ -226,6 +260,7 @@ impl From<BoxError> for TransactionError {
 }
 
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum BlockError {
     #[error("block contains invalid transactions")]
     Transaction(#[from] TransactionError),
@@ -242,8 +277,8 @@ pub enum BlockError {
     #[error("block contains duplicate transactions")]
     DuplicateTransaction,
 
-    #[error("block {0:?} is already in the chain at depth {1:?}")]
-    AlreadyInChain(zebra_chain::block::Hash, u32),
+    #[error("block {0:?} is already in present in the state {1:?}")]
+    AlreadyInChain(zebra_chain::block::Hash, zebra_state::KnownBlock),
 
     #[error("invalid block {0:?}: missing block height")]
     MissingHeight(zebra_chain::block::Hash),

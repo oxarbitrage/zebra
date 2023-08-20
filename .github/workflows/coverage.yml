@@ -41,11 +41,11 @@ on:
       - '.github/workflows/coverage.yml'
 
 env:
-  CARGO_INCREMENTAL: 0
-  RUST_LOG: info
-  RUST_BACKTRACE: full
-  RUST_LIB_BACKTRACE: full
-  COLORBT_SHOW_HIDDEN: '1'
+  CARGO_INCREMENTAL: ${{ vars.CARGO_INCREMENTAL }}
+  RUST_LOG: ${{ vars.RUST_LOG }}
+  RUST_BACKTRACE: ${{ vars.RUST_BACKTRACE }}
+  RUST_LIB_BACKTRACE: ${{ vars.RUST_LIB_BACKTRACE }}
+  COLORBT_SHOW_HIDDEN: ${{ vars.COLORBT_SHOW_HIDDEN }}
 
 jobs:
   coverage:
@@ -57,16 +57,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3.3.0
+      - uses: actions/checkout@v3.5.3
         with:
           persist-credentials: false
 
-      - uses: actions-rs/toolchain@v1.0.7
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          components: llvm-tools-preview
+      # Setup Rust with stable toolchain and minimal profile
+      - name: Setup Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal --component=llvm-tools-preview
 
       - name: Install cargo-llvm-cov cargo command
         run: cargo install cargo-llvm-cov
@@ -111,4 +109,4 @@ jobs:
         run: cargo llvm-cov --lcov --no-run --output-path lcov.info
 
       - name: Upload coverage report to Codecov
-        uses: codecov/codecov-action@v3.1.1
+        uses: codecov/codecov-action@v3.1.4

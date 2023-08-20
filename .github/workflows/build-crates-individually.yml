@@ -37,28 +37,27 @@ on:
       - '.github/workflows/build-crates-individually.yml'
 
 env:
-  CARGO_INCREMENTAL: 0
-  RUST_LOG: info
-  RUST_BACKTRACE: full
-  RUST_LIB_BACKTRACE: full
-  COLORBT_SHOW_HIDDEN: '1'
+  CARGO_INCREMENTAL: ${{ vars.CARGO_INCREMENTAL }}
+  RUST_LOG: ${{ vars.RUST_LOG }}
+  RUST_BACKTRACE: ${{ vars.RUST_BACKTRACE }}
+  RUST_LIB_BACKTRACE: ${{ vars.RUST_LIB_BACKTRACE }}
+  COLORBT_SHOW_HIDDEN: ${{ vars.COLORBT_SHOW_HIDDEN }}
 
 jobs:
   matrix:
-    name: Crates matrix
+    name: Generate crates matrix
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v3.3.0
+      - uses: actions/checkout@v3.5.3
+      - uses: r7kamura/rust-problem-matchers@v1.4.0
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      # Setup Rust with stable toolchain and minimal profile
+      - name: Setup Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal
 
-      - uses: actions-rs/cargo@v1.0.3
       # This step is meant to dynamically create a JSON containing the values of each crate
       # available in this repo in the root directory. We use `cargo tree` to accomplish this task.
       #
@@ -83,6 +82,7 @@ jobs:
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   check-matrix:
+    name: Check crates matrix
     runs-on: ubuntu-latest
     needs: [ matrix ]
     steps:
@@ -106,41 +106,35 @@ jobs:
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v3.3.0
+      - uses: actions/checkout@v3.5.3
         with:
           persist-credentials: false
+      - uses: r7kamura/rust-problem-matchers@v1.4.0
 
       - name: Install last version of Protoc
-        uses: arduino/setup-protoc@v1.1.2
+        uses: arduino/setup-protoc@v2.0.0
         with:
           # TODO: increase to latest version after https://github.com/arduino/setup-protoc/issues/33 is fixed
-          version: '3.20.1'
+          version: '23.x'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      # Setup Rust with stable toolchain and minimal profile
+      - name: Setup Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal
 
         # We could use `features: ['', '--all-features', '--no-default-features']` as a matrix argument,
         # but it's faster to run these commands sequentially, so they can re-use the local cargo cache.
         #
         # Some Zebra crates do not have any features, and most don't have any default features.
       - name: Build ${{ matrix.crate }} crate with no default features
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: build
-          args: --package ${{ matrix.crate }} --no-default-features
+        run: |
+          cargo build --package ${{ matrix.crate }} --no-default-features
 
       - name: Build ${{ matrix.crate }} crate normally
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: build
-          args: --package ${{ matrix.crate }}
+        run: |
+          cargo build --package ${{ matrix.crate }}
 
       - name: Build ${{ matrix.crate }} crate with all features
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: build
-          args: --package ${{ matrix.crate }} --all-features
+        run: |
+          cargo build --package ${{ matrix.crate }} --all-features

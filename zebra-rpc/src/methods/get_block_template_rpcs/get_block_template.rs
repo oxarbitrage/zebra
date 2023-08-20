@@ -39,8 +39,8 @@ pub use crate::methods::get_block_template_rpcs::types::get_block_template::*;
 /// Returns an error if there's a mismatch between the mode and whether `data` is provided.
 pub fn check_parameters(parameters: &Option<JsonParameters>) -> Result<()> {
     let Some(parameters) = parameters else {
-            return Ok(())
-        };
+        return Ok(());
+    };
 
     match parameters {
         JsonParameters {
@@ -97,17 +97,24 @@ pub fn check_miner_address(
 /// usual acceptance rules (except proof-of-work).
 ///
 /// Returns a `getblocktemplate` [`Response`].
-pub async fn validate_block_proposal<ChainVerifier>(
-    mut chain_verifier: ChainVerifier,
+pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
+    mut block_verifier_router: BlockVerifierRouter,
     block_proposal_bytes: Vec<u8>,
+    network: Network,
+    latest_chain_tip: Tip,
+    sync_status: SyncStatus,
 ) -> Result<Response>
 where
-    ChainVerifier: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
+    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
         + Clone
         + Send
         + Sync
         + 'static,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
+    check_synced_to_tip(network, latest_chain_tip, sync_status)?;
+
     let block: Block = match block_proposal_bytes.zcash_deserialize_into() {
         Ok(block) => block,
         Err(parse_error) => {
@@ -122,7 +129,7 @@ where
         }
     };
 
-    let chain_verifier_response = chain_verifier
+    let block_verifier_router_response = block_verifier_router
         .ready()
         .await
         .map_err(|error| Error {
@@ -133,12 +140,12 @@ where
         .call(zebra_consensus::Request::CheckProposal(Arc::new(block)))
         .await;
 
-    Ok(chain_verifier_response
+    Ok(block_verifier_router_response
         .map(|_hash| ProposalResponse::Valid)
         .unwrap_or_else(|verify_chain_error| {
             tracing::info!(
                 ?verify_chain_error,
-                "error response from chain_verifier in CheckProposal request"
+                "error response from block_verifier_router in CheckProposal request"
             );
 
             ProposalResponse::rejected("invalid proposal", verify_chain_error)
@@ -173,7 +180,7 @@ where
         || estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP
     {
         tracing::info!(
-            estimated_distance_to_chain_tip,
+            ?estimated_distance_to_chain_tip,
             ?local_tip_height,
             "Zebra has not synced to the chain tip. \
              Hint: check your network connection, clock, and time zone settings."
@@ -183,7 +190,7 @@ where
             code: NOT_SYNCED_ERROR_CODE,
             message: format!(
                 "Zebra has not synced to the chain tip, \
-                 estimated distance: {estimated_distance_to_chain_tip}, \
+                 estimated distance: {estimated_distance_to_chain_tip:?}, \
                  local tip: {local_tip_height:?}. \
                  Hint: check your network connection, clock, and time zone settings."
             ),
@@ -231,11 +238,15 @@ where
     Ok(chain_info)
 }
 
-/// Returns the transactions that are currently in `mempool`.
+/// Returns the transactions that are currently in `mempool`, or None if the
+/// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
 /// You should call `check_synced_to_tip()` before calling this function.
 /// If the mempool is inactive because Zebra is not synced to the tip, returns no transactions.
-pub async fn fetch_mempool_transactions<Mempool>(mempool: Mempool) -> Result<Vec<VerifiedUnminedTx>>
+pub async fn fetch_mempool_transactions<Mempool>(
+    mempool: Mempool,
+    chain_tip_hash: block::Hash,
+) -> Result<Option<Vec<VerifiedUnminedTx>>>
 where
     Mempool: Service<
             mempool::Request,
@@ -253,11 +264,16 @@ where
             data: None,
         })?;
 
-    if let mempool::Response::FullTransactions(transactions) = response {
-        Ok(transactions)
-    } else {
+    let mempool::Response::FullTransactions {
+        transactions,
+        last_seen_tip_hash,
+    } = response
+    else {
         unreachable!("unmatched response to a mempool::FullTransactions request")
-    }
+    };
+
+    // Check that the mempool and state were in sync when we made the requests
+    Ok((last_seen_tip_hash == chain_tip_hash).then_some(transactions))
 }
 
 // - Response processing
@@ -273,11 +289,18 @@ pub fn generate_coinbase_and_roots(
     mempool_txs: &[VerifiedUnminedTx],
     history_tree: Arc<zebra_chain::history_tree::HistoryTree>,
     like_zcashd: bool,
+    extra_coinbase_data: Vec<u8>,
 ) -> (TransactionTemplate<NegativeOrZero>, DefaultRoots) {
     // Generate the coinbase transaction
     let miner_fee = calculate_miner_fee(mempool_txs);
-    let coinbase_txn =
-        generate_coinbase_transaction(network, height, miner_address, miner_fee, like_zcashd);
+    let coinbase_txn = generate_coinbase_transaction(
+        network,
+        height,
+        miner_address,
+        miner_fee,
+        like_zcashd,
+        extra_coinbase_data,
+    );
 
     // Calculate block default roots
     //
@@ -301,13 +324,15 @@ pub fn generate_coinbase_transaction(
     miner_address: transparent::Address,
     miner_fee: Amount<NonNegative>,
     like_zcashd: bool,
+    extra_coinbase_data: Vec<u8>,
 ) -> UnminedTx {
     let outputs = standard_coinbase_outputs(network, height, miner_address, miner_fee, like_zcashd);
 
     if like_zcashd {
-        Transaction::new_v4_coinbase(network, height, outputs, like_zcashd).into()
+        Transaction::new_v4_coinbase(network, height, outputs, like_zcashd, extra_coinbase_data)
+            .into()
     } else {
-        Transaction::new_v5_coinbase(network, height, outputs).into()
+        Transaction::new_v5_coinbase(network, height, outputs, extra_coinbase_data).into()
     }
 }
 

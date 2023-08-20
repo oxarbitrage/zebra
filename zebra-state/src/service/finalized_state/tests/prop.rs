@@ -9,7 +9,7 @@ use crate::{
     config::Config,
     service::{
         arbitrary::PreparedChain,
-        finalized_state::{FinalizedBlock, FinalizedState},
+        finalized_state::{CheckpointVerifiedBlock, FinalizedState},
     },
     tests::FakeChainHelper,
 };
@@ -24,18 +24,18 @@ fn blocks_with_v5_transactions() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
         |((chain, count, network, _history_tree) in PreparedChain::default())| {
-            let mut state = FinalizedState::new(&Config::ephemeral(), network);
+            let mut state = FinalizedState::new(&Config::ephemeral(), network, #[cfg(feature = "elasticsearch")] None);
             let mut height = Height(0);
             // use `count` to minimize test failures, so they are easier to diagnose
             for block in chain.iter().take(count) {
-                let finalized = FinalizedBlock::from(block.block.clone());
-                let hash = state.commit_finalized_direct(
-                    finalized.into(),
+                let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
+                let (hash, _) = state.commit_finalized_direct(
+                    checkpoint_verified.into(),
+                    None,
                     "blocks_with_v5_transactions test"
-                );
+                ).unwrap();
                 prop_assert_eq!(Some(height), state.finalized_tip_height());
-                prop_assert_eq!(hash.unwrap(), block.hash);
-                // TODO: check that the nullifiers were correctly inserted (#2230)
+                prop_assert_eq!(hash, block.hash);
                 height = Height(height.0 + 1);
             }
     });
@@ -65,7 +65,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_valid_commitments().no_shrink())| {
 
-            let mut state = FinalizedState::new(&Config::ephemeral(), network);
+            let mut state = FinalizedState::new(&Config::ephemeral(), network, #[cfg(feature = "elasticsearch")] None);
             let mut height = Height(0);
             let heartwood_height = NetworkUpgrade::Heartwood.activation_height(network).unwrap();
             let heartwood_height_plus1 = (heartwood_height + 1).unwrap();
@@ -84,18 +84,20 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                         h == nu5_height ||
                         h == nu5_height_plus1 => {
                             let block = block.block.clone().set_block_commitment([0x42; 32]);
-                            let finalized = FinalizedBlock::from(block);
+                            let checkpoint_verified = CheckpointVerifiedBlock::from(block);
                             state.commit_finalized_direct(
-                                finalized.into(),
+                                checkpoint_verified.into(),
+                                None,
                                 "all_upgrades test"
                             ).expect_err("Must fail commitment check");
                             failure_count += 1;
                         },
                     _ => {},
                 }
-                let finalized = FinalizedBlock::from(block.block.clone());
-                let hash = state.commit_finalized_direct(
-                    finalized.into(),
+                let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
+                let (hash, _) = state.commit_finalized_direct(
+                    checkpoint_verified.into(),
+                    None,
                     "all_upgrades test"
                 ).unwrap();
                 prop_assert_eq!(Some(height), state.finalized_tip_height());

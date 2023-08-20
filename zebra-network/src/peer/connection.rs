@@ -7,15 +7,16 @@
 //! And it's unclear if these assumptions match the `zcashd` implementation.
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
-use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
 
 use futures::{
     future::{self, Either},
     prelude::*,
     stream::Stream,
 };
+use rand::{thread_rng, Rng};
 use tokio::time::{sleep, Sleep};
-use tower::Service;
+use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::{
@@ -25,7 +26,10 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants,
+    constants::{
+        self, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
+        OVERLOAD_PROTECTION_INTERVAL,
+    },
     meta_addr::MetaAddr,
     peer::{
         connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
@@ -37,7 +41,7 @@ use crate::{
         external::{types::Nonce, InventoryHash, Message},
         internal::{InventoryResponse, Request, Response},
     },
-    BoxError,
+    BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
 use InventoryResponse::*;
@@ -135,7 +139,7 @@ impl Handler {
     /// Unexpected messages are left unprocessed, and may be rejected later.
     fn process_message(&mut self, msg: Message) -> Option<Message> {
         let mut ignored_msg = None;
-        // XXX can this be avoided?
+        // TODO: can this be avoided?
         let tmp_state = std::mem::replace(self, Handler::Finished(Ok(Response::Nil)));
 
         debug!(handler = %tmp_state, %msg, "received peer response to Zebra request");
@@ -226,11 +230,11 @@ impl Handler {
                 if missing_transaction_ids != pending_ids {
                     trace!(?missing_invs, ?missing_transaction_ids, ?pending_ids);
                     // if these errors are noisy, we should replace them with debugs
-                    info!("unexpected notfound message from peer: all remaining transaction hashes should be listed in the notfound. Using partial received transactions as the peer response");
+                    debug!("unexpected notfound message from peer: all remaining transaction hashes should be listed in the notfound. Using partial received transactions as the peer response");
                 }
                 if missing_transaction_ids.len() != missing_invs.len() {
                     trace!(?missing_invs, ?missing_transaction_ids, ?pending_ids);
-                    info!("unexpected notfound message from peer: notfound contains duplicate hashes or non-transaction hashes. Using partial received transactions as the peer response");
+                    debug!("unexpected notfound message from peer: notfound contains duplicate hashes or non-transaction hashes. Using partial received transactions as the peer response");
                 }
 
                 if transactions.is_empty() {
@@ -330,11 +334,11 @@ impl Handler {
                 if missing_blocks != pending_hashes {
                     trace!(?missing_invs, ?missing_blocks, ?pending_hashes);
                     // if these errors are noisy, we should replace them with debugs
-                    info!("unexpected notfound message from peer: all remaining block hashes should be listed in the notfound. Using partial received blocks as the peer response");
+                    debug!("unexpected notfound message from peer: all remaining block hashes should be listed in the notfound. Using partial received blocks as the peer response");
                 }
                 if missing_blocks.len() != missing_invs.len() {
                     trace!(?missing_invs, ?missing_blocks, ?pending_hashes);
-                    info!("unexpected notfound message from peer: notfound contains duplicate hashes or non-block hashes. Using partial received blocks as the peer response");
+                    debug!("unexpected notfound message from peer: notfound contains duplicate hashes or non-block hashes. Using partial received blocks as the peer response");
                 }
 
                 if blocks.is_empty() {
@@ -388,7 +392,7 @@ impl Handler {
 pub(super) enum State {
     /// Awaiting a client request or a peer message.
     AwaitingRequest,
-    /// Awaiting a peer message we can interpret as a client request.
+    /// Awaiting a peer message we can interpret as a response to a client request.
     AwaitingResponse {
         handler: Handler,
         tx: MustUseClientResponseSender,
@@ -447,11 +451,13 @@ impl From<Request> for InboundMessage {
 }
 
 /// The channels, services, and associated state for a peer connection.
-pub struct Connection<S, Tx> {
+pub struct Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
     /// The metadata for the connected peer `service`.
     ///
     /// This field is used for debugging.
-    #[allow(dead_code)]
     pub connection_info: Arc<ConnectionInfo>,
 
     /// The state of this connection's current request or response.
@@ -509,9 +515,17 @@ pub struct Connection<S, Tx> {
 
     /// The state for this peer, when the metrics were last updated.
     pub(super) last_metrics_state: Option<Cow<'static, str>>,
+
+    /// The time of the last overload error response from the inbound
+    /// service to a request from this connection,
+    /// or None if this connection hasn't yet received an overload error.
+    last_overload_time: Option<Instant>,
 }
 
-impl<S, Tx> fmt::Debug for Connection<S, Tx> {
+impl<S, Tx> fmt::Debug for Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // skip the channels, they don't tell us anything useful
         f.debug_struct(std::any::type_name::<Connection<S, Tx>>())
@@ -526,7 +540,10 @@ impl<S, Tx> fmt::Debug for Connection<S, Tx> {
     }
 }
 
-impl<S, Tx> Connection<S, Tx> {
+impl<S, Tx> Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
     /// Return a new connection from its channels, services, and shared state.
     pub(crate) fn new(
         inbound_service: S,
@@ -550,6 +567,7 @@ impl<S, Tx> Connection<S, Tx> {
             connection_tracker,
             metrics_label,
             last_metrics_state: None,
+            last_overload_time: None,
         }
     }
 }
@@ -595,27 +613,50 @@ where
             match self.state {
                 State::AwaitingRequest => {
                     trace!("awaiting client request or peer message");
-                    // CORRECTNESS
+                    // # Correctness
                     //
-                    // Currently, select prefers the first future if multiple
-                    // futures are ready.
+                    // Currently, select prefers the first future if multiple futures are ready.
+                    // We use this behaviour to prioritise messages on each individual peer
+                    // connection in this order:
+                    // - incoming messages from the remote peer, then
+                    // - outgoing messages to the remote peer.
                     //
-                    // The peer can starve client requests if it sends an
-                    // uninterrupted series of messages. But this is unlikely in
-                    // practice, due to network delays.
+                    // This improves the performance of peer responses to Zebra requests, and new
+                    // peer requests to Zebra's inbound service.
                     //
-                    // If both futures are ready, there's no particular reason
-                    // to prefer one over the other.
+                    // `futures::StreamExt::next()` is cancel-safe:
+                    // <https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety>
+                    // This means that messages from the future that isn't selected stay in the stream,
+                    // and they will be returned next time the future is checked.
                     //
-                    // TODO: use `futures::select!`, which chooses a ready future
-                    //       at random, avoiding starvation
-                    //       (To use `select!`, we'll need to map the different
-                    //       results to a new enum types.)
+                    // If an inbound peer message arrives at a ready peer that also has a pending
+                    // request from Zebra, we want to process the peer's message first.
+                    // If we process the Zebra request first:
+                    // - we could misinterpret the inbound peer message as a response to the Zebra
+                    //   request, or
+                    // - if the peer message is a request to Zebra, and we put the peer in the
+                    //   AwaitingResponse state, then we'll correctly ignore the simultaneous Zebra
+                    //   request. (Zebra services make multiple requests or retry, so this is ok.)
+                    //
+                    // # Security
+                    //
+                    // If a peer sends an uninterrupted series of messages, it will delay any new
+                    // requests from Zebra to that individual peer. This is behaviour we want,
+                    // because:
+                    // - any responses to Zebra's requests to that peer would be slow or timeout,
+                    // - the peer will eventually fail a Zebra keepalive check and get disconnected,
+                    // - if there are too many inbound messages overall, the inbound service will
+                    //   return an overload error and the peer will be disconnected.
+                    //
+                    // Messages to other peers will continue to be processed concurrently. Some
+                    // Zebra services might be temporarily delayed until the peer times out, if a
+                    // request to that peer is sent by the service, and the service blocks until
+                    // the request completes (or times out).
                     match future::select(peer_rx.next(), self.client_rx.next()).await {
                         Either::Left((None, _)) => {
-                            self.fail_with(PeerError::ConnectionClosed);
+                            self.fail_with(PeerError::ConnectionClosed).await;
                         }
-                        Either::Left((Some(Err(e)), _)) => self.fail_with(e),
+                        Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
@@ -631,7 +672,8 @@ where
 
                             // There are no requests to be flushed,
                             // but we need to set an error and update metrics.
-                            self.shutdown(PeerError::ClientDropped);
+                            // (We don't want to log this error, because it's normal behaviour.)
+                            self.shutdown_async(PeerError::ClientDropped).await;
                             break;
                         }
                         Either::Right((Some(req), _)) => {
@@ -701,20 +743,30 @@ where
                         .as_mut()
                         .expect("timeout must be set while awaiting response");
 
-                    // CORRECTNESS
+                    // # Security
                     //
-                    // Currently, select prefers the first future if multiple
-                    // futures are ready.
+                    // select() prefers the first future if multiple futures are ready.
                     //
-                    // If multiple futures are ready, we want the cancellation
-                    // to take priority, then the timeout, then peer responses.
+                    // If multiple futures are ready, we want the priority for each individual
+                    // connection to be:
+                    // - cancellation, then
+                    // - timeout, then
+                    // - peer responses.
+                    //
+                    // (Messages to other peers are processed concurrently.)
+                    //
+                    // This makes sure a peer can't block disconnection or timeouts by sending too
+                    // many messages. It also avoids doing work to process messages after a
+                    // connection has failed.
                     let cancel = future::select(tx.cancellation(), timer_ref);
                     match future::select(cancel, peer_rx.next())
                         .instrument(span.clone())
                         .await
                     {
-                        Either::Right((None, _)) => self.fail_with(PeerError::ConnectionClosed),
-                        Either::Right((Some(Err(e)), _)) => self.fail_with(e),
+                        Either::Right((None, _)) => {
+                            self.fail_with(PeerError::ConnectionClosed).await
+                        }
+                        Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
 
@@ -773,7 +825,7 @@ where
                                     // So we do the state request cleanup manually.
                                     let e = SharedPeerError::from(e);
                                     let _ = tx.send(Err(e.clone()));
-                                    self.fail_with(e);
+                                    self.fail_with(e).await;
                                     State::Failed
                                 }
                                 // Other request timeouts fail the request.
@@ -800,6 +852,8 @@ where
             }
         }
 
+        // TODO: close peer_rx here, after changing it from a stream to a channel
+
         let error = self.error_slot.try_get_error();
         assert!(
             error.is_some(),
@@ -809,18 +863,21 @@ where
         self.update_state_metrics(error.expect("checked is_some").to_string());
     }
 
-    /// Fail this connection.
+    /// Fail this connection, log the failure, and shut it down.
+    /// See [`Self::shutdown_async()`] for details.
     ///
-    /// If the connection has errored already, re-use the original error.
-    /// Otherwise, fail the connection with `error`.
-    fn fail_with(&mut self, error: impl Into<SharedPeerError>) {
+    /// Use [`Self::shutdown_async()`] to avoid logging the failure,
+    /// and [`Self::shutdown()`] from non-async code.
+    async fn fail_with(&mut self, error: impl Into<SharedPeerError>) {
         let error = error.into();
 
-        debug!(%error,
-               client_receiver = ?self.client_rx,
-               "failing peer service with error");
+        debug!(
+            %error,
+            client_receiver = ?self.client_rx,
+            "failing peer service with error"
+        );
 
-        self.shutdown(error);
+        self.shutdown_async(error).await;
     }
 
     /// Handle an internal client request, possibly generating outgoing messages to the
@@ -962,9 +1019,31 @@ where
                     )
             }
             (AwaitingRequest, AdvertiseTransactionIds(hashes)) => {
+                let max_tx_inv_in_message: usize = MAX_TX_INV_IN_SENT_MESSAGE
+                    .try_into()
+                    .expect("constant fits in usize");
+
+                // # Security
+                //
+                // In most cases, we try to split over-sized requests into multiple network-layer
+                // messages. But we are unlikely to reach this limit with the default mempool
+                // config, so a gossip like this could indicate a network amplification attack.
+                //
+                // This limit is particularly important here, because advertisements send the same
+                // message to half our available peers.
+                //
+                // If there are thousands of transactions in the mempool, letting peers know the
+                // exact transactions we have isn't that important, so it's ok to drop arbitrary
+                // transaction hashes from our response.
+                if hashes.len() > max_tx_inv_in_message {
+                    debug!(inv_count = ?hashes.len(), ?MAX_TX_INV_IN_SENT_MESSAGE, "unusually large transaction ID gossip");
+                }
+
+                let hashes = hashes.into_iter().take(max_tx_inv_in_message).map(Into::into).collect();
+
                 self
                     .peer_tx
-                    .send(Message::Inv(hashes.iter().map(|h| (*h).into()).collect()))
+                    .send(Message::Inv(hashes))
                     .await
                     .map(|()|
                          Handler::Finished(Ok(Response::Nil))
@@ -990,7 +1069,7 @@ where
             Err(error) => {
                 let error = SharedPeerError::from(error);
                 let _ = tx.send(Err(error.clone()));
-                self.fail_with(error);
+                self.fail_with(error).await;
             }
         };
     }
@@ -1013,17 +1092,17 @@ where
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
                 if let Err(e) = self.peer_tx.send(Message::Pong(nonce)).await {
-                    self.fail_with(e);
+                    self.fail_with(e).await;
                 }
                 Consumed
             }
             // These messages shouldn't be sent outside of a handshake.
             Message::Version { .. } => {
-                self.fail_with(PeerError::DuplicateHandshake);
+                self.fail_with(PeerError::DuplicateHandshake).await;
                 Consumed
             }
             Message::Verack { .. } => {
-                self.fail_with(PeerError::DuplicateHandshake);
+                self.fail_with(PeerError::DuplicateHandshake).await;
                 Consumed
             }
             // These messages should already be handled as a response if they
@@ -1190,7 +1269,6 @@ where
     /// of connected peers.
     async fn drive_peer_request(&mut self, req: Request) {
         trace!(?req);
-        use tower::{load_shed::error::Overloaded, ServiceExt};
 
         // Add a metric for inbound requests
         metrics::counter!(
@@ -1201,29 +1279,59 @@ where
         );
         self.update_state_metrics(format!("In::Req::{}", req.command()));
 
+        // Give the inbound service time to clear its queue,
+        // before sending the next inbound request.
+        tokio::task::yield_now().await;
+
+        // # Security
+        //
+        // Holding buffer slots for a long time can cause hangs:
+        // <https://docs.rs/tower/latest/tower/buffer/struct.Buffer.html#a-note-on-choosing-a-bound>
+        //
+        // The inbound service must be called immediately after a buffer slot is reserved.
         if self.svc.ready().await.is_err() {
-            // Treat all service readiness errors as Overloaded
-            // TODO: treat `TryRecvError::Closed` in `Inbound::poll_ready` as a fatal error (#1655)
-            self.fail_with(PeerError::Overloaded);
+            self.fail_with(PeerError::ServiceShutdown).await;
             return;
         }
 
         let rsp = match self.svc.call(req.clone()).await {
             Err(e) => {
-                if e.is::<Overloaded>() {
-                    tracing::info!("inbound service is overloaded, closing connection");
-                    metrics::counter!("pool.closed.loadshed", 1);
-                    self.fail_with(PeerError::Overloaded);
+                if e.is::<tower::load_shed::error::Overloaded>() {
+                    // # Security
+                    //
+                    // The peer request queue must have a limited length.
+                    // The buffer and load shed layers are added in `start::start()`.
+                    tracing::debug!("inbound service is overloaded, may close connection");
+
+                    let now = Instant::now();
+
+                    self.handle_inbound_overload(req, now, PeerError::Overloaded)
+                        .await;
+                } else if e.is::<tower::timeout::error::Elapsed>() {
+                    // # Security
+                    //
+                    // Peer requests must have a timeout.
+                    // The timeout layer is added in `start::start()`.
+                    tracing::info!(%req, "inbound service request timed out, may close connection");
+
+                    let now = Instant::now();
+
+                    self.handle_inbound_overload(req, now, PeerError::InboundTimeout)
+                        .await;
                 } else {
                     // We could send a reject to the remote peer, but that might cause
                     // them to disconnect, and we might be using them to sync blocks.
                     // For similar reasons, we don't want to fail_with() here - we
                     // only close the connection if the peer is doing something wrong.
-                    info!(%e,
-                          connection_state = ?self.state,
-                          client_receiver = ?self.client_rx,
-                          "error processing peer request");
+                    info!(
+                        %e,
+                        connection_state = ?self.state,
+                        client_receiver = ?self.client_rx,
+                        "error processing peer request",
+                    );
+                    self.update_state_metrics(format!("In::Req::{}/Rsp::Error", req.command()));
                 }
+
                 return;
             }
             Ok(rsp) => rsp,
@@ -1238,11 +1346,12 @@ where
         );
         self.update_state_metrics(format!("In::Rsp::{}", rsp.command()));
 
+        // TODO: split response handler into its own method
         match rsp.clone() {
             Response::Nil => { /* generic success, do nothing */ }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
-                    self.fail_with(e);
+                    self.fail_with(e).await;
                 }
             }
             Response::Transactions(transactions) => {
@@ -1254,7 +1363,7 @@ where
                     match transaction {
                         Available(transaction) => {
                             if let Err(e) = self.peer_tx.send(Message::Tx(transaction)).await {
-                                self.fail_with(e);
+                                self.fail_with(e).await;
                                 return;
                             }
                         }
@@ -1264,7 +1373,7 @@ where
 
                 if !missing_ids.is_empty() {
                     if let Err(e) = self.peer_tx.send(Message::NotFound(missing_ids)).await {
-                        self.fail_with(e);
+                        self.fail_with(e).await;
                         return;
                     }
                 }
@@ -1278,7 +1387,7 @@ where
                     match block {
                         Available(block) => {
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
-                                self.fail_with(e);
+                                self.fail_with(e).await;
                                 return;
                             }
                         }
@@ -1288,7 +1397,7 @@ where
 
                 if !missing_hashes.is_empty() {
                     if let Err(e) = self.peer_tx.send(Message::NotFound(missing_hashes)).await {
-                        self.fail_with(e);
+                        self.fail_with(e).await;
                         return;
                     }
                 }
@@ -1299,30 +1408,150 @@ where
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
                     .await
                 {
-                    self.fail_with(e)
+                    self.fail_with(e).await
                 }
             }
             Response::BlockHeaders(headers) => {
                 if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
-                    self.fail_with(e)
+                    self.fail_with(e).await
                 }
             }
             Response::TransactionIds(hashes) => {
-                if let Err(e) = self
-                    .peer_tx
-                    .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
-                    .await
-                {
-                    self.fail_with(e)
+                let max_tx_inv_in_message: usize = MAX_TX_INV_IN_SENT_MESSAGE
+                    .try_into()
+                    .expect("constant fits in usize");
+
+                // # Security
+                //
+                // In most cases, we try to split over-sized responses into multiple network-layer
+                // messages. But we are unlikely to reach this limit with the default mempool
+                // config, so a response like this could indicate a network amplification attack.
+                //
+                // If there are thousands of transactions in the mempool, letting peers know the
+                // exact transactions we have isn't that important, so it's ok to drop arbitrary
+                // transaction hashes from our response.
+                if hashes.len() > max_tx_inv_in_message {
+                    debug!(inv_count = ?hashes.len(), ?MAX_TX_INV_IN_SENT_MESSAGE, "unusually large transaction ID response");
+                }
+
+                let hashes = hashes
+                    .into_iter()
+                    .take(max_tx_inv_in_message)
+                    .map(Into::into)
+                    .collect();
+
+                if let Err(e) = self.peer_tx.send(Message::Inv(hashes)).await {
+                    self.fail_with(e).await
                 }
             }
         }
 
         debug!(state = %self.state, %req, %rsp, "sent Zebra response to peer");
+
+        // Give the inbound service time to clear its queue,
+        // before checking the connection for the next inbound or outbound request.
+        tokio::task::yield_now().await;
+    }
+
+    /// Handle inbound service overload and timeout error responses by randomly terminating some
+    /// connections.
+    ///
+    /// # Security
+    ///
+    /// When the inbound service is overloaded with requests, Zebra needs to drop some connections,
+    /// to reduce the load on the application. But dropping every connection that receives an
+    /// `Overloaded` error from the inbound service could cause Zebra to drop too many peer
+    /// connections, and stop itself downloading blocks or transactions.
+    ///
+    /// Malicious or misbehaving peers can also overload the inbound service, and make Zebra drop
+    /// its connections to other peers.
+    ///
+    /// So instead, Zebra drops some overloaded connections at random. If a connection has recently
+    /// overloaded the inbound service, it is more likely to be dropped. This makes it harder for a
+    /// single peer (or multiple peers) to perform a denial of service attack.
+    ///
+    /// The inbound connection rate-limit also makes it hard for multiple peers to perform this
+    /// attack, because each inbound connection can only send one inbound request before its
+    /// probability of being disconnected increases.
+    async fn handle_inbound_overload(&mut self, req: Request, now: Instant, error: PeerError) {
+        let prev = self.last_overload_time.replace(now);
+        let drop_connection_probability = overload_drop_connection_probability(now, prev);
+
+        if thread_rng().gen::<f32>() < drop_connection_probability {
+            if matches!(error, PeerError::Overloaded) {
+                metrics::counter!("pool.closed.loadshed", 1);
+            } else {
+                metrics::counter!("pool.closed.inbound.timeout", 1);
+            }
+
+            tracing::info!(
+                drop_connection_probability = format!("{drop_connection_probability:.3}"),
+                remote_user_agent = ?self.connection_info.remote.user_agent,
+                negotiated_version = ?self.connection_info.negotiated_version,
+                peer = ?self.metrics_label,
+                last_peer_state = ?self.last_metrics_state,
+                // TODO: remove this detailed debug info once #6506 is fixed
+                remote_height = ?self.connection_info.remote.start_height,
+                cached_addrs = ?self.cached_addrs.len(),
+                connection_state = ?self.state,
+                "inbound service {error} error, closing connection",
+            );
+
+            self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Error", req.command()));
+            self.fail_with(error).await;
+        } else {
+            self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Ignored", req.command()));
+
+            if matches!(error, PeerError::Overloaded) {
+                metrics::counter!("pool.ignored.loadshed", 1);
+            } else {
+                metrics::counter!("pool.ignored.inbound.timeout", 1);
+            }
+        }
     }
 }
 
-impl<S, Tx> Connection<S, Tx> {
+/// Returns the probability of dropping a connection where the last overload was at `prev`,
+/// and the current overload is `now`.
+///
+/// # Security
+///
+/// Connections that haven't seen an overload error in the past OVERLOAD_PROTECTION_INTERVAL
+/// have a small chance of being closed (MIN_OVERLOAD_DROP_PROBABILITY).
+///
+/// Connections that have seen a previous overload error in that time
+/// have a higher chance of being dropped up to MAX_OVERLOAD_DROP_PROBABILITY.
+/// This probability increases quadratically, so peers that send lots of inbound
+/// requests are more likely to be dropped.
+///
+/// ## Examples
+///
+/// If a connection sends multiple overloads close together, it is very likely to be
+/// disconnected. If a connection has two overloads multiple seconds apart, it is unlikely
+/// to be disconnected.
+fn overload_drop_connection_probability(now: Instant, prev: Option<Instant>) -> f32 {
+    let Some(prev) = prev else {
+        return MIN_OVERLOAD_DROP_PROBABILITY;
+    };
+
+    let protection_fraction_since_last_overload =
+        (now - prev).as_secs_f32() / OVERLOAD_PROTECTION_INTERVAL.as_secs_f32();
+
+    // Quadratically increase the disconnection probability for very recent overloads.
+    // Negative values are ignored by clamping to MIN_OVERLOAD_DROP_PROBABILITY.
+    let overload_fraction = protection_fraction_since_last_overload.powi(2);
+
+    let probability_range = MAX_OVERLOAD_DROP_PROBABILITY - MIN_OVERLOAD_DROP_PROBABILITY;
+    let raw_drop_probability =
+        MAX_OVERLOAD_DROP_PROBABILITY - (overload_fraction * probability_range);
+
+    raw_drop_probability.clamp(MIN_OVERLOAD_DROP_PROBABILITY, MAX_OVERLOAD_DROP_PROBABILITY)
+}
+
+impl<S, Tx> Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
     /// Update the connection state metrics for this connection,
     /// using `extra_state_info` as additional state information.
     fn update_state_metrics(&mut self, extra_state_info: impl Into<Option<String>>) {
@@ -1361,18 +1590,32 @@ impl<S, Tx> Connection<S, Tx> {
         }
     }
 
-    /// Marks the peer as having failed with `error`, and performs connection cleanup.
+    /// Marks the peer as having failed with `error`, and performs connection cleanup,
+    /// including async channel closes.
     ///
     /// If the connection has errored already, re-use the original error.
     /// Otherwise, fail the connection with `error`.
+    async fn shutdown_async(&mut self, error: impl Into<SharedPeerError>) {
+        // Close async channels first, so other tasks can start shutting down.
+        // There's nothing we can do about errors while shutting down, and some errors are expected.
+        //
+        // TODO: close peer_tx and peer_rx in shutdown() and Drop, after:
+        // - using channels instead of streams/sinks?
+        // - exposing the underlying implementation rather than using generics and closures?
+        // - adding peer_rx to the connection struct (optional)
+        let _ = self.peer_tx.close().await;
+
+        self.shutdown(error);
+    }
+
+    /// Marks the peer as having failed with `error`, and performs connection cleanup.
+    /// See [`Self::shutdown_async()`] for details.
+    ///
+    /// Call [`Self::shutdown_async()`] in async code, because it can shut down more channels.
     fn shutdown(&mut self, error: impl Into<SharedPeerError>) {
         let mut error = error.into();
 
         // Close channels first, so other tasks can start shutting down.
-        //
-        // TODO: close peer_tx and peer_rx, after:
-        // - adapting them using a struct with a Stream impl, rather than closures
-        // - making the struct forward `close` to the inner channel
         self.client_rx.close();
 
         // Update the shared error slot
@@ -1440,7 +1683,10 @@ impl<S, Tx> Connection<S, Tx> {
     }
 }
 
-impl<S, Tx> Drop for Connection<S, Tx> {
+impl<S, Tx> Drop for Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
     fn drop(&mut self) {
         self.shutdown(PeerError::ConnectionDropped);
 

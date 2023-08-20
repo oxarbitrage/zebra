@@ -1,3 +1,5 @@
+//! Randomised property tests for candidate peer selection.
+
 use std::{
     env,
     net::SocketAddr,
@@ -6,15 +8,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use proptest::{collection::vec, prelude::*};
+use proptest::{
+    collection::{hash_map, vec},
+    prelude::*,
+};
 use tokio::time::{sleep, timeout};
 use tracing::Span;
 
 use zebra_chain::{parameters::Network::*, serialization::DateTime32};
 
 use crate::{
-    constants::MIN_PEER_CONNECTION_INTERVAL,
+    canonical_peer_addr,
+    constants::{DEFAULT_MAX_CONNS_PER_IP, MIN_OUTBOUND_PEER_CONNECTION_INTERVAL},
     meta_addr::{MetaAddr, MetaAddrChange},
+    protocol::types::PeerServices,
     AddressBook, BoxError, Request, Response,
 };
 
@@ -65,7 +72,7 @@ proptest! {
         });
 
         // Since the address book is empty, there won't be any available peers
-        let address_book = AddressBook::new(SocketAddr::from_str("0.0.0.0:0").unwrap(), Mainnet, Span::none());
+        let address_book = AddressBook::new(SocketAddr::from_str("0.0.0.0:0").unwrap(), Mainnet, DEFAULT_MAX_CONNS_PER_IP, Span::none());
 
         let mut candidate_set = CandidateSet::new(Arc::new(std::sync::Mutex::new(address_book)), peer_service);
 
@@ -75,7 +82,7 @@ proptest! {
             //
             // Check that it takes less than the peer set candidate delay,
             // and hope that is enough time for test machines with high CPU load.
-            let less_than_min_interval = MIN_PEER_CONNECTION_INTERVAL - Duration::from_millis(1);
+            let less_than_min_interval = MIN_OUTBOUND_PEER_CONNECTION_INTERVAL - Duration::from_millis(1);
             assert_eq!(runtime.block_on(timeout(less_than_min_interval, candidate_set.next())), Ok(None));
         }
     }
@@ -92,18 +99,22 @@ proptest! {
     /// Test that new outbound peer connections are rate-limited.
     #[test]
     fn new_outbound_peer_connections_are_rate_limited(
-        peers in vec(MetaAddrChange::ready_outbound_strategy(), TEST_ADDRESSES),
+        peers in hash_map(MetaAddrChange::ready_outbound_strategy_ip(), MetaAddrChange::ready_outbound_strategy_port(), TEST_ADDRESSES),
         initial_candidates in 0..MAX_TEST_CANDIDATES,
         extra_candidates in 0..MAX_TEST_CANDIDATES,
     ) {
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
 
+        let peers = peers.into_iter().map(|(ip, port)| {
+            MetaAddr::new_alternate(canonical_peer_addr(SocketAddr::new(ip, port)), &PeerServices::NODE_NETWORK)
+        }).collect::<Vec<_>>();
+
         let peer_service = tower::service_fn(|_| async {
             unreachable!("Mock peer service is never used");
         });
 
-        let mut address_book = AddressBook::new(SocketAddr::from_str("0.0.0.0:0").unwrap(), Mainnet, Span::none());
+        let mut address_book = AddressBook::new(SocketAddr::from_str("0.0.0.0:0").unwrap(), Mainnet, DEFAULT_MAX_CONNS_PER_IP, Span::none());
         address_book.extend(peers);
 
         let mut candidate_set = CandidateSet::new(Arc::new(std::sync::Mutex::new(address_book)), peer_service);
@@ -112,7 +123,7 @@ proptest! {
             // Check rate limiting for initial peers
             check_candidates_rate_limiting(&mut candidate_set, initial_candidates).await;
             // Sleep more than the rate limiting delay
-            sleep(MAX_TEST_CANDIDATES * MIN_PEER_CONNECTION_INTERVAL).await;
+            sleep(MAX_TEST_CANDIDATES * MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
             // Check that the next peers are still respecting the rate limiting, without causing a
             // burst of reconnections
             check_candidates_rate_limiting(&mut candidate_set, extra_candidates).await;
@@ -121,7 +132,7 @@ proptest! {
         // Allow enough time for the maximum number of candidates,
         // plus some extra time for test machines with high CPU load.
         // (The max delay asserts usually fail before hitting this timeout.)
-        let max_rate_limit_sleep = 3 * MAX_TEST_CANDIDATES * MIN_PEER_CONNECTION_INTERVAL;
+        let max_rate_limit_sleep = 3 * MAX_TEST_CANDIDATES * MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
         let max_extra_delay = (2 * MAX_TEST_CANDIDATES + 1) * MAX_SLEEP_EXTRA_DELAY;
         assert!(runtime.block_on(timeout(max_rate_limit_sleep + max_extra_delay, checks)).is_ok());
     }
@@ -137,7 +148,7 @@ proptest! {
 /// - if no reconnection peer is returned at all.
 async fn check_candidates_rate_limiting<S>(candidate_set: &mut CandidateSet<S>, candidates: u32)
 where
-    S: tower::Service<Request, Response = Response, Error = BoxError>,
+    S: tower::Service<Request, Response = Response, Error = BoxError> + Send,
     S::Future: Send + 'static,
 {
     let mut now = Instant::now();
@@ -161,7 +172,8 @@ where
             "rate-limited candidates should not be delayed too long: now: {now:?} max: {maximum_reconnect_instant:?}. Hint: is the test machine overloaded?",
         );
 
-        minimum_reconnect_instant = now + MIN_PEER_CONNECTION_INTERVAL;
-        maximum_reconnect_instant = now + MIN_PEER_CONNECTION_INTERVAL + MAX_SLEEP_EXTRA_DELAY;
+        minimum_reconnect_instant = now + MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
+        maximum_reconnect_instant =
+            now + MIN_OUTBOUND_PEER_CONNECTION_INTERVAL + MAX_SLEEP_EXTRA_DELAY;
     }
 }

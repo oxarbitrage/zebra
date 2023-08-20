@@ -36,31 +36,41 @@ use proptest_derive::Arbitrary;
 #[allow(unused_imports)]
 use crate::block::MAX_BLOCK_BYTES;
 
-mod zip317;
+pub mod zip317;
 
 /// The minimum cost value for a transaction in the mempool.
 ///
 /// Contributes to the randomized, weighted eviction of transactions from the
 /// mempool when it reaches a max size, also based on the total cost.
 ///
+/// # Standard Rule
+///
 /// > Each transaction has a cost, which is an integer defined as:
 /// >
-/// > max(serialized transaction size in bytes, 4000)
+/// > max(memory size in bytes, 10000)
 /// >
-/// > The threshold 4000 for the cost function is chosen so that the size in bytes
-/// > of a typical fully shielded Sapling transaction (with, say, 2 shielded outputs
-/// > and up to 5 shielded inputs) will fall below the threshold. This has the effect
+/// > The memory size is an estimate of the size that a transaction occupies in the
+/// > memory of a node. It MAY be approximated as the serialized transaction size in
+/// > bytes.
+/// >
+/// > ...
+/// >
+/// > The threshold 10000 for the cost function is chosen so that the size in bytes of
+/// > a minimal fully shielded Orchard transaction with 2 shielded actions (having a
+/// > serialized size of 9165 bytes) will fall below the threshold. This has the effect
 /// > of ensuring that such transactions are not evicted preferentially to typical
-/// > transparent transactions because of their size.
+/// > transparent or Sapling transactions because of their size.
 ///
 /// [ZIP-401]: https://zips.z.cash/zip-0401
-const MEMPOOL_TRANSACTION_COST_THRESHOLD: u64 = 4000;
+pub const MEMPOOL_TRANSACTION_COST_THRESHOLD: u64 = 10_000;
 
 /// When a transaction pays a fee less than the conventional fee,
 /// this low fee penalty is added to its cost for mempool eviction.
 ///
 /// See [VerifiedUnminedTx::eviction_weight()] for details.
-const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 16_000;
+///
+/// [ZIP-401]: https://zips.z.cash/zip-0401
+const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 40_000;
 
 /// A unique identifier for an unmined transaction, regardless of version.
 ///
@@ -76,7 +86,7 @@ const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 16_000;
 /// [ZIP-239]: https://zips.z.cash/zip-0239
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 /// [Spec: Transaction Identifiers]: https://zips.z.cash/protocol/protocol.pdf#txnidentifiers
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum UnminedTxId {
     /// A legacy unmined transaction identifier.
@@ -94,6 +104,29 @@ pub enum UnminedTxId {
     ///
     /// For more details, see [`WtxId`].
     Witnessed(WtxId),
+}
+
+impl fmt::Debug for UnminedTxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Logging unmined transaction IDs can leak sensitive user information,
+            // particularly when Zebra is being used as a `lightwalletd` backend.
+            Self::Legacy(_hash) => f.debug_tuple("Legacy").field(&self.to_string()).finish(),
+            Self::Witnessed(_id) => f.debug_tuple("Witnessed").field(&self.to_string()).finish(),
+        }
+    }
+}
+
+impl fmt::Display for UnminedTxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Legacy(_hash) => f
+                .debug_tuple("transaction::Hash")
+                .field(&"private")
+                .finish(),
+            Witnessed(_id) => f.debug_tuple("WtxId").field(&"private").finish(),
+        }
+    }
 }
 
 impl From<Transaction> for UnminedTxId {
@@ -127,15 +160,6 @@ impl From<WtxId> for UnminedTxId {
 impl From<&WtxId> for UnminedTxId {
     fn from(wtx_id: &WtxId) -> Self {
         (*wtx_id).into()
-    }
-}
-
-impl fmt::Display for UnminedTxId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Legacy(hash) => hash.fmt(f),
-            Witnessed(id) => id.fmt(f),
-        }
     }
 }
 
@@ -203,7 +227,7 @@ impl UnminedTxId {
 ///
 /// This transaction has been structurally verified.
 /// (But it might still need semantic or contextual verification.)
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct UnminedTx {
     /// The unmined transaction itself.
     pub transaction: Arc<Transaction>,
@@ -220,13 +244,17 @@ pub struct UnminedTx {
     pub conventional_fee: Amount<NonNegative>,
 }
 
+impl fmt::Debug for UnminedTx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Logging unmined transactions can leak sensitive user information,
+        // particularly when Zebra is being used as a `lightwalletd` backend.
+        f.debug_tuple("UnminedTx").field(&"private").finish()
+    }
+}
+
 impl fmt::Display for UnminedTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnminedTx")
-            .field("transaction", &self.transaction.to_string())
-            .field("serialized_size", &self.size)
-            .field("conventional_fee", &self.conventional_fee)
-            .finish()
+        f.debug_tuple("UnminedTx").field(&"private").finish()
     }
 }
 
@@ -294,8 +322,9 @@ impl From<&Arc<Transaction>> for UnminedTx {
 /// A verified unmined transaction, and the corresponding transaction fee.
 ///
 /// This transaction has been fully verified, in the context of the mempool.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+//
+// This struct can't be `Eq`, because it contains a `f32`.
+#[derive(Clone, PartialEq)]
 pub struct VerifiedUnminedTx {
     /// The unmined transaction.
     pub transaction: UnminedTx,
@@ -306,6 +335,13 @@ pub struct VerifiedUnminedTx {
     /// The number of legacy signature operations in this transaction's
     /// transparent inputs and outputs.
     pub legacy_sigop_count: u64,
+
+    /// The number of conventional actions for `transaction`, as defined by [ZIP-317].
+    ///
+    /// The number of actions is limited by [`MAX_BLOCK_BYTES`], so it fits in a u32.
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
+    pub conventional_actions: u32,
 
     /// The number of unpaid actions for `transaction`,
     /// as defined by [ZIP-317] for block production.
@@ -324,14 +360,20 @@ pub struct VerifiedUnminedTx {
     pub fee_weight_ratio: f32,
 }
 
+impl fmt::Debug for VerifiedUnminedTx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Logging unmined transactions can leak sensitive user information,
+        // particularly when Zebra is being used as a `lightwalletd` backend.
+        f.debug_tuple("VerifiedUnminedTx")
+            .field(&"private")
+            .finish()
+    }
+}
+
 impl fmt::Display for VerifiedUnminedTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VerifiedUnminedTx")
-            .field("transaction", &self.transaction.to_string())
-            .field("miner_fee", &self.miner_fee)
-            .field("legacy_sigop_count", &self.legacy_sigop_count)
-            .field("unpaid_actions", &self.unpaid_actions)
-            .field("fee_weight_ratio", &self.fee_weight_ratio)
+        f.debug_tuple("VerifiedUnminedTx")
+            .field(&"private")
             .finish()
     }
 }
@@ -343,17 +385,21 @@ impl VerifiedUnminedTx {
         transaction: UnminedTx,
         miner_fee: Amount<NonNegative>,
         legacy_sigop_count: u64,
-    ) -> Self {
+    ) -> Result<Self, zip317::Error> {
         let fee_weight_ratio = zip317::conventional_fee_weight_ratio(&transaction, miner_fee);
+        let conventional_actions = zip317::conventional_actions(&transaction.transaction);
         let unpaid_actions = zip317::unpaid_actions(&transaction, miner_fee);
 
-        Self {
+        zip317::mempool_checks(unpaid_actions, miner_fee, transaction.size)?;
+
+        Ok(Self {
             transaction,
             miner_fee,
             legacy_sigop_count,
             fee_weight_ratio,
+            conventional_actions,
             unpaid_actions,
-        }
+        })
     }
 
     /// Returns `true` if the transaction pays at least the [ZIP-317] conventional fee.
@@ -369,9 +415,7 @@ impl VerifiedUnminedTx {
     /// and signature verification; networking overheads; size of in-memory data
     /// structures).
     ///
-    /// > Each transaction has a cost, which is an integer defined as:
-    /// >
-    /// > max(serialized transaction size in bytes, 4000)
+    /// > Each transaction has a cost, which is an integer defined as...
     ///
     /// [ZIP-401]: https://zips.z.cash/zip-0401
     pub fn cost(&self) -> u64 {
@@ -384,11 +428,12 @@ impl VerifiedUnminedTx {
     /// The computed _eviction weight_ of a verified unmined transaction as part
     /// of the mempool set, as defined in [ZIP-317] and [ZIP-401].
     ///
-    /// Standard rule:
+    /// # Standard Rule
     ///
-    /// > Each transaction also has an eviction weight, which is cost +
-    /// > low_fee_penalty, where low_fee_penalty is 16000 if the transaction pays
-    /// > a fee less than the conventional fee, otherwise 0.
+    /// > Each transaction also has an *eviction weight*, which is *cost* + *low_fee_penalty*,
+    /// > where *low_fee_penalty* is 40000 if the transaction pays a fee less than the
+    /// > conventional fee, otherwise 0. The conventional fee is currently defined in
+    /// > [ZIP-317].
     ///
     /// > zcashd and zebrad limit the size of the mempool as described in [ZIP-401].
     /// > This specifies a low fee penalty that is added to the "eviction weight" if the transaction

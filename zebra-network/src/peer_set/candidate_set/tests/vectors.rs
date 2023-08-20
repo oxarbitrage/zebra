@@ -1,7 +1,6 @@
 //! Fixed test vectors for CandidateSet.
 
 use std::{
-    convert::TryInto,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -16,7 +15,7 @@ use zebra_chain::{parameters::Network::*, serialization::DateTime32};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
-    constants::{GET_ADDR_FANOUT, MIN_PEER_GET_ADDR_INTERVAL},
+    constants::{DEFAULT_MAX_CONNS_PER_IP, GET_ADDR_FANOUT, MIN_PEER_GET_ADDR_INTERVAL},
     types::{MetaAddr, PeerServices},
     AddressBook, Request, Response,
 };
@@ -142,6 +141,7 @@ fn candidate_set_updates_are_rate_limited() {
     let address_book = AddressBook::new(
         SocketAddr::from_str("0.0.0.0:0").unwrap(),
         Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
         Span::none(),
     );
     let mut peer_service = MockService::build().for_unit_tests();
@@ -187,6 +187,7 @@ fn candidate_set_update_after_update_initial_is_rate_limited() {
     let address_book = AddressBook::new(
         SocketAddr::from_str("0.0.0.0:0").unwrap(),
         Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
         Span::none(),
     );
     let mut peer_service = MockService::build().for_unit_tests();
@@ -245,7 +246,7 @@ fn mock_gossiped_peers(last_seen_times: impl IntoIterator<Item = DateTime<Utc>>)
                 .expect("`last_seen` time doesn't fit in a `DateTime32`");
 
             MetaAddr::new_gossiped_meta_addr(
-                SocketAddr::new(IpAddr::from([192, 168, 1, index as u8]), 20_000),
+                SocketAddr::new(IpAddr::from([192, 168, 1, index as u8]), 20_000).into(),
                 PeerServices::NODE_NETWORK,
                 last_seen,
             )

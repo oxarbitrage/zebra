@@ -1,6 +1,12 @@
 //! The Abscissa component for Zebra's `tracing` implementation.
 
+use std::{
+    fs::{self, File},
+    io::Write,
+};
+
 use abscissa_core::{Component, FrameworkError, Shutdown};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
     fmt::{format, Formatter},
@@ -9,13 +15,36 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter,
 };
+use zebra_chain::parameters::Network;
 
-use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
-
-use crate::{application::app_version, components::tracing::Config};
+use crate::{application::build_version, components::tracing::Config};
 
 #[cfg(feature = "flamegraph")]
 use super::flame;
+
+// Art generated with these two images.
+// Zebra logo: book/theme/favicon.png
+// License: MIT or Apache 2.0
+//
+// Heart image: https://commons.wikimedia.org/wiki/File:Love_Heart_SVG.svg
+// Author: Bubinator
+// License: Public Domain or Unconditional Use
+//
+// How to render
+//
+// Convert heart image to PNG (2000px):
+// curl -o heart.svg https://upload.wikimedia.org/wikipedia/commons/4/42/Love_Heart_SVG.svg
+// cargo install resvg
+// resvg --width 2000 --height 2000 heart.svg heart.png
+//
+// Then to text (40x20):
+// img2txt -W 40 -H 20 -f utf8 -d none heart.png > heart.utf8
+// img2txt -W 40 -H 20 -f utf8 -d none favicon.png > logo.utf8
+// paste -d "\0" logo.utf8 heart.utf8 > zebra.utf8
+static ZEBRA_ART: [u8; include_bytes!("zebra.utf8").len()] = *include_bytes!("zebra.utf8");
+
+/// A type-erased boxed writer that can be sent between threads safely.
+pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
 /// Abscissa component for initializing the `tracing` subsystem
 pub struct Tracing {
@@ -37,27 +66,94 @@ pub struct Tracing {
     flamegrapher: Option<flame::Grapher>,
 
     /// Drop guard for worker thread of non-blocking logger,
-    /// responsible for flushing any remaining logs when the program terminates
-    _guard: WorkerGuard,
+    /// responsible for flushing any remaining logs when the program terminates.
+    //
+    // Correctness: must be listed last in the struct, so it drops after other drops have logged.
+    _guard: Option<WorkerGuard>,
 }
 
 impl Tracing {
-    /// Try to create a new [`Tracing`] component with the given `filter`.
-    pub fn new(config: Config) -> Result<Self, FrameworkError> {
+    /// Try to create a new [`Tracing`] component with the given `config`.
+    ///
+    /// If `uses_intro` is true, show a welcome message, the `network`,
+    /// and the Zebra logo on startup. (If the terminal supports it.)
+    //
+    // This method should only print to stderr, because stdout is for tracing logs.
+    #[allow(clippy::print_stderr, clippy::unwrap_in_result)]
+    pub fn new(network: Network, config: Config, uses_intro: bool) -> Result<Self, FrameworkError> {
+        // Only use color if tracing output is being sent to a terminal or if it was explicitly
+        // forced to.
+        let use_color = config.use_color_stdout();
+        let use_color_stderr = config.use_color_stderr();
+
         let filter = config.filter.unwrap_or_default();
         let flame_root = &config.flamegraph;
+
+        // Only show the intro for user-focused node server commands like `start`
+        if uses_intro {
+            // If it's a terminal and color escaping is enabled: clear screen and
+            // print Zebra logo (here `use_color` is being interpreted as
+            // "use escape codes")
+            if use_color_stderr {
+                // Clear screen
+                eprint!("\x1B[2J");
+                eprintln!(
+                    "{}",
+                    std::str::from_utf8(&ZEBRA_ART)
+                        .expect("should always work on a UTF-8 encoded constant")
+                );
+            }
+
+            eprintln!(
+                "Thank you for running a {} zebrad {} node!",
+                network.lowercase_name(),
+                build_version()
+            );
+            eprintln!(
+                "You're helping to strengthen the network and contributing to a social good :)"
+            );
+        }
+
+        let writer = if let Some(log_file) = config.log_file.as_ref() {
+            // Make sure the directory for the log file exists.
+            // If the log is configured in the current directory, it won't have a parent directory.
+            //
+            // # Security
+            //
+            // If the user is running Zebra with elevated permissions ("root"), they should
+            // create the log file directory before running Zebra, and make sure the Zebra user
+            // account has exclusive access to that directory, and other users can't modify
+            // its parent directories.
+            //
+            // This avoids a TOCTOU security issue in the Rust filesystem API.
+            let log_file_dir = log_file.parent();
+            if let Some(log_file_dir) = log_file_dir {
+                if !log_file_dir.exists() {
+                    eprintln!("Directory for log file {log_file:?} does not exist, trying to create it...");
+
+                    if let Err(create_dir_error) = fs::create_dir_all(log_file_dir) {
+                        eprintln!("Failed to create directory for log file: {create_dir_error}");
+                        eprintln!("Trying log file anyway...");
+                    }
+                }
+            }
+
+            if uses_intro {
+                eprintln!("Sending logs to {log_file:?}...");
+            }
+            let log_file = File::options().append(true).create(true).open(log_file)?;
+            Box::new(log_file) as BoxWrite
+        } else {
+            let stdout = std::io::stdout();
+            Box::new(stdout) as BoxWrite
+        };
 
         // Builds a lossy NonBlocking logger with a default line limit of 128_000 or an explicit buffer_limit.
         // The write method queues lines down a bounded channel with this capacity to a worker thread that writes to stdout.
         // Increments error_counter and drops lines when the buffer is full.
-        let (non_blocking, _guard) = NonBlockingBuilder::default()
+        let (non_blocking, worker_guard) = NonBlockingBuilder::default()
             .buffered_lines_limit(config.buffer_limit.max(100))
-            .finish(std::io::stdout());
-
-        // Only use color if tracing output is being sent to a terminal or if it was explicitly
-        // forced to.
-        let use_color =
-            config.force_use_color || (config.use_color && atty::is(atty::Stream::Stdout));
+            .finish(writer);
 
         // Construct a format subscriber with the supplied global logging filter,
         // and optionally enable reloading.
@@ -154,7 +250,7 @@ impl Tracing {
         let subscriber = subscriber.with(journaldlayer);
 
         #[cfg(feature = "sentry")]
-        let subscriber = subscriber.with(sentry_tracing::layer());
+        let subscriber = subscriber.with(sentry::integrations::tracing::layer());
 
         // spawn the console server in the background, and apply the console layer
         // TODO: set Builder::poll_duration_histogram_max() if needed
@@ -205,13 +301,41 @@ impl Tracing {
             "installed tokio-console tracing layer",
         );
 
+        // Write any progress reports sent by other tasks to the terminal
+        //
+        // TODO: move this to its own module?
+        #[cfg(feature = "progress-bar")]
+        {
+            use howudoin::consumers::TermLine;
+            use std::time::Duration;
+
+            // Stops flickering during the initial sync.
+            const PROGRESS_BAR_DEBOUNCE: Duration = Duration::from_secs(2);
+
+            let terminal_consumer = TermLine::with_debounce(PROGRESS_BAR_DEBOUNCE);
+            howudoin::init(terminal_consumer);
+
+            info!("activated progress bar");
+        }
+
         Ok(Self {
             filter_handle,
             initial_filter: filter,
             #[cfg(feature = "flamegraph")]
             flamegrapher,
-            _guard,
+            _guard: Some(worker_guard),
         })
+    }
+
+    /// Drops guard for worker thread of non-blocking logger,
+    /// to flush any remaining logs when the program terminates.
+    pub fn shutdown(&mut self) {
+        self.filter_handle.take();
+
+        #[cfg(feature = "flamegraph")]
+        self.flamegrapher.take();
+
+        self._guard.take();
     }
 
     /// Return the currently-active tracing filter.
@@ -265,7 +389,7 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
     }
 
     fn version(&self) -> abscissa_core::Version {
-        app_version()
+        build_version()
     }
 
     fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
@@ -280,6 +404,16 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
                 .map_err(|e| FrameworkErrorKind::ComponentError.context(e))?
         }
 
+        #[cfg(feature = "progress-bar")]
+        howudoin::disable();
+
         Ok(())
+    }
+}
+
+impl Drop for Tracing {
+    fn drop(&mut self) {
+        #[cfg(feature = "progress-bar")]
+        howudoin::disable();
     }
 }

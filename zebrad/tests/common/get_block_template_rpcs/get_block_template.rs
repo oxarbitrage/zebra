@@ -10,7 +10,9 @@ use std::time::Duration;
 use color_eyre::eyre::{eyre, Context, Result};
 
 use futures::FutureExt;
+
 use zebra_chain::{parameters::Network, serialization::ZcashSerialize};
+use zebra_node_services::rpc_client::RpcRequestClient;
 use zebra_rpc::methods::get_block_template_rpcs::{
     get_block_template::{
         proposal::TimeSource, GetBlockTemplate, JsonParameters, ProposalResponse,
@@ -19,28 +21,39 @@ use zebra_rpc::methods::get_block_template_rpcs::{
 };
 
 use crate::common::{
-    launch::{can_spawn_zebrad_for_rpc, spawn_zebrad_for_rpc},
-    rpc_client::RPCRequestClient,
+    launch::{can_spawn_zebrad_for_test_type, spawn_zebrad_for_rpc},
     sync::{check_sync_logs_until, MempoolBehavior, SYNC_FINISHED_REGEX},
     test_type::TestType,
 };
 
-/// How long the test waits for the mempool to download and verify transactions.
-///
-/// We've seen it take anywhere from 1-45 seconds for the mempool to have some transactions in it.
-pub const EXPECTED_MEMPOOL_TRANSACTION_TIME: Duration = Duration::from_secs(45);
-
 /// Delay between getting block proposal results and cancelling long poll requests.
+///
+/// This ensures that a new template can be deserialized and sent to interrupt the
+/// block proposal requests if the old template is no longer valid in edge-cases where
+/// an old template becomes invalid right after it's returned. We've seen the getblocktemplate
+/// respond within ~50ms of a request locallly, and this test is run on GCP compute instances
+/// that should offer comparable latency in CI.
 pub const EXTRA_LONGPOLL_WAIT_TIME: Duration = Duration::from_millis(150);
 
 /// Delay between attempts to validate a template as block proposals.
 ///
 /// Running many iterations in short intervals tests that long poll requests correctly
 /// return `submit_old: false` when the old template becomes invalid.
-pub const BLOCK_PROPOSAL_INTERVAL: Duration = Duration::from_millis(300);
+///
+/// We've seen a typical call to `try_validate_block_template` take ~900ms, a minimum
+/// spacing of 1s ensures that this test samples various chain states and mempool contents.
+pub const BLOCK_PROPOSAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Number of times we want to try submitting a block template as a block proposal at an interval
 /// that allows testing the varying mempool contents.
+///
+/// We usually see at least 1 template with a `submit_old` of false from a long poll request
+/// with 1000 `try_validate_block_template` calls.
+///
+/// The block proposal portion of this test should take ~18 minutes for 1000 iterations at
+/// an interval of 1s.
+///
+/// See [`BLOCK_PROPOSAL_INTERVAL`] for more information.
 const NUM_SUCCESSFUL_BLOCK_PROPOSALS_REQUIRED: usize = 1000;
 
 /// Launch Zebra, wait for it to sync, and check the getblocktemplate RPC returns without errors.
@@ -53,7 +66,7 @@ pub(crate) async fn run() -> Result<()> {
     let network = Network::Mainnet;
 
     // Skip the test unless the user specifically asked for it and there is a zebrad_state_path
-    if !can_spawn_zebrad_for_rpc(test_name, test_type) {
+    if !can_spawn_zebrad_for_test_type(test_name, test_type, true) {
         return Ok(());
     }
 
@@ -78,7 +91,7 @@ pub(crate) async fn run() -> Result<()> {
         true,
     )?;
 
-    let client = RPCRequestClient::new(rpc_address);
+    let client = RpcRequestClient::new(rpc_address);
 
     tracing::info!(
         "calling getblocktemplate RPC method at {rpc_address}, \
@@ -93,7 +106,15 @@ pub(crate) async fn run() -> Result<()> {
         .await?;
 
     let is_response_success = getblocktemplate_response.status().is_success();
-    let response_text = getblocktemplate_response.text().await?;
+
+    let mut response_text = getblocktemplate_response.text().await?;
+    // This string can be extremely long in logs.
+    if response_text.len() > 1003 {
+        let end = response_text.len() - 500;
+        // Replace the middle bytes with "...", but leave 500 bytes on either side.
+        // The response text is ascii, so this replacement won't panic.
+        response_text.replace_range(500..=end, "...");
+    }
 
     tracing::info!(
         response_text,
@@ -102,22 +123,7 @@ pub(crate) async fn run() -> Result<()> {
 
     assert!(is_response_success);
 
-    tokio::time::sleep(EXPECTED_MEMPOOL_TRANSACTION_TIME).await;
-
     for _ in 0..NUM_SUCCESSFUL_BLOCK_PROPOSALS_REQUIRED {
-        tracing::info!(
-            "waiting {EXPECTED_MEMPOOL_TRANSACTION_TIME:?} for the mempool \
-             to download and verify some transactions...",
-        );
-
-        tokio::time::sleep(BLOCK_PROPOSAL_INTERVAL).await;
-
-        tracing::info!(
-            "calling getblocktemplate RPC method at {rpc_address}, \
-                 with a mempool that likely has transactions and attempting \
-                 to validate response result as a block proposal",
-        );
-
         let (validation_result, _) = futures::future::join(
             try_validate_block_template(&client),
             tokio::time::sleep(BLOCK_PROPOSAL_INTERVAL),
@@ -138,7 +144,7 @@ pub(crate) async fn run() -> Result<()> {
         .wrap_err("Possible port conflict. Are there other acceptance tests running?")
 }
 
-/// Accepts an [`RPCRequestClient`], calls getblocktemplate in template mode,
+/// Accepts an [`RpcRequestClient`], calls getblocktemplate in template mode,
 /// deserializes and transforms the block template in the response into block proposal data,
 /// then calls getblocktemplate RPC in proposal mode with the serialized and hex-encoded data.
 ///
@@ -151,7 +157,7 @@ pub(crate) async fn run() -> Result<()> {
 /// If an RPC call returns a failure
 /// If the response result cannot be deserialized to `GetBlockTemplate` in 'template' mode
 /// or `ProposalResponse` in 'proposal' mode.
-async fn try_validate_block_template(client: &RPCRequestClient) -> Result<()> {
+async fn try_validate_block_template(client: &RpcRequestClient) -> Result<()> {
     let mut response_json_result: GetBlockTemplate = client
         .json_result_from_call("getblocktemplate", "[]".to_string())
         .await
@@ -202,23 +208,16 @@ async fn try_validate_block_template(client: &RPCRequestClient) -> Result<()> {
     };
 
     loop {
-        tracing::info!(
-            ?response_json_result,
-            "got getblocktemplate response, hopefully with transactions"
-        );
-
         let mut proposal_requests = vec![];
 
         for time_source in TimeSource::valid_sources() {
             // Propose a new block with an empty solution and nonce field
-            tracing::info!(
-                "calling getblocktemplate with a block proposal and time source {time_source:?}...",
-            );
 
             let raw_proposal_block = hex::encode(
                 proposal_block_from_template(&response_json_result, time_source)?
                     .zcash_serialize_to_vec()?,
             );
+            let template = response_json_result.clone();
 
             proposal_requests.push(async move {
                 (
@@ -228,6 +227,7 @@ async fn try_validate_block_template(client: &RPCRequestClient) -> Result<()> {
                             format!(r#"[{{"mode":"proposal","data":"{raw_proposal_block}"}}]"#),
                         )
                         .await,
+                    template,
                     time_source,
                 )
             });
@@ -249,17 +249,18 @@ async fn try_validate_block_template(client: &RPCRequestClient) -> Result<()> {
                 results
             }) => {
                 let _ = done_tx.send(()).await;
-                for (proposal_result, time_source) in proposal_results {
+                for (proposal_result, template, time_source) in proposal_results {
                     let proposal_result = proposal_result
                         .expect("response should be success output with with a serialized `ProposalResponse`");
 
-                    tracing::info!(
-                        ?proposal_result,
-                        ?time_source,
-                        "got getblocktemplate proposal response"
-                    );
-
                     if let ProposalResponse::Rejected(reject_reason) = proposal_result {
+                        tracing::info!(
+                            ?reject_reason,
+                            ?template,
+                            ?time_source,
+                            "failed to validate template as a block proposal"
+                        );
+
                         Err(eyre!(
                             "unsuccessful block proposal validation, reason: {reject_reason:?}"
                         ))?;

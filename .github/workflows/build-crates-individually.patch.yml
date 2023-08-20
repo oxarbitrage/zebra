@@ -18,20 +18,18 @@ on:
 
 jobs:
   matrix:
-    name: Crates matrix
+    name: Generate crates matrix
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v3.3.0
+      - uses: actions/checkout@v3.5.3
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      # Setup Rust with stable toolchain and minimal profile
+      - name: Setup Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal
 
-      - uses: actions-rs/cargo@v1.0.3
       # This step is meant to dynamically create a JSON containing the values of each crate
       # available in this repo in the root directory. We use `cargo tree` to accomplish this task.
       #
@@ -56,6 +54,7 @@ jobs:
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   check-matrix:
+    name: Check crates matrix
     runs-on: ubuntu-latest
     needs: [ matrix ]
     steps:

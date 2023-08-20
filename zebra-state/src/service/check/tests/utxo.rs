@@ -21,7 +21,7 @@ use crate::{
         write::validate_and_commit_non_finalized,
     },
     tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
-    FinalizedBlock,
+    CheckpointVerifiedBlock,
     ValidateContextError::{
         DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
         MissingTransparentOutput, UnshieldedTransparentCoinbaseSpend,
@@ -53,8 +53,13 @@ fn accept_shielded_mature_coinbase_utxo_spend() {
     };
 
     let result =
-        check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo.clone());
-    assert_eq!(result, Ok(ordered_utxo));
+        check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo.as_ref());
+
+    assert_eq!(
+        result,
+        Ok(()),
+        "mature transparent coinbase spend check should return Ok(())"
+    );
 }
 
 /// Check that non-shielded spends of coinbase transparent outputs fail.
@@ -75,7 +80,8 @@ fn reject_unshielded_coinbase_utxo_spend() {
 
     let spend_restriction = transparent::CoinbaseSpendRestriction::SomeTransparentOutputs;
 
-    let result = check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo);
+    let result =
+        check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo.as_ref());
     assert_eq!(result, Err(UnshieldedTransparentCoinbaseSpend { outpoint }));
 }
 
@@ -100,7 +106,8 @@ fn reject_immature_coinbase_utxo_spend() {
     let spend_restriction =
         transparent::CoinbaseSpendRestriction::OnlyShieldedOutputs { spend_height };
 
-    let result = check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo);
+    let result =
+        check::utxo::transparent_coinbase_spend(outpoint, spend_restriction, ordered_utxo.as_ref());
     assert_eq!(
         result,
         Err(ImmatureTransparentCoinbaseSpend {
@@ -177,8 +184,8 @@ proptest! {
 
         // randomly choose to commit the block to the finalized or non-finalized state
         if use_finalized_state {
-            let block1 = FinalizedBlock::from(Arc::new(block1));
-            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), "test");
+            let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
+            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -207,10 +214,9 @@ proptest! {
             prop_assert!(!non_finalized_state.eq_internal_state(&previous_non_finalized_state));
 
             // the non-finalized state has created and spent the UTXO
-            prop_assert_eq!(non_finalized_state.chain_set.len(), 1);
+            prop_assert_eq!(non_finalized_state.chain_count(), 1);
             let chain = non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap();
             prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
@@ -266,8 +272,8 @@ proptest! {
         block2.transactions.push(spend_transaction.into());
 
         if use_finalized_state_spend {
-            let block2 = FinalizedBlock::from(Arc::new(block2));
-            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), "test");
+            let block2 = CheckpointVerifiedBlock::from(Arc::new(block2));
+            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(),None,  "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(2), block2.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -294,10 +300,9 @@ proptest! {
             prop_assert!(!non_finalized_state.eq_internal_state(&previous_non_finalized_state));
 
             // the UTXO is spent
-            prop_assert_eq!(non_finalized_state.chain_set.len(), 1);
+            prop_assert_eq!(non_finalized_state.chain_count(), 1);
             let chain = non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap();
             prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
@@ -448,11 +453,10 @@ proptest! {
             // the finalized state has the UTXO
             prop_assert!(finalized_state.utxo(&expected_outpoint).is_some());
             // the non-finalized state has no chains (so it can't have the UTXO)
-            prop_assert!(non_finalized_state.chain_set.iter().next().is_none());
+            prop_assert!(non_finalized_state.chain_iter().next().is_none());
         } else {
             let chain = non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap();
             // the non-finalized state has the UTXO
@@ -534,11 +538,10 @@ proptest! {
             // the finalized state has the UTXO
             prop_assert!(finalized_state.utxo(&expected_outpoint).is_some());
             // the non-finalized state has no chains (so it can't have the UTXO)
-            prop_assert!(non_finalized_state.chain_set.iter().next().is_none());
+            prop_assert!(non_finalized_state.chain_iter().next().is_none());
         } else {
             let chain = non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap();
             // the non-finalized state has the UTXO
@@ -608,8 +611,8 @@ proptest! {
         let block2 = Arc::new(block2);
 
         if use_finalized_state_spend {
-            let block2 = FinalizedBlock::from(block2.clone());
-            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), "test");
+            let block2 = CheckpointVerifiedBlock::from(block2.clone());
+            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), None, "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(2), block2.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -637,10 +640,9 @@ proptest! {
             // the block data is in the non-finalized state
             prop_assert!(!non_finalized_state.eq_internal_state(&previous_non_finalized_state));
 
-            prop_assert_eq!(non_finalized_state.chain_set.len(), 1);
+            prop_assert_eq!(non_finalized_state.chain_count(), 1);
             let chain = non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap();
 
@@ -840,7 +842,7 @@ struct TestState {
     /// The genesis block that has already been committed to the `state` service's
     /// finalized state.
     #[allow(dead_code)]
-    genesis: FinalizedBlock,
+    genesis: CheckpointVerifiedBlock,
 
     /// A block at height 1, that has already been committed to the `state` service.
     block1: Arc<Block>,
@@ -881,8 +883,9 @@ fn new_state_with_mainnet_transparent_data(
     let block1 = Arc::new(block1);
 
     if use_finalized_state {
-        let block1 = FinalizedBlock::from(block1.clone());
-        let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), "test");
+        let block1 = CheckpointVerifiedBlock::from(block1.clone());
+        let commit_result =
+            finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
 
         // the block was committed
         assert_eq!(
@@ -926,13 +929,12 @@ fn new_state_with_mainnet_transparent_data(
         // the block data is in the non-finalized state
         assert!(!non_finalized_state.eq_internal_state(&previous_non_finalized_state));
 
-        assert_eq!(non_finalized_state.chain_set.len(), 1);
+        assert_eq!(non_finalized_state.chain_count(), 1);
 
         for expected_outpoint in expected_outpoints {
             // the non-finalized state has the unspent UTXOs
             assert!(non_finalized_state
-                .chain_set
-                .iter()
+                .chain_iter()
                 .next()
                 .unwrap()
                 .unspent_utxos()

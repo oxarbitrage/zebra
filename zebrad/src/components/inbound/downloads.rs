@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    convert::TryFrom,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -17,7 +16,10 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::{block, chain_tip::ChainTip};
+use zebra_chain::{
+    block::{self, HeightDiff},
+    chain_tip::ChainTip,
+};
 use zebra_network as zn;
 use zebra_state as zs;
 
@@ -47,7 +49,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Since Zebra keeps an `inv` index, inbound downloads for malicious blocks
 /// will be directed to the malicious node that originally gossiped the hash.
 /// Therefore, this attack can be carried out by a single malicious node.
-pub const MAX_INBOUND_CONCURRENCY: usize = 20;
+pub const MAX_INBOUND_CONCURRENCY: usize = 30;
 
 /// The action taken in response to a peer's gossiped block hash.
 pub enum DownloadAction {
@@ -242,11 +244,9 @@ where
 
         let fut = async move {
             // Check if the block is already in the state.
-            // BUG: check if the hash is in any chain (#862).
-            // Depth only checks the main chain.
-            match state.oneshot(zs::Request::Depth(hash)).await {
-                Ok(zs::Response::Depth(None)) => Ok(()),
-                Ok(zs::Response::Depth(Some(_))) => Err("already present".into()),
+            match state.oneshot(zs::Request::KnownBlock(hash)).await {
+                Ok(zs::Response::KnownBlock(None)) => Ok(()),
+                Ok(zs::Response::KnownBlock(Some(_))) => Err("already present".into()),
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(e),
             }?;
@@ -283,7 +283,8 @@ where
             let tip_height = latest_chain_tip.best_tip_height();
 
             let max_lookahead_height = if let Some(tip_height) = tip_height {
-                let lookahead = i32::try_from(full_verify_concurrency_limit).expect("fits in i32");
+                let lookahead = HeightDiff::try_from(full_verify_concurrency_limit)
+                    .expect("fits in HeightDiff");
                 (tip_height + lookahead).expect("tip is much lower than Height::MAX")
             } else {
                 let genesis_lookahead =

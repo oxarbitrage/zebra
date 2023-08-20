@@ -22,8 +22,8 @@ use std::{
 use chrono::Utc;
 use futures::{channel::mpsc, FutureExt, StreamExt};
 use indexmap::IndexSet;
-use tokio::{net::TcpStream, task::JoinHandle};
-use tower::{service_fn, Service};
+use tokio::{io::AsyncWriteExt, net::TcpStream, task::JoinHandle};
+use tower::{service_fn, Layer, Service, ServiceExt};
 use tracing::Span;
 
 use zebra_chain::{chain_tip::NoChainTip, parameters::Network, serialization::DateTime32};
@@ -31,8 +31,9 @@ use zebra_test::net::random_known_port;
 
 use crate::{
     address_book_updater::AddressBookUpdater,
+    config::CacheDir,
     constants, init,
-    meta_addr::MetaAddr,
+    meta_addr::{MetaAddr, PeerAddrState},
     peer::{self, ClientTestHarness, HandshakeRequest, OutboundConnectorRequest},
     peer_set::{
         initialize::{
@@ -43,7 +44,7 @@ use crate::{
         ActiveConnectionCounter, CandidateSet,
     },
     protocol::types::PeerServices,
-    AddressBook, BoxError, Config, Request, Response,
+    AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
 use Network::*;
@@ -53,10 +54,18 @@ use Network::*;
 /// Using a very short time can make the crawler not run at all.
 const CRAWLER_TEST_DURATION: Duration = Duration::from_secs(10);
 
+/// The amount of time to run the peer cache updater task, before testing what it has done.
+///
+/// Using a very short time can make the peer cache updater not run at all.
+const PEER_CACHE_UPDATER_TEST_DURATION: Duration = Duration::from_secs(25);
+
 /// The amount of time to run the listener, before testing what it has done.
 ///
 /// Using a very short time can make the listener not run at all.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
+
+/// The amount of time to make the inbound connection acceptor wait between peer connections.
+const MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS: Duration = Duration::from_millis(25);
 
 /// Test that zebra-network discovers dynamic bind-to-all-interfaces listener ports,
 /// and sends them to the `AddressBook`.
@@ -177,7 +186,8 @@ async fn peer_limit_zero_mainnet() {
     let unreachable_inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
-    let address_book = init_with_peer_limit(0, unreachable_inbound_service, Mainnet).await;
+    let address_book =
+        init_with_peer_limit(0, unreachable_inbound_service, Mainnet, None, None).await;
     assert_eq!(
         address_book.lock().unwrap().peers().count(),
         0,
@@ -198,7 +208,8 @@ async fn peer_limit_zero_testnet() {
     let unreachable_inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
-    let address_book = init_with_peer_limit(0, unreachable_inbound_service, Testnet).await;
+    let address_book =
+        init_with_peer_limit(0, unreachable_inbound_service, Testnet, None, None).await;
     assert_eq!(
         address_book.lock().unwrap().peers().count(),
         0,
@@ -218,7 +229,7 @@ async fn peer_limit_one_mainnet() {
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
-    let _ = init_with_peer_limit(1, nil_inbound_service, Mainnet).await;
+    let _ = init_with_peer_limit(1, nil_inbound_service, Mainnet, None, None).await;
 
     // Let the crawler run for a while.
     tokio::time::sleep(CRAWLER_TEST_DURATION).await;
@@ -237,7 +248,7 @@ async fn peer_limit_one_testnet() {
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
-    let _ = init_with_peer_limit(1, nil_inbound_service, Testnet).await;
+    let _ = init_with_peer_limit(1, nil_inbound_service, Testnet, None, None).await;
 
     // Let the crawler run for a while.
     tokio::time::sleep(CRAWLER_TEST_DURATION).await;
@@ -256,7 +267,7 @@ async fn peer_limit_two_mainnet() {
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
-    let _ = init_with_peer_limit(2, nil_inbound_service, Mainnet).await;
+    let _ = init_with_peer_limit(2, nil_inbound_service, Mainnet, None, None).await;
 
     // Let the crawler run for a while.
     tokio::time::sleep(CRAWLER_TEST_DURATION).await;
@@ -275,12 +286,95 @@ async fn peer_limit_two_testnet() {
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
-    let _ = init_with_peer_limit(2, nil_inbound_service, Testnet).await;
+    let _ = init_with_peer_limit(2, nil_inbound_service, Testnet, None, None).await;
 
     // Let the crawler run for a while.
     tokio::time::sleep(CRAWLER_TEST_DURATION).await;
 
     // Any number of address book peers is valid here, because some peers might have failed.
+}
+
+/// Test zebra-network writes a peer cache file, and can read it back manually.
+#[tokio::test]
+async fn written_peer_cache_can_be_read_manually() {
+    let _init_guard = zebra_test::init();
+
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
+
+    // The default config should have an active peer cache
+    let config = Config::default();
+    let address_book =
+        init_with_peer_limit(25, nil_inbound_service, Mainnet, None, config.clone()).await;
+
+    // Let the peer cache updater run for a while.
+    tokio::time::sleep(PEER_CACHE_UPDATER_TEST_DURATION).await;
+
+    let approximate_peer_count = address_book
+        .lock()
+        .expect("previous thread panicked while holding address book lock")
+        .len();
+    if approximate_peer_count > 0 {
+        let cached_peers = config
+            .load_peer_cache()
+            .await
+            .expect("unexpected error reading peer cache");
+
+        assert!(
+            !cached_peers.is_empty(),
+            "unexpected empty peer cache from manual load: {:?}",
+            config.cache_dir.peer_cache_file_path(config.network)
+        );
+    }
+}
+
+/// Test zebra-network writes a peer cache file, and reads it back automatically.
+#[tokio::test]
+async fn written_peer_cache_is_automatically_read_on_startup() {
+    let _init_guard = zebra_test::init();
+
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
+
+    // The default config should have an active peer cache
+    let mut config = Config::default();
+    let address_book =
+        init_with_peer_limit(25, nil_inbound_service, Mainnet, None, config.clone()).await;
+
+    // Let the peer cache updater run for a while.
+    tokio::time::sleep(PEER_CACHE_UPDATER_TEST_DURATION).await;
+
+    let approximate_peer_count = address_book
+        .lock()
+        .expect("previous thread panicked while holding address book lock")
+        .len();
+    if approximate_peer_count > 0 {
+        // Make sure our only peers are coming from the disk cache
+        config.initial_mainnet_peers = Default::default();
+
+        let address_book =
+            init_with_peer_limit(25, nil_inbound_service, Mainnet, None, config.clone()).await;
+
+        // Let the peer cache reader run and fill the address book.
+        tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+
+        // We should have loaded at least one peer from the cache
+        let approximate_cached_peer_count = address_book
+            .lock()
+            .expect("previous thread panicked while holding address book lock")
+            .len();
+        assert!(
+            approximate_cached_peer_count > 0,
+            "unexpected empty address book using cache from previous instance: {:?}",
+            config.cache_dir.peer_cache_file_path(config.network)
+        );
+    }
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
@@ -365,15 +459,7 @@ async fn crawler_peer_limit_one_connect_ok_then_drop() {
         let peer_result = peerset_rx.try_next();
         match peer_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_result)) => {
-                assert!(
-                    matches!(peer_result, Ok((_, _))),
-                    "unexpected connection error: {peer_result:?}\n\
-                     {peer_count} previous peers succeeded",
-                );
-                peer_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -427,15 +513,7 @@ async fn crawler_peer_limit_one_connect_ok_stay_open() {
         let peer_change_result = peerset_rx.try_next();
         match peer_change_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_change_result)) => {
-                assert!(
-                    matches!(peer_change_result, Ok((_, _))),
-                    "unexpected connection error: {peer_change_result:?}\n\
-                     {peer_change_count} previous peers succeeded",
-                );
-                peer_change_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_change_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -537,15 +615,7 @@ async fn crawler_peer_limit_default_connect_ok_then_drop() {
         let peer_result = peerset_rx.try_next();
         match peer_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_result)) => {
-                assert!(
-                    matches!(peer_result, Ok((_, _))),
-                    "unexpected connection error: {peer_result:?}\n\
-                     {peer_count} previous peers succeeded",
-                );
-                peer_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -600,15 +670,7 @@ async fn crawler_peer_limit_default_connect_ok_stay_open() {
         let peer_change_result = peerset_rx.try_next();
         match peer_change_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_change_result)) => {
-                assert!(
-                    matches!(peer_change_result, Ok((_, _))),
-                    "unexpected connection error: {peer_change_result:?}\n\
-                     {peer_change_count} previous peers succeeded",
-                );
-                peer_change_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_change_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -665,7 +727,7 @@ async fn listener_peer_limit_zero_handshake_panic() {
     });
 
     let (_config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(0, unreachable_inbound_handshaker).await;
+        spawn_inbound_listener_with_peer_limit(0, None, unreachable_inbound_handshaker).await;
 
     let peer_result = peerset_rx.try_next();
     assert!(
@@ -690,7 +752,7 @@ async fn listener_peer_limit_one_handshake_error() {
         service_fn(|_| async { Err("test inbound handshaker always returns errors".into()) });
 
     let (_config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(1, error_inbound_handshaker).await;
+        spawn_inbound_listener_with_peer_limit(1, None, error_inbound_handshaker).await;
 
     let peer_result = peerset_rx.try_next();
     assert!(
@@ -732,23 +794,19 @@ async fn listener_peer_limit_one_handshake_ok_then_drop() {
             Ok(fake_client)
         });
 
-    let (config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(1, success_disconnect_inbound_handshaker).await;
+    let (config, mut peerset_rx) = spawn_inbound_listener_with_peer_limit(
+        1,
+        usize::MAX,
+        success_disconnect_inbound_handshaker,
+    )
+    .await;
 
     let mut peer_count: usize = 0;
     loop {
         let peer_result = peerset_rx.try_next();
         match peer_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_result)) => {
-                assert!(
-                    matches!(peer_result, Ok((_, _))),
-                    "unexpected connection error: {peer_result:?}\n\
-                     {peer_count} previous peers succeeded",
-                );
-                peer_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -799,22 +857,14 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
         });
 
     let (config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(1, success_stay_open_inbound_handshaker).await;
+        spawn_inbound_listener_with_peer_limit(1, None, success_stay_open_inbound_handshaker).await;
 
     let mut peer_change_count: usize = 0;
     loop {
         let peer_change_result = peerset_rx.try_next();
         match peer_change_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_change_result)) => {
-                assert!(
-                    matches!(peer_change_result, Ok((_, _))),
-                    "unexpected connection error: {peer_change_result:?}\n\
-                     {peer_change_count} previous peers succeeded",
-                );
-                peer_change_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_change_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -871,7 +921,7 @@ async fn listener_peer_limit_default_handshake_error() {
         service_fn(|_| async { Err("test inbound handshaker always returns errors".into()) });
 
     let (_config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(None, error_inbound_handshaker).await;
+        spawn_inbound_listener_with_peer_limit(None, None, error_inbound_handshaker).await;
 
     let peer_result = peerset_rx.try_next();
     assert!(
@@ -917,23 +967,19 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
             Ok(fake_client)
         });
 
-    let (config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(None, success_disconnect_inbound_handshaker).await;
+    let (config, mut peerset_rx) = spawn_inbound_listener_with_peer_limit(
+        None,
+        usize::MAX,
+        success_disconnect_inbound_handshaker,
+    )
+    .await;
 
     let mut peer_count: usize = 0;
     loop {
         let peer_result = peerset_rx.try_next();
         match peer_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_result)) => {
-                assert!(
-                    matches!(peer_result, Ok((_, _))),
-                    "unexpected connection error: {peer_result:?}\n\
-                     {peer_count} previous peers succeeded",
-                );
-                peer_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -984,22 +1030,15 @@ async fn listener_peer_limit_default_handshake_ok_stay_open() {
         });
 
     let (config, mut peerset_rx) =
-        spawn_inbound_listener_with_peer_limit(None, success_stay_open_inbound_handshaker).await;
+        spawn_inbound_listener_with_peer_limit(None, None, success_stay_open_inbound_handshaker)
+            .await;
 
     let mut peer_change_count: usize = 0;
     loop {
         let peer_change_result = peerset_rx.try_next();
         match peer_change_result {
             // A peer handshake succeeded.
-            Ok(Some(peer_change_result)) => {
-                assert!(
-                    matches!(peer_change_result, Ok((_, _))),
-                    "unexpected connection error: {peer_change_result:?}\n\
-                     {peer_change_count} previous peers succeeded",
-                );
-                peer_change_count += 1;
-            }
-
+            Ok(Some(_peer_change)) => peer_change_count += 1,
             // The channel is closed and there are no messages left in the channel.
             Ok(None) => break,
             // The channel is still open, but there are no messages left in the channel.
@@ -1064,10 +1103,13 @@ async fn add_initial_peers_is_rate_limited() {
 
     let elapsed = Instant::now() - before;
 
-    assert_eq!(connections.len(), PEER_COUNT);
+    // Errors are ignored, so we don't expect any peers here
+    assert_eq!(connections.len(), 0);
     // Make sure the rate limiting worked by checking if it took long enough
     assert!(
-        elapsed > constants::MIN_PEER_CONNECTION_INTERVAL.saturating_mul((PEER_COUNT - 1) as u32),
+        elapsed
+            > constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+                .saturating_mul((PEER_COUNT - 1) as u32),
         "elapsed only {elapsed:?}"
     );
 
@@ -1080,7 +1122,7 @@ async fn add_initial_peers_is_rate_limited() {
     // Check for panics or errors in the address book updater task.
     let updater_result = address_book_updater_task_handle.now_or_never();
     assert!(
-        matches!(updater_result, None)
+        updater_result.is_none()
             || matches!(updater_result, Some(Err(ref join_error)) if join_error.is_cancelled())
             // The task method only returns one kind of error.
             // We can't check for error equality due to type erasure,
@@ -1088,6 +1130,216 @@ async fn add_initial_peers_is_rate_limited() {
             || matches!(updater_result, Some(Ok(Err(ref _all_senders_closed)))),
         "unexpected error or panic in address book updater task: {updater_result:?}",
     );
+}
+
+/// Test that self-connections fail.
+//
+// TODO:
+// - add a unit test that makes sure the error is a nonce reuse error
+// - add a unit test that makes sure connections that replay nonces also get rejected
+#[tokio::test]
+async fn self_connections_should_fail() {
+    let _init_guard = zebra_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    const TEST_PEERSET_INITIAL_TARGET_SIZE: usize = 3;
+    const TEST_CRAWL_NEW_PEER_INTERVAL: Duration = Duration::from_secs(1);
+
+    // If we get an inbound request from a peer, the test has a bug,
+    // because self-connections should fail at the handshake stage.
+    let unreachable_inbound_service =
+        service_fn(|_| async { unreachable!("inbound service should never be called") });
+
+    let force_listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let no_initial_peers_config = Config {
+        crawl_new_peer_interval: TEST_CRAWL_NEW_PEER_INTERVAL,
+
+        initial_mainnet_peers: IndexSet::new(),
+        initial_testnet_peers: IndexSet::new(),
+        cache_dir: CacheDir::disabled(),
+
+        ..Config::default()
+    };
+
+    let address_book = init_with_peer_limit(
+        TEST_PEERSET_INITIAL_TARGET_SIZE,
+        unreachable_inbound_service,
+        Mainnet,
+        force_listen_addr,
+        no_initial_peers_config,
+    )
+    .await;
+
+    // Insert our own address into the address book, and make sure it works
+    let (real_self_listener, updated_addr) = {
+        let mut unlocked_address_book = address_book
+            .lock()
+            .expect("unexpected panic in address book");
+
+        let real_self_listener = unlocked_address_book.local_listener_meta_addr(Utc::now());
+
+        // Set a fake listener to get past the check for adding our own address
+        unlocked_address_book.set_local_listener("192.168.0.0:1".parse().unwrap());
+
+        let updated_addr = unlocked_address_book.update(
+            real_self_listener
+                .new_gossiped_change()
+                .expect("change is valid"),
+        );
+
+        std::mem::drop(unlocked_address_book);
+
+        (real_self_listener, updated_addr)
+    };
+
+    // Make sure we modified the address book correctly
+    assert!(
+        updated_addr.is_some(),
+        "inserting our own address into the address book failed: {real_self_listener:?}"
+    );
+    assert_eq!(
+        updated_addr.unwrap().addr(),
+        real_self_listener.addr(),
+        "wrong address inserted into address book"
+    );
+    assert_ne!(
+        updated_addr.unwrap().addr().ip(),
+        Ipv4Addr::UNSPECIFIED,
+        "invalid address inserted into address book: ip must be valid for inbound connections"
+    );
+    assert_ne!(
+        updated_addr.unwrap().addr().port(),
+        0,
+        "invalid address inserted into address book: port must be valid for inbound connections"
+    );
+
+    // Wait until the crawler has tried at least one self-connection
+    tokio::time::sleep(TEST_CRAWL_NEW_PEER_INTERVAL * 3).await;
+
+    // Check that the self-connection failed
+    let self_connection_status = {
+        let mut unlocked_address_book = address_book
+            .lock()
+            .expect("unexpected panic in address book");
+
+        let self_connection_status = unlocked_address_book
+            .get(real_self_listener.addr())
+            .expect("unexpected dropped listener address in address book");
+
+        std::mem::drop(unlocked_address_book);
+
+        self_connection_status
+    };
+
+    // Make sure we fetched from the address book correctly
+    assert_eq!(
+        self_connection_status.addr(),
+        real_self_listener.addr(),
+        "wrong address fetched from address book"
+    );
+
+    // Make sure the self-connection failed
+    assert_eq!(
+        self_connection_status.last_connection_state,
+        PeerAddrState::Failed,
+        "self-connection should have failed"
+    );
+}
+
+/// Test that the number of nonces is limited when peers send an invalid response or
+/// if handshakes time out and are dropped.
+#[tokio::test]
+async fn remnant_nonces_from_outbound_connections_are_limited() {
+    use tower::timeout::TimeoutLayer;
+
+    let _init_guard = zebra_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    const TEST_PEERSET_INITIAL_TARGET_SIZE: usize = 3;
+
+    // Create a test config that listens on an unused port.
+    let listen_addr = "127.0.0.1:0".parse().unwrap();
+    let config = Config {
+        listen_addr,
+        peerset_initial_target_size: TEST_PEERSET_INITIAL_TARGET_SIZE,
+        ..Config::default()
+    };
+
+    let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
+    let nil_inbound_service =
+        tower::service_fn(|_req| async move { Ok::<Response, BoxError>(Response::Nil) });
+
+    let hs = peer::Handshake::builder()
+        .with_config(config.clone())
+        .with_inbound_service(nil_inbound_service)
+        .with_user_agent(("Test user agent").to_string())
+        .with_latest_chain_tip(NoChainTip)
+        .want_transactions(true)
+        .finish()
+        .expect("configured all required parameters");
+
+    let mut outbound_connector = hs_timeout.layer(peer::Connector::new(hs.clone()));
+
+    let mut active_outbound_connections = ActiveConnectionCounter::new_counter();
+
+    let expected_max_nonces = config.peerset_total_connection_limit();
+    let num_connection_attempts = 2 * expected_max_nonces;
+
+    for i in 1..num_connection_attempts {
+        let expected_nonce_count = expected_max_nonces.min(i);
+
+        let (tcp_listener, addr) = open_listener(&config.clone()).await;
+
+        tokio::spawn(async move {
+            let (mut tcp_stream, _addr) = tcp_listener
+                .accept()
+                .await
+                .expect("client connection should succeed");
+
+            tcp_stream
+                .shutdown()
+                .await
+                .expect("shutdown should succeed");
+        });
+
+        let outbound_connector = outbound_connector
+            .ready()
+            .await
+            .expect("outbound connector never errors");
+
+        let connection_tracker = active_outbound_connections.track_connection();
+
+        let req = OutboundConnectorRequest {
+            addr: addr.into(),
+            connection_tracker,
+        };
+
+        outbound_connector
+            .call(req)
+            .await
+            .expect_err("connection attempt should fail");
+
+        let nonce_count = hs.nonce_count().await;
+
+        assert!(
+            expected_max_nonces >= nonce_count,
+            "number of nonces should be limited to `peerset_total_connection_limit`"
+        );
+
+        assert!(
+            expected_nonce_count == nonce_count,
+            "number of nonces should be the lesser of the number of closed connections and `peerset_total_connection_limit`"
+        )
+    }
 }
 
 /// Test that [`init`] does not deadlock in `add_initial_peers`,
@@ -1135,7 +1387,12 @@ async fn add_initial_peers_deadlock() {
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
-    let init_future = init(config, nil_inbound_service, NoChainTip);
+    let init_future = init(
+        config,
+        nil_inbound_service,
+        NoChainTip,
+        "Test user agent".to_string(),
+    );
 
     assert!(tokio::time::timeout(TIME_LIMIT, init_future).await.is_ok());
 }
@@ -1150,14 +1407,24 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
         // Stop Zebra making outbound connections
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
+        cache_dir: CacheDir::disabled(),
 
         ..Config::default()
     };
     let inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
-    let (_peer_service, address_book) = init(config, inbound_service, NoChainTip).await;
-    let local_listener = address_book.lock().unwrap().local_listener_meta_addr();
+    let (_peer_service, address_book) = init(
+        config,
+        inbound_service,
+        NoChainTip,
+        "Test user agent".to_string(),
+    )
+    .await;
+    let local_listener = address_book
+        .lock()
+        .unwrap()
+        .local_listener_meta_addr(Utc::now());
 
     if listen_addr.port() == 0 {
         assert_ne!(
@@ -1180,33 +1447,46 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
     );
 }
 
-/// Initialize a peer set with `peerset_initial_target_size` and `inbound_service` on `network`.
-/// Returns the newly created [`AddressBook`] for testing.
+/// Initialize a peer set with `peerset_initial_target_size`, `inbound_service`, and `network`.
 ///
-/// Binds the network listener to an unused port on all network interfaces.
+/// If `force_listen_addr` is set, binds the network listener to that address.
+/// Otherwise, binds the network listener to an unused port on all network interfaces.
+/// Uses `default_config` or Zebra's defaults for the rest of the configuration.
+///
+/// Returns the newly created [`AddressBook`] for testing.
 async fn init_with_peer_limit<S>(
     peerset_initial_target_size: usize,
     inbound_service: S,
     network: Network,
+    force_listen_addr: impl Into<Option<SocketAddr>>,
+    default_config: impl Into<Option<Config>>,
 ) -> Arc<std::sync::Mutex<AddressBook>>
 where
-    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
 {
     // This test might fail on machines with no configured IPv4 addresses
     // (localhost should be enough).
     let unused_v4 = "0.0.0.0:0".parse().unwrap();
 
+    let default_config = default_config.into().unwrap_or_default();
+
     let config = Config {
         peerset_initial_target_size,
 
         network,
-        listen_addr: unused_v4,
+        listen_addr: force_listen_addr.into().unwrap_or(unused_v4),
 
-        ..Config::default()
+        ..default_config
     };
 
-    let (_peer_service, address_book) = init(config, inbound_service, NoChainTip).await;
+    let (_peer_service, address_book) = init(
+        config,
+        inbound_service,
+        NoChainTip,
+        "Test user agent".to_string(),
+    )
+    .await;
 
     address_book
 }
@@ -1222,8 +1502,11 @@ async fn spawn_crawler_with_peer_limit<C>(
     outbound_connector: C,
 ) -> (Config, mpsc::Receiver<DiscoveredPeer>)
 where
-    C: Service<OutboundConnectorRequest, Response = (SocketAddr, peer::Client), Error = BoxError>
-        + Clone
+    C: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
         + Send
         + 'static,
     C::Future: Send + 'static,
@@ -1235,15 +1518,23 @@ where
     }
 
     // Manually initialize an address book without a timestamp tracker.
-    let mut address_book = AddressBook::new(config.listen_addr, config.network, Span::current());
+    let mut address_book = AddressBook::new(
+        config.listen_addr,
+        config.network,
+        config.max_connections_per_ip,
+        Span::current(),
+    );
 
     // Add enough fake peers to go over the limit, even if the limit is zero.
     let over_limit_peers = config.peerset_outbound_connection_limit() * 2 + 1;
     let mut fake_peer = None;
     for address_number in 0..over_limit_peers {
         let addr = SocketAddr::new(Ipv4Addr::new(127, 1, 1, address_number as _).into(), 1);
-        let addr =
-            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now());
+        let addr = MetaAddr::new_gossiped_meta_addr(
+            addr.into(),
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        );
         fake_peer = Some(addr);
         let addr = addr
             .new_gossiped_change()
@@ -1303,8 +1594,7 @@ where
     // Check for panics or errors in the crawler.
     let crawl_result = crawl_task_handle.now_or_never();
     assert!(
-        matches!(crawl_result, None)
-            || matches!(crawl_result, Some(Err(ref e)) if e.is_cancelled()),
+        crawl_result.is_none() || matches!(crawl_result, Some(Err(ref e)) if e.is_cancelled()),
         "unexpected error or panic in peer crawler task: {crawl_result:?}",
     );
 
@@ -1328,12 +1618,14 @@ where
 /// Returns the generated [`Config`], and the peer set receiver.
 async fn spawn_inbound_listener_with_peer_limit<S>(
     peerset_initial_target_size: impl Into<Option<usize>>,
+    max_connections_per_ip: impl Into<Option<usize>>,
     listen_handshaker: S,
 ) -> (Config, mpsc::Receiver<DiscoveredPeer>)
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
         + Clone
         + Send
+        + Sync
         + 'static,
     S::Future: Send + 'static,
 {
@@ -1341,6 +1633,9 @@ where
     let listen_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = Config {
         listen_addr,
+        max_connections_per_ip: max_connections_per_ip
+            .into()
+            .unwrap_or(constants::DEFAULT_MAX_CONNS_PER_IP),
         ..Config::default()
     };
 
@@ -1360,6 +1655,7 @@ where
     let listen_fut = accept_inbound_connections(
         config.clone(),
         tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         listen_handshaker,
         peerset_tx.clone(),
     );
@@ -1408,8 +1704,7 @@ where
     // Check for panics or errors in the listener.
     let listen_result = listen_task_handle.now_or_never();
     assert!(
-        matches!(listen_result, None)
-            || matches!(listen_result, Some(Err(ref e)) if e.is_cancelled()),
+        listen_result.is_none() || matches!(listen_result, Some(Err(ref e)) if e.is_cancelled()),
         "unexpected error or panic in inbound peer listener task: {listen_result:?}",
     );
 
@@ -1433,8 +1728,11 @@ async fn spawn_add_initial_peers<C>(
     JoinHandle<Result<(), BoxError>>,
 )
 where
-    C: Service<OutboundConnectorRequest, Response = (SocketAddr, peer::Client), Error = BoxError>
-        + Clone
+    C: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
         + Send
         + 'static,
     C::Future: Send + 'static,
@@ -1453,6 +1751,8 @@ where
 
     let config = Config {
         initial_mainnet_peers: peers,
+        // We want exactly the above list of peers, without any cached peers.
+        cache_dir: CacheDir::disabled(),
 
         network: Network::Mainnet,
         listen_addr: unused_v4,

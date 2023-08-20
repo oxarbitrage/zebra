@@ -7,7 +7,7 @@ use jsonrpc_core::{self, BoxFuture, Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use tower::{buffer::Buffer, Service, ServiceExt};
 
-use zcash_address;
+use zcash_address::{self, unified::Encoding, TryFromAddress};
 
 use zebra_chain::{
     amount::Amount,
@@ -17,11 +17,14 @@ use zebra_chain::{
     parameters::Network,
     primitives,
     serialization::ZcashDeserializeInto,
-    transparent,
+    transparent::{
+        self, EXTRA_ZEBRA_COINBASE_DATA, MAX_COINBASE_DATA_LEN, MAX_COINBASE_HEIGHT_DATA_LEN,
+    },
+    work::difficulty::{ExpandedDifficulty, U256},
 };
 use zebra_consensus::{
     funding_stream_address, funding_stream_values, height_for_first_halving, miner_subsidy,
-    VerifyChainError,
+    RouterError,
 };
 use zebra_network::AddressBookPeers;
 use zebra_node_services::mempool;
@@ -46,7 +49,7 @@ use crate::methods::{
             peer_info::PeerInfo,
             submit_block,
             subsidy::{BlockSubsidy, FundingStream},
-            validate_address,
+            unified_address, validate_address, z_validate_address,
         },
     },
     height_from_signed_int, GetBlockHash, MISSING_BLOCK_ERROR_CODE,
@@ -107,8 +110,7 @@ pub trait GetBlockTemplateRpc {
     /// - the parent block is a valid block that Zebra already has, or will receive soon.
     ///
     /// Zebra verifies blocks in parallel, and keeps recent chains in parallel,
-    /// so moving between chains is very cheap. (But forking a new chain may take some time,
-    /// until bug #4794 is fixed.)
+    /// so moving between chains and forking chains is very cheap.
     ///
     /// This rpc method is available only if zebra is built with `--features getblocktemplate-rpcs`.
     #[rpc(name = "getblocktemplate")]
@@ -178,6 +180,16 @@ pub trait GetBlockTemplateRpc {
     #[rpc(name = "validateaddress")]
     fn validate_address(&self, address: String) -> BoxFuture<Result<validate_address::Response>>;
 
+    /// Checks if a zcash address is valid.
+    /// Returns information about the given address if valid.
+    ///
+    /// zcashd reference: [`z_validateaddress`](https://zcash.github.io/rpc/z_validateaddress.html)
+    #[rpc(name = "z_validateaddress")]
+    fn z_validate_address(
+        &self,
+        address: String,
+    ) -> BoxFuture<Result<types::z_validate_address::Response>>;
+
     /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
     /// Returns an error if `height` is less than the height of the first halving for the current network.
     ///
@@ -187,11 +199,32 @@ pub trait GetBlockTemplateRpc {
     /// zcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)
     #[rpc(name = "getblocksubsidy")]
     fn get_block_subsidy(&self, height: Option<u32>) -> BoxFuture<Result<BlockSubsidy>>;
+
+    /// Returns the proof-of-work difficulty as a multiple of the minimum difficulty.
+    ///
+    /// zcashd reference: [`getdifficulty`](https://zcash.github.io/rpc/getdifficulty.html)
+    #[rpc(name = "getdifficulty")]
+    fn get_difficulty(&self) -> BoxFuture<Result<f64>>;
+
+    /// Returns the list of individual payment addresses given a unified address.
+    ///
+    /// zcashd reference: [`z_listunifiedreceivers`](https://zcash.github.io/rpc/z_listunifiedreceivers.html)
+    #[rpc(name = "z_listunifiedreceivers")]
+    fn z_list_unified_receivers(
+        &self,
+        address: String,
+    ) -> BoxFuture<Result<unified_address::Response>>;
 }
 
 /// RPC method implementations.
-pub struct GetBlockTemplateRpcImpl<Mempool, State, Tip, ChainVerifier, SyncStatus, AddressBook>
-where
+pub struct GetBlockTemplateRpcImpl<
+    Mempool,
+    State,
+    Tip,
+    BlockVerifierRouter,
+    SyncStatus,
+    AddressBook,
+> where
     Mempool: Service<
         mempool::Request,
         Response = mempool::Response,
@@ -202,7 +235,7 @@ where
         Response = zebra_state::ReadResponse,
         Error = zebra_state::BoxError,
     >,
-    ChainVerifier: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
+    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
         + Clone
         + Send
         + Sync
@@ -220,6 +253,14 @@ where
     /// Zebra currently only supports transparent addresses.
     miner_address: Option<transparent::Address>,
 
+    /// Extra data to include in coinbase transaction inputs.
+    /// Limited to around 95 bytes by the consensus rules.
+    extra_coinbase_data: Vec<u8>,
+
+    /// Should Zebra's block templates try to imitate `zcashd`?
+    /// Developer-only config.
+    debug_like_zcashd: bool,
+
     // Services
     //
     /// A handle to the mempool service.
@@ -232,7 +273,7 @@ where
     latest_chain_tip: Tip,
 
     /// The chain verifier, used for submitting blocks.
-    chain_verifier: ChainVerifier,
+    block_verifier_router: BlockVerifierRouter,
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     sync_status: SyncStatus,
@@ -241,8 +282,8 @@ where
     address_book: AddressBook,
 }
 
-impl<Mempool, State, Tip, ChainVerifier, SyncStatus, AddressBook>
-    GetBlockTemplateRpcImpl<Mempool, State, Tip, ChainVerifier, SyncStatus, AddressBook>
+impl<Mempool, State, Tip, BlockVerifierRouter, SyncStatus, AddressBook>
+    GetBlockTemplateRpcImpl<Mempool, State, Tip, BlockVerifierRouter, SyncStatus, AddressBook>
 where
     Mempool: Service<
             mempool::Request,
@@ -258,7 +299,7 @@ where
         + Sync
         + 'static,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    ChainVerifier: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
+    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
         + Clone
         + Send
         + Sync
@@ -267,6 +308,10 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     /// Create a new instance of the handler for getblocktemplate RPCs.
+    ///
+    /// # Panics
+    ///
+    /// If the `mining_config` is invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: Network,
@@ -274,25 +319,54 @@ where
         mempool: Buffer<Mempool, mempool::Request>,
         state: State,
         latest_chain_tip: Tip,
-        chain_verifier: ChainVerifier,
+        block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
         address_book: AddressBook,
     ) -> Self {
+        // A limit on the configured extra coinbase data, regardless of the current block height.
+        // This is different from the consensus rule, which limits the total height + data.
+        const EXTRA_COINBASE_DATA_LIMIT: usize =
+            MAX_COINBASE_DATA_LEN - MAX_COINBASE_HEIGHT_DATA_LEN;
+
+        let debug_like_zcashd = mining_config.debug_like_zcashd;
+
+        // Hex-decode to bytes if possible, otherwise UTF-8 encode to bytes.
+        let extra_coinbase_data = mining_config.extra_coinbase_data.unwrap_or_else(|| {
+            if debug_like_zcashd {
+                ""
+            } else {
+                EXTRA_ZEBRA_COINBASE_DATA
+            }
+            .to_string()
+        });
+        let extra_coinbase_data = hex::decode(&extra_coinbase_data)
+            .unwrap_or_else(|_error| extra_coinbase_data.as_bytes().to_vec());
+
+        assert!(
+            extra_coinbase_data.len() <= EXTRA_COINBASE_DATA_LIMIT,
+            "extra coinbase data is {} bytes, but Zebra's limit is {}.\n\
+             Configure mining.extra_coinbase_data with a shorter string",
+            extra_coinbase_data.len(),
+            EXTRA_COINBASE_DATA_LIMIT,
+        );
+
         Self {
             network,
             miner_address: mining_config.miner_address,
+            extra_coinbase_data,
+            debug_like_zcashd,
             mempool,
             state,
             latest_chain_tip,
-            chain_verifier,
+            block_verifier_router,
             sync_status,
             address_book,
         }
     }
 }
 
-impl<Mempool, State, Tip, ChainVerifier, SyncStatus, AddressBook> GetBlockTemplateRpc
-    for GetBlockTemplateRpcImpl<Mempool, State, Tip, ChainVerifier, SyncStatus, AddressBook>
+impl<Mempool, State, Tip, BlockVerifierRouter, SyncStatus, AddressBook> GetBlockTemplateRpc
+    for GetBlockTemplateRpcImpl<Mempool, State, Tip, BlockVerifierRouter, SyncStatus, AddressBook>
 where
     Mempool: Service<
             mempool::Request,
@@ -310,12 +384,12 @@ where
         + 'static,
     <State as Service<zebra_state::ReadRequest>>::Future: Send,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    ChainVerifier: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
+    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
         + Clone
         + Send
         + Sync
         + 'static,
-    <ChainVerifier as Service<zebra_consensus::Request>>::Future: Send,
+    <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
@@ -363,14 +437,11 @@ where
         &self,
         parameters: Option<get_block_template::JsonParameters>,
     ) -> BoxFuture<Result<get_block_template::Response>> {
-        // Should we generate coinbase transactions that are exactly like zcashd's?
-        //
-        // This is useful for testing, but either way Zebra should obey the consensus rules.
-        const COINBASE_LIKE_ZCASHD: bool = true;
-
-        // Clone Config
+        // Clone Configs
         let network = self.network;
         let miner_address = self.miner_address;
+        let debug_like_zcashd = self.debug_like_zcashd;
+        let extra_coinbase_data = self.extra_coinbase_data.clone();
 
         // Clone Services
         let mempool = self.mempool.clone();
@@ -382,8 +453,14 @@ where
             .as_ref()
             .and_then(get_block_template::JsonParameters::block_proposal_data)
         {
-            return validate_block_proposal(self.chain_verifier.clone(), block_proposal_bytes)
-                .boxed();
+            return validate_block_proposal(
+                self.block_verifier_router.clone(),
+                block_proposal_bytes,
+                network,
+                latest_chain_tip,
+                sync_status,
+            )
+            .boxed();
         }
 
         // To implement long polling correctly, we split this RPC into multiple phases.
@@ -426,8 +503,13 @@ where
                 //
                 // We always return after 90 minutes on mainnet, even if we have the same response,
                 // because the max time has been reached.
-                let chain_tip_and_local_time =
-                    fetch_state_tip_and_local_time(state.clone()).await?;
+                let chain_tip_and_local_time @ zebra_state::GetBlockTemplateChainInfo {
+                    tip_hash,
+                    tip_height,
+                    max_time,
+                    cur_time,
+                    ..
+                } = fetch_state_tip_and_local_time(state.clone()).await?;
 
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
@@ -439,13 +521,21 @@ where
                 //
                 // Optional TODO:
                 // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
-                let mempool_txs = fetch_mempool_transactions(mempool.clone()).await?;
+                let Some(mempool_txs) = fetch_mempool_transactions(mempool.clone(), tip_hash)
+                    .await?
+                    // If the mempool and state responses are out of sync:
+                    // - if we are not long polling, omit mempool transactions from the template,
+                    // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
+                    .or_else(|| client_long_poll_id.is_none().then(Vec::new))
+                else {
+                    continue;
+                };
 
                 // - Long poll ID calculation
                 let server_long_poll_id = LongPollInput::new(
-                    chain_tip_and_local_time.tip_height,
-                    chain_tip_and_local_time.tip_hash,
-                    chain_tip_and_local_time.max_time,
+                    tip_height,
+                    tip_hash,
+                    max_time,
                     mempool_txs.iter().map(|tx| tx.transaction.id),
                 )
                 .generate_id();
@@ -502,9 +592,7 @@ where
                 // It can also be zero if cur_time was clamped to max_time. In that case,
                 // we want to wait for another change, and ignore this timeout. So we use an
                 // `OptionFuture::None`.
-                let duration_until_max_time = chain_tip_and_local_time
-                    .max_time
-                    .saturating_duration_since(chain_tip_and_local_time.cur_time);
+                let duration_until_max_time = max_time.saturating_duration_since(cur_time);
                 let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
                     Some(tokio::time::sleep(duration_until_max_time.to_std()))
                 } else {
@@ -527,8 +615,8 @@ where
                     // This timer elapses every few seconds
                     _elapsed = wait_for_mempool_request => {
                         tracing::info!(
-                            max_time = ?chain_tip_and_local_time.max_time,
-                            cur_time = ?chain_tip_and_local_time.cur_time,
+                            ?max_time,
+                            ?cur_time,
                             ?server_long_poll_id,
                             ?client_long_poll_id,
                             GET_BLOCK_TEMPLATE_MEMPOOL_LONG_POLL_INTERVAL,
@@ -541,8 +629,8 @@ where
                         match tip_changed_result {
                             Ok(()) => {
                                 tracing::info!(
-                                    max_time = ?chain_tip_and_local_time.max_time,
-                                    cur_time = ?chain_tip_and_local_time.cur_time,
+                                    ?max_time,
+                                    ?cur_time,
                                     ?server_long_poll_id,
                                     ?client_long_poll_id,
                                     "returning from long poll because state has changed"
@@ -554,8 +642,8 @@ where
                                 // it will help with debugging.
                                 tracing::info!(
                                     ?recv_error,
-                                    max_time = ?chain_tip_and_local_time.max_time,
-                                    cur_time = ?chain_tip_and_local_time.cur_time,
+                                    ?max_time,
+                                    ?cur_time,
                                     ?server_long_poll_id,
                                     ?client_long_poll_id,
                                     "returning from long poll due to a state error.\
@@ -577,8 +665,8 @@ where
                         // This log should stay at info when the others go to debug,
                         // it's very rare.
                         tracing::info!(
-                            max_time = ?chain_tip_and_local_time.max_time,
-                            cur_time = ?chain_tip_and_local_time.cur_time,
+                            ?max_time,
+                            ?cur_time,
                             ?server_long_poll_id,
                             ?client_long_poll_id,
                             "returning from long poll because max time was reached"
@@ -608,14 +696,13 @@ where
             );
 
             // Randomly select some mempool transactions.
-            //
-            // TODO: sort these transactions to match zcashd's order, to make testing easier.
             let mempool_txs = zip317::select_mempool_transactions(
                 network,
                 next_block_height,
                 miner_address,
                 mempool_txs,
-                COINBASE_LIKE_ZCASHD,
+                debug_like_zcashd,
+                extra_coinbase_data.clone(),
             )
             .await;
 
@@ -636,7 +723,8 @@ where
                 server_long_poll_id,
                 mempool_txs,
                 submit_old,
-                COINBASE_LIKE_ZCASHD,
+                debug_like_zcashd,
+                extra_coinbase_data,
             );
 
             Ok(response.into())
@@ -649,13 +737,13 @@ where
         HexData(block_bytes): HexData,
         _parameters: Option<submit_block::JsonParameters>,
     ) -> BoxFuture<Result<submit_block::Response>> {
-        let mut chain_verifier = self.chain_verifier.clone();
+        let mut block_verifier_router = self.block_verifier_router.clone();
 
         async move {
             let block: Block = match block_bytes.zcash_deserialize_into() {
                 Ok(block_bytes) => block_bytes,
                 Err(error) => {
-                    tracing::info!(?error, "submit block failed");
+                    tracing::info!(?error, "submit block failed: block bytes could not be deserialized into a structurally valid block");
 
                     return Ok(submit_block::ErrorResponse::Rejected.into());
                 }
@@ -665,8 +753,9 @@ where
                 .coinbase_height()
                 .map(|height| height.0.to_string())
                 .unwrap_or_else(|| "invalid coinbase height".to_string());
+            let block_hash = block.hash();
 
-            let chain_verifier_response = chain_verifier
+            let block_verifier_router_response = block_verifier_router
                 .ready()
                 .await
                 .map_err(|error| Error {
@@ -677,7 +766,7 @@ where
                 .call(zebra_consensus::Request::Commit(Arc::new(block)))
                 .await;
 
-            let chain_error = match chain_verifier_response {
+            let chain_error = match block_verifier_router_response {
                 // Currently, this match arm returns `null` (Accepted) for blocks committed
                 // to any chain, but Accepted is only for blocks in the best chain.
                 //
@@ -693,11 +782,10 @@ where
                 // by downcasting from Any to VerifyChainError.
                 Err(box_error) => {
                     let error = box_error
-                        .downcast::<VerifyChainError>()
+                        .downcast::<RouterError>()
                         .map(|boxed_chain_error| *boxed_chain_error);
 
-                    // TODO: add block hash to error?
-                    tracing::info!(?error, ?block_height, "submit block failed");
+                    tracing::info!(?error, ?block_hash, ?block_height, "submit block failed verification");
 
                     error
                 }
@@ -720,7 +808,7 @@ where
                 //   and return a duplicate error for the newer request immediately.
                 //   This improves the speed of the RPC response.
                 //
-                // Checking the download queues and ChainVerifier buffer for duplicates
+                // Checking the download queues and BlockVerifierRouter buffer for duplicates
                 // might require architectural changes to Zebra, so we should only do it
                 // if mining pools really need it.
                 Ok(_verify_chain_error) => submit_block::ErrorResponse::Rejected,
@@ -825,12 +913,12 @@ where
                 return Ok(validate_address::Response::invalid());
             }
 
-            return Ok(if address.network() == network {
-                validate_address::Response {
+            if address.network() == network {
+                Ok(validate_address::Response {
                     address: Some(raw_address),
                     is_valid: true,
                     is_script: Some(address.is_script_hash()),
-                }
+                })
             } else {
                 tracing::info!(
                     ?network,
@@ -838,8 +926,51 @@ where
                     "invalid address in validateaddress RPC: Zebra's configured network must match address network"
                 );
 
-                validate_address::Response::invalid()
-            });
+                Ok(validate_address::Response::invalid())
+            }
+        }
+        .boxed()
+    }
+
+    fn z_validate_address(
+        &self,
+        raw_address: String,
+    ) -> BoxFuture<Result<types::z_validate_address::Response>> {
+        let network = self.network;
+
+        async move {
+            let Ok(address) = raw_address
+                .parse::<zcash_address::ZcashAddress>() else {
+                    return Ok(z_validate_address::Response::invalid());
+                };
+
+            let address = match address
+                .convert::<primitives::Address>() {
+                    Ok(address) => address,
+                    Err(err) => {
+                        tracing::debug!(?err, "conversion error");
+                        return Ok(z_validate_address::Response::invalid());
+                    }
+                };
+
+            if address.network() == network {
+                Ok(z_validate_address::Response {
+                    is_valid: true,
+                    address: Some(raw_address),
+                    address_type: Some(z_validate_address::AddressType::from(&address)),
+                    is_mine: Some(false),
+                })
+            } else {
+                tracing::info!(
+                    ?network,
+                    address_network = ?address.network(),
+                    "invalid address network in z_validateaddress RPC: address is for {:?} but Zebra is on {:?}",
+                    address.network(),
+                    network
+                );
+
+                Ok(z_validate_address::Response::invalid())
+            }
         }
         .boxed()
     }
@@ -901,6 +1032,138 @@ where
                 founders: founders.into(),
                 funding_streams,
             })
+        }
+        .boxed()
+    }
+
+    fn get_difficulty(&self) -> BoxFuture<Result<f64>> {
+        let network = self.network;
+        let mut state = self.state.clone();
+
+        async move {
+            let request = ReadRequest::ChainInfo;
+
+            // # TODO
+            // - add a separate request like BestChainNextMedianTimePast, but skipping the
+            //   consistency check, because any block's difficulty is ok for display
+            // - return 1.0 for a "not enough blocks in the state" error, like `zcashd`:
+            // <https://github.com/zcash/zcash/blob/7b28054e8b46eb46a9589d0bdc8e29f9fa1dc82d/src/rpc/blockchain.cpp#L40-L41>
+            let response = state
+                .ready()
+                .and_then(|service| service.call(request))
+                .await
+                .map_err(|error| Error {
+                    code: ErrorCode::ServerError(0),
+                    message: error.to_string(),
+                    data: None,
+                })?;
+
+            let chain_info = match response {
+                ReadResponse::ChainInfo(info) => info,
+                _ => unreachable!("unmatched response to a chain info request"),
+            };
+
+            // This RPC is typically used for display purposes, so it is not consensus-critical.
+            // But it uses the difficulty consensus rules for its calculations.
+            //
+            // Consensus:
+            // https://zips.z.cash/protocol/protocol.pdf#nbits
+            //
+            // The zcashd implementation performs to_expanded() on f64,
+            // and then does an inverse division:
+            // https://github.com/zcash/zcash/blob/d6e2fada844373a8554ee085418e68de4b593a6c/src/rpc/blockchain.cpp#L46-L73
+            //
+            // But in Zebra we divide the high 128 bits of each expanded difficulty. This gives
+            // a similar result, because the lower 128 bits are insignificant after conversion
+            // to `f64` with a 53-bit mantissa.
+            //
+            // `pow_limit >> 128 / difficulty >> 128` is the same as the work calculation
+            // `(2^256 / pow_limit) / (2^256 / difficulty)`, but it's a bit more accurate.
+            //
+            // To simplify the calculation, we don't scale for leading zeroes. (Bitcoin's
+            // difficulty currently uses 68 bits, so even it would still have full precision
+            // using this calculation.)
+
+            // Get expanded difficulties (256 bits), these are the inverse of the work
+            let pow_limit: U256 = ExpandedDifficulty::target_difficulty_limit(network).into();
+            let difficulty: U256 = chain_info
+                .expected_difficulty
+                .to_expanded()
+                .expect("valid blocks have valid difficulties")
+                .into();
+
+            // Shift out the lower 128 bits (256 bits, but the top 128 are all zeroes)
+            let pow_limit = pow_limit >> 128;
+            let difficulty = difficulty >> 128;
+
+            // Convert to u128 then f64.
+            // We could also convert U256 to String, then parse as f64, but that's slower.
+            let pow_limit = pow_limit.as_u128() as f64;
+            let difficulty = difficulty.as_u128() as f64;
+
+            // Invert the division to give approximately: `work(difficulty) / work(pow_limit)`
+            Ok(pow_limit / difficulty)
+        }
+        .boxed()
+    }
+
+    fn z_list_unified_receivers(
+        &self,
+        address: String,
+    ) -> BoxFuture<Result<unified_address::Response>> {
+        use zcash_address::unified::Container;
+
+        async move {
+            let (network, unified_address): (
+                zcash_address::Network,
+                zcash_address::unified::Address,
+            ) = zcash_address::unified::Encoding::decode(address.clone().as_str()).map_err(
+                |error| Error {
+                    code: ErrorCode::ServerError(0),
+                    message: error.to_string(),
+                    data: None,
+                },
+            )?;
+
+            let mut p2pkh = String::new();
+            let mut p2sh = String::new();
+            let mut orchard = String::new();
+            let mut sapling = String::new();
+
+            for item in unified_address.items() {
+                match item {
+                    zcash_address::unified::Receiver::Orchard(_data) => {
+                        let addr = zcash_address::unified::Address::try_from_items(vec![item])
+                            .expect("using data already decoded as valid");
+                        orchard = addr.encode(&network);
+                    }
+                    zcash_address::unified::Receiver::Sapling(data) => {
+                        let addr =
+                            zebra_chain::primitives::Address::try_from_sapling(network, data)
+                                .expect("using data already decoded as valid");
+                        sapling = addr.payment_address().unwrap_or_default();
+                    }
+                    zcash_address::unified::Receiver::P2pkh(data) => {
+                        let addr = zebra_chain::primitives::Address::try_from_transparent_p2pkh(
+                            network, data,
+                        )
+                        .expect("using data already decoded as valid");
+                        p2pkh = addr.payment_address().unwrap_or_default();
+                    }
+                    zcash_address::unified::Receiver::P2sh(data) => {
+                        let addr = zebra_chain::primitives::Address::try_from_transparent_p2sh(
+                            network, data,
+                        )
+                        .expect("using data already decoded as valid");
+                        p2sh = addr.payment_address().unwrap_or_default();
+                    }
+                    _ => (),
+                }
+            }
+
+            Ok(unified_address::Response::new(
+                orchard, sapling, p2pkh, p2sh,
+            ))
         }
         .boxed()
     }

@@ -277,7 +277,7 @@ proptest! {
             block.transactions.push(Arc::new(transaction.clone()));
 
             // commit the created block
-            let request = zebra_state::Request::CommitFinalizedBlock(zebra_state::FinalizedBlock::from(Arc::new(block.clone())));
+            let request = zebra_state::Request::CommitCheckpointVerifiedBlock(zebra_state::CheckpointVerifiedBlock::from(Arc::new(block.clone())));
             let send_task = tokio::spawn(write_state.clone().oneshot(request.clone()));
             let response = zebra_state::Response::Committed(block.hash());
 
@@ -292,7 +292,7 @@ proptest! {
             let send_task = tokio::spawn(Runner::check_state(read_state.clone(), transactions_hash_set));
 
             let expected_request = ReadRequest::Transaction(transaction.hash());
-            let response = ReadResponse::Transaction(Some((Arc::new(transaction), Height(1))));
+            let response = ReadResponse::Transaction(Some(zebra_state::MinedTx::new(Arc::new(transaction), Height(1), 1)));
 
             read_state
                 .expect_request(expected_request)

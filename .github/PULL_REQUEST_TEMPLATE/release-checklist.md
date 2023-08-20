@@ -1,89 +1,21 @@
 ---
-name: Release Checklist Template
-about: Checklist of versioning to create a taggable commit for Zebra
-title: ''
-labels:
+name: 'Release Checklist Template'
+about: 'Checklist to create and publish a Zebra release'
+title: 'Release Zebra (version)'
+labels: 'A-release, C-trivial, P-Critical :ambulance:'
 assignees: ''
 
 ---
 
-## Versioning
+# Prepare for the Release
 
-### How to Increment Versions
+- [ ] Make sure the PRs with the new checkpoint hashes and missed dependencies are already merged.
+      (See the release ticket checklist for details)
 
-Zebra follows [semantic versioning](https://semver.org). Semantic versions look like: MAJOR`.`MINOR`.`PATCH[`-`TAG`.`PRE-RELEASE]
 
-The [draft `zebrad` changelog](https://github.com/ZcashFoundation/zebra/releases) will have an automatic version bump. This version is based on [the labels on the PRs in the release](https://github.com/ZcashFoundation/zebra/blob/main/.github/release-drafter.yml).
+# Summarise Release Changes
 
-Check that the automatic `zebrad` version increment is correct:
-
-If we're releasing a mainnet network upgrade, it is a `major` release:
-1. Increment the `major` version of _*all*_ the Zebra crates.
-2. Increment the `patch` version of the tower crates.
-
-If we're not releasing a mainnet network upgrade, check for features, major changes, deprecations, and removals. If this release has any, it is a `minor` release:
-1. Increment the `minor` version of `zebrad`.
-2. Increment the `pre-release` version of the other crates.
-3. Increment the `patch` version of the tower crates.
-
-Otherwise, it is a `patch` release:
-1. Increment the `patch` version of `zebrad`.
-2. Increment the `pre-release` version of the other crates.
-3. Increment the `patch` version of the tower crates.
-
-Zebra's Rust API is not stable or supported, so we keep all the crates on the same beta `pre-release` version.
-
-### Version Locations
-
-Once you know which versions you want to increment, you can find them in the:
-
-zebrad (rc):
-- [ ] zebrad `Cargo.toml`
-- [ ] `zebra-network` protocol user agent: https://github.com/ZcashFoundation/zebra/blob/main/zebra-network/src/constants.rs
-- [ ] `README.md`
-- [ ] `book/src/user/docker.md`
-
-crates (beta):
-- [ ] zebra-* `Cargo.toml`s
-
-tower (patch):
-- [ ] tower-* `Cargo.toml`s
-
-auto-generated:
-- [ ] `Cargo.lock`: run `cargo build` after updating all the `Cargo.toml`s
-
-#### Version Tooling
-
-You can use `fastmod` to interactively find and replace versions.
-
-For example, you can do something like:
-```
-fastmod --extensions rs,toml,md --fixed-strings '1.0.0-rc.0' '1.0.0-rc.1' zebrad README.md zebra-network/src/constants.rs book/src/user/docker.md
-fastmod --extensions rs,toml,md --fixed-strings '1.0.0-beta.15' '1.0.0-beta.16' zebra-*
-fastmod --extensions rs,toml,md --fixed-strings '0.2.30' '0.2.31' tower-batch tower-fallback
-cargo build
-```
-
-If you use `fastmod`, don't update versions in `CHANGELOG.md` or `zebra-dependencies-for-audit.md`.
-
-## README
-
-Update the README to:
-- [ ] Remove any "Known Issues" that have been fixed
-- [ ] Update the "Build and Run Instructions" with any new dependencies.
-      Check for changes in the `Dockerfile` since the last tag: `git diff <previous-release-tag> docker/Dockerfile`.
-- [ ] If Zebra has started using newer Rust language features or standard library APIs, update the known working Rust version in the README, book, and `Cargo.toml`s
-
-You can use a command like:
-```sh
-      fastmod --fixed-strings '1.58' '1.65'
-```
-
-## Checkpoints
-
-With every release and for performance reasons, we want to update the Zebra checkpoints. More information on how to do this can be found in [the zebra-checkpoints README](https://github.com/ZcashFoundation/zebra/blob/main/zebra-consensus/src/checkpoint/README.md).
-
-To do this you will need a synchronized `zcashd` node. You can request help from other zebra team members to submit this PR if you can't make it yourself at the moment of the release.
+These steps can be done a few days before the release, in the same PR:
 
 ## Change Log
 
@@ -94,51 +26,107 @@ We use [the Release Drafter workflow](https://github.com/marketplace/actions/rel
 
 To create the final change log:
 - [ ] Copy the **latest** draft changelog into `CHANGELOG.md` (there can be multiple draft releases)
-- [ ] Delete any trivial changes. Keep the list of those, to include in the PR
+- [ ] Delete any trivial changes
+    - [ ] Put the list of deleted changelog entries in a PR comment to make reviewing easier
 - [ ] Combine duplicate changes
-- [ ] Edit change descriptions so they are consistent, and make sense to non-developers
+- [ ] Edit change descriptions so they will make sense to Zebra users
 - [ ] Check the category for each change
   - Prefer the "Fix" category if you're not sure
 
+## README
+
+README updates can be skipped for urgent releases.
+
+Update the README to:
+- [ ] Remove any "Known Issues" that have been fixed since the last release.
+- [ ] Update the "Build and Run Instructions" with any new dependencies.
+      Check for changes in the `Dockerfile` since the last tag: `git diff <previous-release-tag> docker/Dockerfile`.
+- [ ] If Zebra has started using newer Rust language features or standard library APIs, update the known working Rust version in the README, book, and `Cargo.toml`s
+
+You can use a command like:
+```sh
+fastmod --fixed-strings '1.58' '1.65'
+```
+
+## Create the Release PR
+
+- [ ] Push the updated changelog and README into a new branch
+      for example: `bump-v1.0.0` - this needs to be different to the tag name
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/ZcashFoundation/zebra/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/ZcashFoundation/repo/zebra/queues) using Mergify.
+- [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
+- [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
+
+
+# Update Versions and End of Support
+
+## Update Zebra Version
+
+### Choose a Release Level
+
+Zebra follows [semantic versioning](https://semver.org). Semantic versions look like: MAJOR.MINOR.PATCH[-TAG.PRE-RELEASE]
+
+Choose a release level for `zebrad`. Release levels are based on user-visible changes from the changelog:
+- Mainnet Network Upgrades are `major` releases
+- significant new features or behaviour changes; changes to RPCs, command-line, or configs; and deprecations or removals are `minor` releases
+- otherwise, it is a `patch` release
+
+Zebra's Rust API doesn't have any support or stability guarantees, so we keep all the `zebra-*` and `tower-*` crates on a beta `pre-release` version.
+
+### Update Crate Versions
+
 <details>
 
-#### Change Categories
+<summary>If you're publishing crates for the first time, click this triangle for extra steps</summary>
 
-From "Keep a Changelog":
-* `Added` for new features.
-* `Changed` for changes in existing functionality.
-* `Deprecated` for soon-to-be removed features.
-* `Removed` for now removed features.
-* `Fixed` for any bug fixes.
-* `Security` in case of vulnerabilities.
+- [ ] Install `cargo-release`: `cargo install cargo-release`
+- [ ] Make sure you are  an owner of the crate or [a member of the Zebra crates.io `owners` group on GitHub](https://github.com/orgs/ZcashFoundation/teams/owners)
 
 </details>
 
-## Create the Release
+Check that the release will work:
+- [ ] Update crate versions, commit the changes to the release branch, and do a release dry-run:
 
-### Create the Release PR
+```sh
+cargo release version --verbose --execute --allow-branch '*' --workspace --exclude zebrad beta
+cargo release version --verbose --execute --allow-branch '*' --package zebrad patch # [ major | minor | patch ]
+cargo release replace --verbose --execute --allow-branch '*' --package zebrad
+cargo release commit --verbose --execute --allow-branch '*'
+```
 
-After you have the version increments, the updated checkpoints and the updated changelog:
+Crate publishing is [automatically checked in CI](https://github.com/ZcashFoundation/zebra/actions/workflows/release-crates-io.yml) using "dry run" mode.
 
-- [ ] Make sure the PR with the new checkpoint hashes is already merged, or make it part of the changelog PR
-- [ ] Push the version increments and the updated changelog into a branch
-      (for example: `bump-v1.0.0-rc.0` - this needs to be different to the tag name)
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/ZcashFoundation/zebra/compare/v1.0.0-rc.0-release?expand=1&template=release-checklist.md)).
-  - [ ] Add the list of deleted changelog entries as a comment to make reviewing easier.
-- [ ] Turn on [Merge Freeze](https://www.mergefreeze.com/installations/3676/branches).
-- [ ] Once the PR is ready to be merged, unfreeze it [here](https://www.mergefreeze.com/installations/3676/branches).
-      Do not unfreeze the whole repository.
-- [ ] Update the PR to the latest `main` branch using `@mergifyio update`. Then Mergify should merge it in-place.
-      If it makes a merge PR instead, that PR will get cancelled by the merge freeze. So just merge the changelog PR manually.
+## Update End of Support
 
-### Create the Release
+The end of support height is calculated from the current blockchain height:
+- [ ] Find where the Zcash blockchain tip is now by using a [Zcash explorer](https://zcashblockexplorer.com/blocks) or other tool.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
 
-- [ ] Once the PR has been merged, create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/ZcashFoundation/zebra/releases)
+<details>
+
+<summary>Optional: calculate the release tagging height</summary>
+
+- Add `1152` blocks for each day until the release
+- For example, if the release is in 3 days, add `1152 * 3` to the current Mainnet block height
+
+</details>
+
+## Update the Release PR
+
+- [ ] Push the version increments and the release constants to the release branch.
+
+
+# Publish the Zebra Release
+
+## Create the GitHub Pre-Release
+
+- [ ] Wait for all the release PRs to be merged
+- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/ZcashFoundation/zebra/releases)
 - [ ] Set the tag name to the version tag,
-      for example: `v1.0.0-rc.0`
+      for example: `v1.0.0`
 - [ ] Set the release to target the `main` branch
 - [ ] Set the release title to `Zebra ` followed by the version tag,
-      for example: `Zebra 1.0.0-rc.0`
+      for example: `Zebra 1.0.0`
 - [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
       starting just _after_ the title `## [Zebra ...` of the current version being released,
       and ending just _before_ the title of the previous release.
@@ -146,26 +134,41 @@ After you have the version increments, the updated checkpoints and the updated c
 - [ ] Publish the pre-release to GitHub using "Publish Release"
 - [ ] Delete all the [draft releases from the list of releases](https://github.com/ZcashFoundation/zebra/releases)
 
-## Binary Testing
+## Test the Pre-Release
 
 - [ ] Wait until the [Docker binaries have been built on `main`](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml), and the quick tests have passed.
-      (You can ignore the full sync and `lightwalletd` tests, because they take about a day to run.)
+- [ ] Wait until the [pre-release deployment machines have successfully launched](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-delivery.yml)
+
+## Publish Release
+
 - [ ] [Publish the release to GitHub](https://github.com/ZcashFoundation/zebra/releases) by disabling 'pre-release', then clicking "Set as the latest release"
-- [ ] Wait until [the Docker images have been published](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml)
-- [ ] Test the Docker image using `docker run --tty --interactive zfnd/zebra:1.0.0-rc.<version>` <!-- TODO: replace with `zfnd/zebra` when we release 1.0.0 -->
-- [ ] Turn off [Merge Freeze](https://www.mergefreeze.com/installations/3676/branches) for the whole repository
 
+## Publish Crates
 
-## Blog Post
+- [ ] Run `cargo login`
+- [ ] Run `cargo clean` in the zebra repo (optional)
+- [ ] Publish the crates to crates.io: `cargo release publish --verbose --workspace --execute`
+- [ ] Check that Zebra can be installed from `crates.io`:
+      `cargo install --locked --force --version 1.minor.patch zebrad && ~/.cargo/bin/zebrad`
+      and put the output in a comment on the PR.
 
-If the release contains new features (`major` or `minor`), or high-priority bug fixes:
-- [ ] Ask the team about doing a blog post
+## Publish Docker Images
+- [ ] Wait for the [the Docker images to be published successfully](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml).
+- [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/ZcashFoundation/repo/zebra/queues) using Mergify.
+- [ ] Remove `do-not-merge` from the PRs you added it to
 
 ## Release Failures
 
 If building or running fails after tagging:
+
+<details>
+
+<summary>Tag a new release, following these instructions...</summary>
+
 1. Fix the bug that caused the failure
-2. Increment versions again, following these instructions from the start
-3. Update the code and documentation with a **new** git tag
+2. Start a new `patch` release
+3. Skip the **Release Preparation**, and start at the **Release Changes** step
 4. Update `CHANGELOG.md` with details about the fix
-5. Tag a **new** release
+5. Follow the release checklist for the new Zebra version
+
+</details>

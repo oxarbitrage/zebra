@@ -4,7 +4,10 @@ use std::{fmt, str::FromStr};
 
 use thiserror::Error;
 
-use crate::{block::Height, parameters::NetworkUpgrade::Canopy};
+use crate::{
+    block::{Height, HeightDiff},
+    parameters::NetworkUpgrade::Canopy,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -46,7 +49,7 @@ mod tests;
 /// period. Therefore Zebra must validate those blocks during the grace period using checkpoints.
 /// Therefore the mandatory checkpoint height ([`Network::mandatory_checkpoint_height`]) must be
 /// after the grace period.
-const ZIP_212_GRACE_PERIOD_DURATION: i32 = 32_256;
+const ZIP_212_GRACE_PERIOD_DURATION: HeightDiff = 32_256;
 
 /// An enum describing the possible network choices.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -56,7 +59,7 @@ pub enum Network {
     #[default]
     Mainnet,
 
-    /// The testnet.
+    /// The oldest public test network.
     Testnet,
 }
 
@@ -115,6 +118,16 @@ impl Network {
             Network::Mainnet => "main".to_string(),
             Network::Testnet => "test".to_string(),
         }
+    }
+
+    /// Return the lowercase network name.
+    pub fn lowercase_name(&self) -> String {
+        self.to_string().to_ascii_lowercase()
+    }
+
+    /// Returns `true` if this network is a testing network.
+    pub fn is_a_test_network(&self) -> bool {
+        *self != Network::Mainnet
     }
 }
 

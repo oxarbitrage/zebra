@@ -9,7 +9,7 @@ use tracing::Span;
 use zebra_chain::{parameters::Network::*, serialization::Duration32};
 
 use crate::{
-    constants::{MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_ACTIVE_FOR_GOSSIP},
+    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_ACTIVE_FOR_GOSSIP},
     meta_addr::{arbitrary::MAX_META_ADDR, MetaAddr, MetaAddrChange},
     AddressBook,
 };
@@ -30,6 +30,7 @@ proptest! {
         let address_book = AddressBook::new_with_addrs(
             local_listener,
             Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             addresses
@@ -59,6 +60,7 @@ proptest! {
         let address_book = AddressBook::new_with_addrs(
             local_listener,
             Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
             MAX_ADDRS_IN_ADDRESS_BOOK,
             Span::none(),
             addresses
@@ -77,7 +79,7 @@ proptest! {
             MetaAddrChange::addr_changes_strategy(MAX_ADDR_CHANGE),
             2..MAX_ADDR_CHANGE
         ),
-        addr_limit in 0..=MAX_ADDR_CHANGE,
+        addr_limit in 1..=MAX_ADDR_CHANGE,
         pre_fill in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
@@ -97,6 +99,7 @@ proptest! {
         let mut address_book = AddressBook::new_with_addrs(
             local_listener,
             Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
             addr_limit,
             Span::none(),
             initial_addrs.clone(),
@@ -119,6 +122,7 @@ proptest! {
         let mut address_book = AddressBook::new_with_addrs(
             local_listener,
             Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
             addr_limit,
             Span::none(),
             initial_addrs,

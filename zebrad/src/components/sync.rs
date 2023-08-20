@@ -8,14 +8,14 @@ use color_eyre::eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::watch, time::sleep};
+use tokio::{sync::watch, task::JoinError, time::sleep};
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, retry::Retry, timeout::Timeout,
     Service, ServiceExt,
 };
 
 use zebra_chain::{
-    block::{self, Height},
+    block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
     parameters::genesis_hash,
 };
@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod downloads;
+pub mod end_of_support;
 mod gossip;
 mod progress;
 mod recent_sync_lengths;
@@ -106,6 +107,16 @@ pub const MAX_TIPS_RESPONSE_HASH_COUNT: usize = 500;
 /// failure loop.
 pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Controls how long we wait between gossiping successive blocks or transactions.
+///
+/// ## Correctness
+///
+/// If this timeout is set too high, blocks and transactions won't propagate through
+/// the network efficiently.
+///
+/// If this timeout is set too low, the peer set and remote peers can get overloaded.
+pub const PEER_GOSSIP_DELAY: Duration = Duration::from_secs(7);
+
 /// Controls how long we wait for a block download request to complete.
 ///
 /// This timeout makes sure that the syncer doesn't hang when:
@@ -165,7 +176,7 @@ const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2 * 
 /// The number of blocks after the final checkpoint that get the shorter timeout.
 ///
 /// We've only seen this error on the first few blocks after the final checkpoint.
-const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: i32 = 100;
+const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: HeightDiff = 100;
 
 /// Controls how long we wait to restart syncing after finishing a sync run.
 ///
@@ -657,7 +668,17 @@ where
         let mut download_set = IndexSet::new();
         while let Some(res) = requests.next().await {
             match res
-                .expect("panic in spawned obtain tips request")
+                .unwrap_or_else(|e @ JoinError { .. }| {
+                    if e.is_panic() {
+                        panic!("panic in obtain tips task: {e:?}");
+                    } else {
+                        info!(
+                            "task error during obtain tips task: {e:?},\
+                     is Zebra shutting down?"
+                        );
+                        Err(e.into())
+                    }
+                })
                 .map_err::<Report, _>(|e| eyre!(e))
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
@@ -1057,22 +1078,18 @@ where
 
     /// Returns `true` if the hash is present in the state, and `false`
     /// if the hash is not present in the state.
-    ///
-    /// TODO BUG: check if the hash is in any chain (#862)
-    /// Depth only checks the main chain.
     async fn state_contains(&mut self, hash: block::Hash) -> Result<bool, Report> {
         match self
             .state
             .ready()
             .await
             .map_err(|e| eyre!(e))?
-            .call(zebra_state::Request::Depth(hash))
+            .call(zebra_state::Request::KnownBlock(hash))
             .await
             .map_err(|e| eyre!(e))?
         {
-            zs::Response::Depth(Some(_)) => Ok(true),
-            zs::Response::Depth(None) => Ok(false),
-            _ => unreachable!("wrong response to depth request"),
+            zs::Response::KnownBlock(loc) => Ok(loc.is_some()),
+            _ => unreachable!("wrong response to known block request"),
         }
     }
 

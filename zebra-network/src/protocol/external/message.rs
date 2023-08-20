@@ -202,7 +202,11 @@ pub enum Message {
 
     /// A `tx` message.
     ///
-    /// This message is used to advertise unmined transactions for the mempool.
+    /// This message can be used to:
+    /// - send unmined transactions in response to `GetData` requests, and
+    /// - advertise unmined transactions for the mempool.
+    ///
+    /// Zebra chooses to advertise new transactions using `Inv(hash)` rather than `Tx(transaction)`.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#tx)
     Tx(UnminedTx),
@@ -293,6 +297,12 @@ pub enum Message {
     FilterClear,
 }
 
+/// The maximum size of the user agent string.
+///
+/// This is equivalent to `MAX_SUBVERSION_LENGTH` in `zcashd`:
+/// <https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/net.h#L56>
+pub const MAX_USER_AGENT_LENGTH: usize = 256;
+
 /// A `version` message.
 ///
 /// Note that although this is called `version` in Bitcoin, its role is really
@@ -358,13 +368,17 @@ pub struct VersionMessage {
 
 /// The maximum size of the rejection message.
 ///
-/// This is equivalent to `COMMAND_SIZE` in zcashd.
-const MAX_REJECT_MESSAGE_LENGTH: usize = 12;
+/// This is equivalent to `COMMAND_SIZE` in zcashd:
+/// <https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/protocol.h#L33>
+/// <https://github.com/zcash/zcash/blob/c0fbeb809bf2303e30acef0d2b74db11e9177427/src/main.cpp#L7544>
+pub const MAX_REJECT_MESSAGE_LENGTH: usize = 12;
 
 /// The maximum size of the rejection reason.
 ///
-/// This is equivalent to `MAX_REJECT_MESSAGE_LENGTH` in zcashd.
-const MAX_REJECT_REASON_LENGTH: usize = 111;
+/// This is equivalent to `MAX_REJECT_MESSAGE_LENGTH` in zcashd:
+/// <https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/main.h#L126>
+/// <https://github.com/zcash/zcash/blob/c0fbeb809bf2303e30acef0d2b74db11e9177427/src/main.cpp#L7544>
+pub const MAX_REJECT_REASON_LENGTH: usize = 111;
 
 impl From<VersionMessage> for Message {
     fn from(version_message: VersionMessage) -> Self {
@@ -387,7 +401,7 @@ impl TryFrom<Message> for VersionMessage {
     }
 }
 
-// TODO: add tests for Error conversion and Reject message serialization (#4633)
+// TODO: add tests for Error conversion and Reject message serialization
 // (Zebra does not currently send reject messages, and it ignores received reject messages.)
 impl<E> From<E> for Message
 where

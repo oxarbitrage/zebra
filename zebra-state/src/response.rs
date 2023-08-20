@@ -24,7 +24,7 @@ use crate::{service::read::AddressUtxos, TransactionLocation};
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
-    /// Response to [`Request::CommitBlock`] indicating that a block was
+    /// Response to [`Request::CommitSemanticallyVerifiedBlock`] indicating that a block was
     /// successfully committed to the state.
     Committed(block::Hash),
 
@@ -32,6 +32,9 @@ pub enum Response {
     Depth(Option<u32>),
 
     /// Response to [`Request::Tip`] with the current best chain tip.
+    //
+    // TODO: remove this request, and replace it with a call to
+    //       `LatestChainTip::best_tip_height_and_hash()`
     Tip(Option<(block::Height, block::Hash)>),
 
     /// Response to [`Request::BlockLocator`] with a block locator object.
@@ -65,15 +68,60 @@ pub enum Response {
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
 
+    /// Response to [`Request::BestChainBlockHash`](Request::BestChainBlockHash) with the
+    /// specified block hash.
+    BlockHash(Option<block::Hash>),
+
+    /// Response to [`Request::KnownBlock`].
+    KnownBlock(Option<KnownBlock>),
+
     #[cfg(feature = "getblocktemplate-rpcs")]
-    /// Response to [`Request::CheckBlockProposalValidity`](crate::Request::CheckBlockProposalValidity)
+    /// Response to [`Request::CheckBlockProposalValidity`](Request::CheckBlockProposalValidity)
     ValidBlockProposal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// An enum of block stores in the state where a block hash could be found.
+pub enum KnownBlock {
+    /// Block is in the best chain.
+    BestChain,
+
+    /// Block is in a side chain.
+    SideChain,
+
+    /// Block is queued to be validated and committed, or rejected and dropped.
+    Queue,
+}
+
+/// Information about a transaction in the best chain
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MinedTx {
+    /// The transaction.
+    pub tx: Arc<Transaction>,
+
+    /// The transaction height.
+    pub height: block::Height,
+
+    /// The number of confirmations for this transaction
+    /// (1 + depth of block the transaction was found in)
+    pub confirmations: u32,
+}
+
+impl MinedTx {
+    /// Creates a new [`MinedTx`]
+    pub fn new(tx: Arc<Transaction>, height: block::Height, confirmations: u32) -> Self {
+        Self {
+            tx,
+            height,
+            confirmations,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s
-/// [`ReadRequest`](crate::ReadRequest).
+/// [`ReadRequest`](ReadRequest).
 pub enum ReadResponse {
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
@@ -85,7 +133,7 @@ pub enum ReadResponse {
     Block(Option<Arc<Block>>),
 
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
-    Transaction(Option<(Arc<Transaction>, block::Height)>),
+    Transaction(Option<MinedTx>),
 
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
     /// with an list of transaction hashes in block order,
@@ -137,22 +185,21 @@ pub enum ReadResponse {
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
 
-    #[cfg(feature = "getblocktemplate-rpcs")]
-    /// Response to [`ReadRequest::BestChainBlockHash`](crate::ReadRequest::BestChainBlockHash) with the
+    /// Response to [`ReadRequest::BestChainBlockHash`](ReadRequest::BestChainBlockHash) with the
     /// specified block hash.
     BlockHash(Option<block::Hash>),
 
     #[cfg(feature = "getblocktemplate-rpcs")]
-    /// Response to [`ReadRequest::ChainInfo`](crate::ReadRequest::ChainInfo) with the state
+    /// Response to [`ReadRequest::ChainInfo`](ReadRequest::ChainInfo) with the state
     /// information needed by the `getblocktemplate` RPC method.
     ChainInfo(GetBlockTemplateChainInfo),
 
     #[cfg(feature = "getblocktemplate-rpcs")]
-    /// Response to [`ReadRequest::SolutionRate`](crate::ReadRequest::SolutionRate)
+    /// Response to [`ReadRequest::SolutionRate`](ReadRequest::SolutionRate)
     SolutionRate(Option<u128>),
 
     #[cfg(feature = "getblocktemplate-rpcs")]
-    /// Response to [`ReadRequest::CheckBlockProposalValidity`](crate::ReadRequest::CheckBlockProposalValidity)
+    /// Response to [`ReadRequest::CheckBlockProposalValidity`](ReadRequest::CheckBlockProposalValidity)
     ValidBlockProposal,
 }
 
@@ -205,10 +252,11 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::Tip(height_and_hash) => Ok(Response::Tip(height_and_hash)),
             ReadResponse::Depth(depth) => Ok(Response::Depth(depth)),
             ReadResponse::BestChainNextMedianTimePast(median_time_past) => Ok(Response::BestChainNextMedianTimePast(median_time_past)),
+            ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
-            ReadResponse::Transaction(tx_and_height) => {
-                Ok(Response::Transaction(tx_and_height.map(|(tx, _height)| tx)))
+            ReadResponse::Transaction(tx_info) => {
+                Ok(Response::Transaction(tx_info.map(|tx_info| tx_info.tx)))
             }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
 
@@ -234,10 +282,6 @@ impl TryFrom<ReadResponse> for Response {
             #[cfg(feature = "getblocktemplate-rpcs")]
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
-            #[cfg(feature = "getblocktemplate-rpcs")]
-            ReadResponse::BlockHash(_) => {
-                Err("there is no corresponding Response for this ReadResponse")
-            }
             #[cfg(feature = "getblocktemplate-rpcs")]
             ReadResponse::ChainInfo(_) | ReadResponse::SolutionRate(_) => {
                 Err("there is no corresponding Response for this ReadResponse")

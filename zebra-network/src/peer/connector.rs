@@ -2,7 +2,6 @@
 
 use std::{
     future::Future,
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -17,7 +16,7 @@ use zebra_chain::chain_tip::{ChainTip, NoChainTip};
 use crate::{
     peer::{Client, ConnectedAddr, Handshake, HandshakeRequest},
     peer_set::ConnectionTracker,
-    BoxError, Request, Response,
+    BoxError, PeerSocketAddr, Request, Response,
 };
 
 /// A wrapper around [`Handshake`] that opens a TCP connection before
@@ -60,7 +59,7 @@ where
 /// Contains the information needed to make an outbound connection to the peer.
 pub struct OutboundConnectorRequest {
     /// The Zcash listener address of the peer.
-    pub addr: SocketAddr,
+    pub addr: PeerSocketAddr,
 
     /// A connection tracker that reduces the open connection count when dropped.
     ///
@@ -74,7 +73,7 @@ where
     S::Future: Send,
     C: ChainTip + Clone + Send + 'static,
 {
-    type Response = (SocketAddr, Client);
+    type Response = (PeerSocketAddr, Client);
     type Error = BoxError;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -93,8 +92,12 @@ where
         let connected_addr = ConnectedAddr::new_outbound_direct(addr);
         let connector_span = info_span!("connector", peer = ?connected_addr);
 
+        // # Security
+        //
+        // `zebra_network::init()` implements a connection timeout on this future.
+        // Any code outside this future does not have a timeout.
         async move {
-            let tcp_stream = TcpStream::connect(addr).await?;
+            let tcp_stream = TcpStream::connect(*addr).await?;
             let client = hs
                 .oneshot(HandshakeRequest::<TcpStream> {
                     data_stream: tcp_stream,

@@ -4,7 +4,6 @@ use std::{
     collections::HashSet,
     future::Future,
     iter,
-    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -29,7 +28,7 @@ use crate::{
         external::InventoryHash,
         internal::{Request, Response},
     },
-    BoxError,
+    BoxError, PeerSocketAddr,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -87,7 +86,7 @@ pub(crate) struct ClientRequest {
     /// The peer address for registering missing inventory.
     ///
     /// TODO: replace this with `ConnectedAddr`?
-    pub transient_addr: Option<SocketAddr>,
+    pub transient_addr: Option<PeerSocketAddr>,
 
     /// The tracing context for the request, so that work the connection task does
     /// processing messages in the context of this request will have correct context.
@@ -166,7 +165,7 @@ pub(super) struct MissingInventoryCollector {
     collector: broadcast::Sender<InventoryChange>,
 
     /// The peer address for registering missing inventory.
-    transient_addr: SocketAddr,
+    transient_addr: PeerSocketAddr,
 }
 
 impl std::fmt::Debug for Client {
@@ -263,7 +262,7 @@ impl MustUseClientResponseSender {
         tx: oneshot::Sender<Result<Response, SharedPeerError>>,
         request: &Request,
         inv_collector: Option<broadcast::Sender<InventoryChange>>,
-        transient_addr: Option<SocketAddr>,
+        transient_addr: Option<PeerSocketAddr>,
     ) -> Self {
         Self {
             tx: Some(tx),
@@ -341,7 +340,7 @@ impl MissingInventoryCollector {
     pub fn new(
         request: &Request,
         inv_collector: Option<broadcast::Sender<InventoryChange>>,
-        transient_addr: Option<SocketAddr>,
+        transient_addr: Option<PeerSocketAddr>,
     ) -> Option<Box<MissingInventoryCollector>> {
         if !request.is_inventory_download() {
             return None;
@@ -544,10 +543,14 @@ impl Client {
         // Prevent any senders from sending more messages to this peer.
         self.server_tx.close_channel();
 
-        // Stop the heartbeat task
+        // Ask the heartbeat task to stop.
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(CancelHeartbeatTask);
         }
+
+        // Force the connection and heartbeat tasks to stop.
+        self.connection_task.abort();
+        self.heartbeat_task.abort();
     }
 }
 
@@ -621,8 +624,13 @@ impl Service<Request> for Client {
             Ok(()) => {
                 // The receiver end of the oneshot is itself a future.
                 rx.map(|oneshot_recv_result| {
-                    oneshot_recv_result
-                        .expect("ClientRequest oneshot sender must not be dropped before send")
+                    // The ClientRequest oneshot sender should not be dropped before sending a
+                    // response. But sometimes that happens during process or connection shutdown.
+                    // So we just return a generic error here.
+                    match oneshot_recv_result {
+                        Ok(result) => result,
+                        Err(oneshot::Canceled) => Err(PeerError::ConnectionDropped.into()),
+                    }
                 })
                 .boxed()
             }

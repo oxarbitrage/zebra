@@ -2,7 +2,7 @@
 
 Support for different platforms are organized into three tiers, each with a
 different set of guarantees. For more information on the policies for platforms
-at each tier, see the [Platform Tier Policy](platform-tier-policy.md).
+at each tier, see the [Platform Tier Policy](target-tier-policies.md).
 
 Platforms are identified by their Rust "target triple" which is a string composed by
 `<machine>-<vendor>-<operating system>`.
@@ -32,7 +32,6 @@ For the full requirements, see [Tier 2 platform policy](platform-tier-policy.md#
 
 | platform | os | notes | rust | artifacts
 | -------|-------|-------|-------|-------
-| `x86_64-apple-darwin` | [GitHub macos-latest](https://github.com/actions/virtual-environments#available-environments) | 64-bit | [latest stable release](https://github.com/rust-lang/rust/releases) | N/A
 | `x86_64-unknown-linux-gnu` | [GitHub ubuntu-latest](https://github.com/actions/virtual-environments#available-environments) | 64-bit | [latest stable release](https://github.com/rust-lang/rust/releases) | N/A
 | `x86_64-unknown-linux-gnu` | [GitHub ubuntu-latest](https://github.com/actions/virtual-environments#available-environments) | 64-bit | [latest beta release](https://github.com/rust-lang/rust/blob/beta/src/version) | N/A
 
@@ -47,3 +46,5 @@ For the full requirements, see [Tier 3 platform policy](platform-tier-policy.md#
 | platform | os | notes | rust | artifacts
 | -------|-------|-------|-------|-------
 | `aarch64-unknown-linux-gnu` | [Debian 11](https://www.debian.org/releases/bullseye/) | 64-bit | [latest stable release](https://github.com/rust-lang/rust/releases) | N/A
+| `x86_64-apple-darwin` | [GitHub macos-latest](https://github.com/actions/virtual-environments#available-environments) | 64-bit | [latest stable release](https://github.com/rust-lang/rust/releases) | N/A
+

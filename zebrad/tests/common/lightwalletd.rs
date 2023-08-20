@@ -148,7 +148,7 @@ pub fn can_spawn_lightwalletd_for_rpc<S: AsRef<str> + std::fmt::Debug>(
 }
 
 /// Extension trait for methods on `tempfile::TempDir` for using it as a test
-/// directory for `zebrad`.
+/// directory for `lightwalletd`.
 pub trait LightWalletdTestDirExt: ZebradTestDirExt
 where
     Self: AsRef<Path> + Sized,
@@ -247,10 +247,15 @@ where
     fn with_lightwalletd_config(self, zebra_rpc_listener: SocketAddr) -> Result<Self> {
         use std::fs;
 
+        // zcash/lightwalletd requires rpcuser and rpcpassword, or a zcashd cookie file
+        // But when a lightwalletd with this config is used by Zebra,
+        // Zebra ignores any authentication and provides access regardless.
         let lightwalletd_config = format!(
             "\
             rpcbind={}\n\
             rpcport={}\n\
+            rpcuser=xxxxx
+            rpcpassword=xxxxx
             ",
             zebra_rpc_listener.ip(),
             zebra_rpc_listener.port(),

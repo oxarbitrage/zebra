@@ -5,10 +5,7 @@
 //! Test functions in this file will not be run.
 //! This file is only for test library code.
 
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 use color_eyre::eyre::Result;
 use tempfile::TempDir;
@@ -19,7 +16,6 @@ use zebrad::{components::sync, config::ZebradConfig};
 use zebra_test::{args, prelude::*};
 
 use super::{
-    cached_state::copy_state_directory,
     config::{persistent_test_config, testdir},
     launch::ZebradTestDirExt,
 };
@@ -46,10 +42,13 @@ pub const SYNC_FINISHED_REGEX: &str =
     r"finished initial sync to chain tip, using gossiped blocks .*sync_percent.*=.*100\.";
 
 /// The text that should be logged every time Zebra checks the sync progress.
-//
-// This is only used with `--feature lightwalletd-grpc-tests`
-#[allow(dead_code)]
+#[cfg(feature = "lightwalletd-grpc-tests")]
 pub const SYNC_PROGRESS_REGEX: &str = r"sync_percent";
+
+/// The text that should be logged when Zebra loads its compiled-in checkpoints.
+#[cfg(feature = "zebra-checkpoints")]
+pub const CHECKPOINT_VERIFIER_REGEX: &str =
+    r"initializing block verifier router.*max_checkpoint_height.*=.*Height";
 
 /// The maximum amount of time Zebra should take to reload after shutting down.
 ///
@@ -59,10 +58,16 @@ pub const STOP_ON_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum amount of time Zebra should take to sync a few hundred blocks.
 ///
 /// Usually the small checkpoint is much shorter than this.
-pub const TINY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+//
+// Tempoaraily increased to 4 minutes to get more diagnostic info in failed tests.
+// TODO: reduce to 120 when #6506 is fixed
+pub const TINY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// The maximum amount of time Zebra should take to sync a thousand blocks.
-pub const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
+//
+// Tempoaraily increased to 4 minutes to get more diagnostic info in failed tests.
+// TODO: reduce to 180 when #6506 is fixed
+pub const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// The maximum time to wait for Zebrad to synchronize up to the chain tip starting from a
 /// partially synchronized state.
@@ -74,7 +79,7 @@ pub const FINISH_PARTIAL_SYNC_TIMEOUT: Duration = Duration::from_secs(11 * 60 * 
 
 /// The maximum time to wait for Zebrad to synchronize up to the chain tip starting from the
 /// genesis block.
-pub const FINISH_FULL_SYNC_TIMEOUT: Duration = Duration::from_secs(48 * 60 * 60);
+pub const FINISH_FULL_SYNC_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 
 /// The test sync height where we switch to using the default lookahead limit.
 ///
@@ -314,6 +319,10 @@ pub fn check_sync_logs_until(
     if check_legacy_chain {
         zebrad.expect_stdout_line_matches("starting legacy chain check")?;
         zebrad.expect_stdout_line_matches("no legacy chain found")?;
+
+        zebrad.expect_stdout_line_matches("starting state checkpoint validation")?;
+        // TODO: what if the mempool is enabled for debugging before this finishes?
+        zebrad.expect_stdout_line_matches("finished state checkpoint validation")?;
     }
 
     // before the stop regex, expect mempool activation
@@ -326,30 +335,6 @@ pub fn check_sync_logs_until(
     zebrad.expect_stdout_line_matches(stop_regex)?;
 
     Ok(zebrad)
-}
-
-/// Runs a zebrad instance to synchronize the chain to the network tip.
-///
-/// The zebrad instance is executed on a copy of the partially synchronized chain state. This copy
-/// is returned afterwards, containing the fully synchronized chain state.
-#[allow(dead_code)]
-#[tracing::instrument]
-pub async fn copy_state_and_perform_full_sync(
-    network: Network,
-    partial_sync_path: &Path,
-) -> Result<TempDir> {
-    let fully_synced_path = copy_state_directory(network, &partial_sync_path).await?;
-
-    sync_until(
-        Height::MAX,
-        network,
-        SYNC_FINISHED_REGEX,
-        FINISH_PARTIAL_SYNC_TIMEOUT,
-        fully_synced_path,
-        MempoolBehavior::ShouldAutomaticallyActivate,
-        true,
-        false,
-    )
 }
 
 /// Returns a test config for caching Zebra's state up to the mandatory checkpoint.

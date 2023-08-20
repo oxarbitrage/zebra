@@ -148,14 +148,11 @@ pub enum Request {
 
     /// Advertise a set of unmined transactions to all peers.
     ///
-    /// This is intended to be used in Zebra with a single transaction at a time
-    /// (set of size 1), but multiple transactions are permitted because this is
-    /// how we interpret advertisements from zcashd, which sometimes advertises
-    /// multiple transactions at once.
+    /// Both Zebra and zcashd sometimes advertise multiple transactions at once.
     ///
     /// This is implemented by sending an `inv` message containing the unmined
-    /// transaction ID, allowing the remote peer to choose whether to download
-    /// it. Remote peers who choose to download the transaction will generate a
+    /// transaction IDs, allowing the remote peer to choose whether to download
+    /// them. Remote peers who choose to download the transaction will generate a
     /// [`Request::TransactionsById`] against the "inbound" service passed to
     /// [`init`](crate::init).
     ///
@@ -203,9 +200,9 @@ impl fmt::Display for Request {
             Request::Ping(_) => "Ping".to_string(),
 
             Request::BlocksByHash(hashes) => {
-                format!("BlocksByHash {{ hashes: {} }}", hashes.len())
+                format!("BlocksByHash({})", hashes.len())
             }
-            Request::TransactionsById(ids) => format!("TransactionsById {{ ids: {} }}", ids.len()),
+            Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
 
             Request::FindBlocks { known_blocks, stop } => format!(
                 "FindBlocks {{ known_blocks: {}, stop: {} }}",
@@ -220,7 +217,7 @@ impl fmt::Display for Request {
 
             Request::PushTransaction(_) => "PushTransaction".to_string(),
             Request::AdvertiseTransactionIds(ids) => {
-                format!("AdvertiseTransactionIds {{ ids: {} }}", ids.len())
+                format!("AdvertiseTransactionIds({})", ids.len())
             }
 
             Request::AdvertiseBlock(_) => "AdvertiseBlock".to_string(),

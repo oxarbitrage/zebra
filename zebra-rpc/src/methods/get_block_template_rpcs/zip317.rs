@@ -15,7 +15,7 @@ use zebra_chain::{
     amount::NegativeOrZero,
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
-    transaction::VerifiedUnminedTx,
+    transaction::{zip317::BLOCK_PRODUCTION_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
     transparent,
 };
 use zebra_consensus::MAX_BLOCK_SIGOPS;
@@ -23,10 +23,6 @@ use zebra_consensus::MAX_BLOCK_SIGOPS;
 use crate::methods::get_block_template_rpcs::{
     get_block_template::generate_coinbase_transaction, types::transaction::TransactionTemplate,
 };
-
-/// The ZIP-317 recommended limit on the number of unpaid actions per block.
-/// `block_unpaid_action_limit` in ZIP-317.
-pub const BLOCK_PRODUCTION_UNPAID_ACTION_LIMIT: u32 = 50;
 
 /// Selects mempool transactions for block production according to [ZIP-317],
 /// using a fake coinbase transaction and the mempool.
@@ -46,11 +42,17 @@ pub async fn select_mempool_transactions(
     miner_address: transparent::Address,
     mempool_txs: Vec<VerifiedUnminedTx>,
     like_zcashd: bool,
+    extra_coinbase_data: Vec<u8>,
 ) -> Vec<VerifiedUnminedTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
-    let fake_coinbase_tx =
-        fake_coinbase_transaction(network, next_block_height, miner_address, like_zcashd);
+    let fake_coinbase_tx = fake_coinbase_transaction(
+        network,
+        next_block_height,
+        miner_address,
+        like_zcashd,
+        extra_coinbase_data,
+    );
 
     // Setup the transaction lists.
     let (mut conventional_fee_txs, mut low_fee_txs): (Vec<_>, Vec<_>) = mempool_txs
@@ -117,6 +119,7 @@ pub fn fake_coinbase_transaction(
     height: Height,
     miner_address: transparent::Address,
     like_zcashd: bool,
+    extra_coinbase_data: Vec<u8>,
 ) -> TransactionTemplate<NegativeOrZero> {
     // Block heights are encoded as variable-length (script) and `u32` (lock time, expiry height).
     // They can also change the `u32` consensus branch id.
@@ -129,8 +132,14 @@ pub fn fake_coinbase_transaction(
     // https://developer.bitcoin.org/reference/transactions.html#txout-a-transaction-output
     let miner_fee = 1.try_into().expect("amount is valid and non-negative");
 
-    let coinbase_tx =
-        generate_coinbase_transaction(network, height, miner_address, miner_fee, like_zcashd);
+    let coinbase_tx = generate_coinbase_transaction(
+        network,
+        height,
+        miner_address,
+        miner_fee,
+        like_zcashd,
+        extra_coinbase_data,
+    );
 
     TransactionTemplate::from_coinbase(&coinbase_tx, miner_fee)
 }

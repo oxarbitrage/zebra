@@ -52,8 +52,8 @@ pub trait CommandExt {
     fn output2(&mut self) -> Result<TestOutput<NoDir>, Report>;
 
     /// wrapper for `spawn` fn on `Command` that constructs informative error
-    /// reports
-    fn spawn2<T>(&mut self, dir: T) -> Result<TestChild<T>, Report>;
+    /// reports using the original `command_path`
+    fn spawn2<T>(&mut self, dir: T, command_path: impl ToString) -> Result<TestChild<T>, Report>;
 }
 
 impl CommandExt for Command {
@@ -89,18 +89,19 @@ impl CommandExt for Command {
     }
 
     /// wrapper for `spawn` fn on `Command` that constructs informative error
-    /// reports
-    fn spawn2<T>(&mut self, dir: T) -> Result<TestChild<T>, Report> {
-        let cmd = format!("{self:?}");
+    /// reports using the original `command_path`
+    fn spawn2<T>(&mut self, dir: T, command_path: impl ToString) -> Result<TestChild<T>, Report> {
+        let command_and_args = format!("{self:?}");
         let child = self.spawn();
 
         let child = child
             .wrap_err("failed to execute process")
-            .with_section(|| cmd.clone().header("Command:"))?;
+            .with_section(|| command_and_args.clone().header("Command:"))?;
 
         Ok(TestChild {
             dir: Some(dir),
-            cmd,
+            cmd: command_and_args,
+            command_path: command_path.to_string(),
             child: Some(child),
             stdout: None,
             stderr: None,
@@ -133,14 +134,18 @@ where
     Self: AsRef<Path> + Sized,
 {
     #[allow(clippy::unwrap_in_result)]
-    fn spawn_child_with_command(self, cmd: &str, args: Arguments) -> Result<TestChild<Self>> {
-        let mut cmd = test_cmd(cmd, self.as_ref())?;
+    fn spawn_child_with_command(
+        self,
+        command_path: &str,
+        args: Arguments,
+    ) -> Result<TestChild<Self>> {
+        let mut cmd = test_cmd(command_path, self.as_ref())?;
 
         Ok(cmd
             .args(args.into_arguments())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn2(self)
+            .spawn2(self, command_path)
             .unwrap())
     }
 }
@@ -183,8 +188,11 @@ pub struct TestChild<T> {
     /// and its output has been taken.
     pub dir: Option<T>,
 
-    /// The original command string.
+    /// The full command string, including arguments and working directory.
     pub cmd: String,
+
+    /// The path of the command, as passed to spawn2().
+    pub command_path: String,
 
     /// The child process itself.
     ///
@@ -532,8 +540,11 @@ impl<T> TestChild<T> {
         // Read unread child output.
         //
         // This checks for failure logs, and prevents some test hangs and deadlocks.
-        if self.child.is_some() || self.stdout.is_some() {
-            let wrote_lines = self.wait_for_stdout_line("\nChild Stdout:".to_string());
+        //
+        // TODO: this could block if stderr is full and stdout is waiting for stderr to be read.
+        if self.stdout.is_some() {
+            let wrote_lines =
+                self.wait_for_stdout_line(format!("\n{} Child Stdout:", self.command_path));
 
             while self.wait_for_stdout_line(None) {}
 
@@ -543,8 +554,9 @@ impl<T> TestChild<T> {
             }
         }
 
-        if self.child.is_some() || self.stderr.is_some() {
-            let wrote_lines = self.wait_for_stderr_line("\nChild Stderr:".to_string());
+        if self.stderr.is_some() {
+            let wrote_lines =
+                self.wait_for_stderr_line(format!("\n{} Child Stderr:", self.command_path));
 
             while self.wait_for_stderr_line(None) {}
 
@@ -556,10 +568,60 @@ impl<T> TestChild<T> {
         kill_result
     }
 
+    /// Kill the process, and return all its remaining standard output and standard error output.
+    ///
+    /// If `ignore_exited` is `true`, log "can't kill an exited process" errors,
+    /// rather than returning them.
+    ///
+    /// Returns `Ok(output)`, or an error if the kill failed.
+    pub fn kill_and_return_output(&mut self, ignore_exited: bool) -> Result<String> {
+        self.apply_failure_regexes_to_outputs();
+
+        // Prevent a hang when consuming output,
+        // by making sure the child's output actually finishes.
+        let kill_result = self.kill(ignore_exited);
+
+        // Read unread child output.
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+
+        // This also checks for failure logs, and prevents some test hangs and deadlocks.
+        loop {
+            let mut remaining_output = false;
+
+            if let Some(stdout) = self.stdout.as_mut() {
+                if let Some(line) =
+                    Self::wait_and_return_output_line(stdout, self.bypass_test_capture)
+                {
+                    stdout_buf.push_str(&line);
+                    remaining_output = true;
+                }
+            }
+
+            if let Some(stderr) = self.stderr.as_mut() {
+                if let Some(line) =
+                    Self::wait_and_return_output_line(stderr, self.bypass_test_capture)
+                {
+                    stderr_buf.push_str(&line);
+                    remaining_output = true;
+                }
+            }
+
+            if !remaining_output {
+                break;
+            }
+        }
+
+        let mut output = stdout_buf;
+        output.push_str(&stderr_buf);
+
+        kill_result.map(|()| output)
+    }
+
     /// Waits until a line of standard output is available, then consumes it.
     ///
     /// If there is a line, and `write_context` is `Some`, writes the context to the test logs.
-    /// Then writes the line to the test logs.
+    /// Always writes the line to the test logs.
     ///
     /// Returns `true` if a line was available,
     /// or `false` if the standard output has finished.
@@ -592,7 +654,7 @@ impl<T> TestChild<T> {
     /// Waits until a line of standard error is available, then consumes it.
     ///
     /// If there is a line, and `write_context` is `Some`, writes the context to the test logs.
-    /// Then writes the line to the test logs.
+    /// Always writes the line to the test logs.
     ///
     /// Returns `true` if a line was available,
     /// or `false` if the standard error has finished.
@@ -622,15 +684,40 @@ impl<T> TestChild<T> {
         false
     }
 
+    /// Waits until a line of `output` is available, then returns it.
+    ///
+    /// If there is a line, and `write_context` is `Some`, writes the context to the test logs.
+    /// Always writes the line to the test logs.
+    ///
+    /// Returns `true` if a line was available,
+    /// or `false` if the standard output has finished.
+    #[allow(clippy::unwrap_in_result)]
+    fn wait_and_return_output_line(
+        mut output: impl Iterator<Item = std::io::Result<String>>,
+        bypass_test_capture: bool,
+    ) -> Option<String> {
+        if let Some(line_result) = output.next() {
+            let line_result = line_result.expect("failure reading test process logs");
+
+            Self::write_to_test_logs(&line_result, bypass_test_capture);
+
+            return Some(line_result);
+        }
+
+        None
+    }
+
     /// Waits for the child process to exit, then returns its output.
+    ///
+    /// # Correctness
     ///
     /// The other test child output methods take one or both outputs,
     /// making them unavailable to this method.
     ///
     /// Ignores any configured timeouts.
     ///
-    /// Returns an error if the child has already been taken,
-    /// or both outputs have already been taken.
+    /// Returns an error if the child has already been taken.
+    /// TODO: return an error if both outputs have already been taken.
     #[spandoc::spandoc]
     pub fn wait_with_output(mut self) -> Result<TestOutput<T>> {
         let child = match self.child.take() {
@@ -686,21 +773,23 @@ impl<T> TestChild<T> {
         self
     }
 
-    /// Configures testrunner to forward stdout and stderr to the true stdout,
+    /// Configures this test runner to forward stdout and stderr to the true stdout,
     /// rather than the fakestdout used by cargo tests.
     pub fn bypass_test_capture(mut self, cond: bool) -> Self {
         self.bypass_test_capture = cond;
         self
     }
 
-    /// Checks each line of the child's stdout against `success_regex`, and returns Ok
-    /// if a line matches.
+    /// Checks each line of the child's stdout against `success_regex`,
+    /// and returns the first matching line. Prints all stdout lines.
     ///
     /// Kills the child on error, or after the configured timeout has elapsed.
     /// See [`Self::expect_line_matching_regex_set`] for details.
+    //
+    // TODO: these methods could block if stderr is full and stdout is waiting for stderr to be read
     #[instrument(skip(self))]
     #[allow(clippy::unwrap_in_result)]
-    pub fn expect_stdout_line_matches<R>(&mut self, success_regex: R) -> Result<&mut Self>
+    pub fn expect_stdout_line_matches<R>(&mut self, success_regex: R) -> Result<String>
     where
         R: ToRegex + Debug,
     {
@@ -711,11 +800,11 @@ impl<T> TestChild<T> {
             .take()
             .expect("child must capture stdout to call expect_stdout_line_matches, and it can't be called again after an error");
 
-        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stdout") {
-            Ok(()) => {
+        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stdout", true) {
+            Ok(line) => {
                 // Replace the log lines for the next check
                 self.stdout = Some(lines);
-                Ok(self)
+                Ok(line)
             }
             Err(report) => {
                 // Read all the log lines for error context
@@ -725,14 +814,14 @@ impl<T> TestChild<T> {
         }
     }
 
-    /// Checks each line of the child's stderr against `success_regex`, and returns Ok
-    /// if a line matches.
+    /// Checks each line of the child's stderr against `success_regex`,
+    /// and returns the first matching line. Prints all stderr lines to stdout.
     ///
     /// Kills the child on error, or after the configured timeout has elapsed.
     /// See [`Self::expect_line_matching_regex_set`] for details.
     #[instrument(skip(self))]
     #[allow(clippy::unwrap_in_result)]
-    pub fn expect_stderr_line_matches<R>(&mut self, success_regex: R) -> Result<&mut Self>
+    pub fn expect_stderr_line_matches<R>(&mut self, success_regex: R) -> Result<String>
     where
         R: ToRegex + Debug,
     {
@@ -743,11 +832,75 @@ impl<T> TestChild<T> {
             .take()
             .expect("child must capture stderr to call expect_stderr_line_matches, and it can't be called again after an error");
 
-        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stderr") {
-            Ok(()) => {
+        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stderr", true) {
+            Ok(line) => {
                 // Replace the log lines for the next check
                 self.stderr = Some(lines);
-                Ok(self)
+                Ok(line)
+            }
+            Err(report) => {
+                // Read all the log lines for error context
+                self.stderr = Some(lines);
+                Err(report).context_from(self)
+            }
+        }
+    }
+
+    /// Checks each line of the child's stdout against `success_regex`,
+    /// and returns the first matching line. Does not print any output.
+    ///
+    /// Kills the child on error, or after the configured timeout has elapsed.
+    /// See [`Self::expect_line_matching_regex_set`] for details.
+    #[instrument(skip(self))]
+    #[allow(clippy::unwrap_in_result)]
+    pub fn expect_stdout_line_matches_silent<R>(&mut self, success_regex: R) -> Result<String>
+    where
+        R: ToRegex + Debug,
+    {
+        self.apply_failure_regexes_to_outputs();
+
+        let mut lines = self
+            .stdout
+            .take()
+            .expect("child must capture stdout to call expect_stdout_line_matches, and it can't be called again after an error");
+
+        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stdout", false) {
+            Ok(line) => {
+                // Replace the log lines for the next check
+                self.stdout = Some(lines);
+                Ok(line)
+            }
+            Err(report) => {
+                // Read all the log lines for error context
+                self.stdout = Some(lines);
+                Err(report).context_from(self)
+            }
+        }
+    }
+
+    /// Checks each line of the child's stderr against `success_regex`,
+    /// and returns the first matching line. Does not print any output.
+    ///
+    /// Kills the child on error, or after the configured timeout has elapsed.
+    /// See [`Self::expect_line_matching_regex_set`] for details.
+    #[instrument(skip(self))]
+    #[allow(clippy::unwrap_in_result)]
+    pub fn expect_stderr_line_matches_silent<R>(&mut self, success_regex: R) -> Result<String>
+    where
+        R: ToRegex + Debug,
+    {
+        self.apply_failure_regexes_to_outputs();
+
+        let mut lines = self
+            .stderr
+            .take()
+            .expect("child must capture stderr to call expect_stderr_line_matches, and it can't be called again after an error");
+
+        match self.expect_line_matching_regex_set(&mut lines, success_regex, "stderr", false) {
+            Ok(line) => {
+                // Replace the log lines for the next check
+                self.stderr = Some(lines);
+                Ok(line)
             }
             Err(report) => {
                 // Read all the log lines for error context
@@ -767,7 +920,8 @@ impl<T> TestChild<T> {
         lines: &mut L,
         success_regexes: R,
         stream_name: &str,
-    ) -> Result<()>
+        write_to_logs: bool,
+    ) -> Result<String>
     where
         L: Iterator<Item = std::io::Result<String>>,
         R: ToRegexSet,
@@ -776,7 +930,7 @@ impl<T> TestChild<T> {
             .to_regex_set()
             .expect("regexes must be valid");
 
-        self.expect_line_matching_regexes(lines, success_regexes, stream_name)
+        self.expect_line_matching_regexes(lines, success_regexes, stream_name, write_to_logs)
     }
 
     /// Checks each line in `lines` against a regex set, and returns Ok if a line matches.
@@ -788,7 +942,8 @@ impl<T> TestChild<T> {
         lines: &mut L,
         success_regexes: I,
         stream_name: &str,
-    ) -> Result<()>
+        write_to_logs: bool,
+    ) -> Result<String>
     where
         L: Iterator<Item = std::io::Result<String>>,
         I: CollectRegexSet,
@@ -797,7 +952,7 @@ impl<T> TestChild<T> {
             .collect_regex_set()
             .expect("regexes must be valid");
 
-        self.expect_line_matching_regexes(lines, success_regexes, stream_name)
+        self.expect_line_matching_regexes(lines, success_regexes, stream_name, write_to_logs)
     }
 
     /// Checks each line in `lines` against `success_regexes`, and returns Ok if a line
@@ -814,7 +969,8 @@ impl<T> TestChild<T> {
         lines: &mut L,
         success_regexes: RegexSet,
         stream_name: &str,
-    ) -> Result<()>
+        write_to_logs: bool,
+    ) -> Result<String>
     where
         L: Iterator<Item = std::io::Result<String>>,
     {
@@ -831,11 +987,13 @@ impl<T> TestChild<T> {
                 break;
             };
 
-            // Since we're about to discard this line write it to stdout.
-            Self::write_to_test_logs(&line, self.bypass_test_capture);
+            if write_to_logs {
+                // Since we're about to discard this line write it to stdout.
+                Self::write_to_test_logs(&line, self.bypass_test_capture);
+            }
 
             if success_regexes.is_match(&line) {
-                return Ok(());
+                return Ok(line);
             }
         }
 
@@ -1214,6 +1372,11 @@ impl<T> TestOutput<T> {
     fn was_killed(&self) -> bool {
         self.output.status.signal() == Some(9)
     }
+
+    /// Takes the generic `dir` parameter out of this `TestOutput`.
+    pub fn take_dir(&mut self) -> Option<T> {
+        self.dir.take()
+    }
 }
 
 /// Add context to an error report
@@ -1295,8 +1458,8 @@ impl<T> ContextFrom<&mut TestChild<T>> for Report {
             }
         }
 
-        self.section(stdout_buf.header("Unread Stdout:"))
-            .section(stderr_buf.header("Unread Stderr:"))
+        self.section(stdout_buf.header(format!("{} Unread Stdout:", source.command_path)))
+            .section(stderr_buf.header(format!("{} Unread Stderr:", source.command_path)))
     }
 }
 
@@ -1313,6 +1476,7 @@ impl ContextFrom<&Output> for Report {
     type Return = Report;
 
     fn context_from(self, source: &Output) -> Self::Return {
+        // TODO: add TestChild.command_path before Stdout and Stderr header names
         let stdout = || {
             String::from_utf8_lossy(&source.stdout)
                 .into_owned()

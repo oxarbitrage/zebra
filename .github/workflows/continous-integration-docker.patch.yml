@@ -19,13 +19,16 @@ on:
       - '**/clippy.toml'
       # workflow definitions
       - 'docker/**'
+      - '.dockerignore'
       - '.github/workflows/continous-integration-docker.yml'
       - '.github/workflows/deploy-gcp-tests.yml'
+      - '.github/workflows/find-cached-disks.yml'
       - '.github/workflows/build-docker-image.yml'
 
 jobs:
+  # We don't patch the testnet job, because testnet isn't required to merge (it's too unstable)
   get-available-disks:
-    name: Find available cached state disks
+    name: Check if cached state disks exist for Mainnet / Check if cached state disks exist
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'
@@ -86,6 +89,12 @@ jobs:
 
   test-update-sync:
     name: Zebra tip update / Run update-to-tip test
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No build required"'
+
+  generate-checkpoints-mainnet:
+    name: Generate checkpoints mainnet / Run generate-checkpoints-mainnet test
     runs-on: ubuntu-latest
     steps:
       - run: 'echo "No build required"'

@@ -35,7 +35,7 @@ pub use commitment::{
 };
 pub use hash::Hash;
 pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
-pub use height::Height;
+pub use height::{Height, HeightDiff, TryIntoHeight};
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -43,7 +43,10 @@ pub use arbitrary::LedgerState;
 
 /// A Zcash block, containing a header and a list of transactions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
+#[cfg_attr(
+    any(test, feature = "proptest-impl", feature = "elasticsearch"),
+    derive(Serialize)
+)]
 pub struct Block {
     /// The block header, containing block metadata.
     pub header: Arc<Header>,

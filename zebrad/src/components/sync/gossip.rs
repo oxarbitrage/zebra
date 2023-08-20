@@ -9,9 +9,10 @@ use tower::{timeout::Timeout, Service, ServiceExt};
 use zebra_network as zn;
 use zebra_state::ChainTipChange;
 
-use crate::BoxError;
-
-use super::{SyncStatus, TIPS_RESPONSE_TIMEOUT};
+use crate::{
+    components::sync::{SyncStatus, PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT},
+    BoxError,
+};
 
 use BlockGossipError::*;
 
@@ -85,5 +86,11 @@ where
             .map_err(PeerSetReadiness)?
             .call(request)
             .await;
+
+        // wait for at least the network timeout between gossips
+        //
+        // in practice, we expect blocks to arrive approximately every 75 seconds,
+        // so waiting 6 seconds won't make much difference
+        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     }
 }

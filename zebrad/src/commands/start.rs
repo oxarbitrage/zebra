@@ -2,7 +2,7 @@
 //!
 //! ## Application Structure
 //!
-//! A zebra node consists of the following services and tasks:
+//! A zebra node consists of the following major services and tasks:
 //!
 //! Peers:
 //!  * Peer Connection Pool Service
@@ -12,6 +12,9 @@
 //!    * maintains a list of peer addresses, and connection priority metadata
 //!    * discovers new peer addresses from existing peer connections
 //!    * initiates new outbound peer connections in response to demand from tasks within this node
+//!  * Peer Cache Service
+//!    * Reads previous peer cache on startup, and adds it to the configured DNS seed peers
+//!    * Periodically updates the peer cache on disk from the latest address book state
 //!
 //! Blocks & Mempool Transactions:
 //!  * Consensus Service
@@ -61,25 +64,27 @@
 //!    * answers RPC client requests using the State Service and Mempool Service
 //!    * submits client transactions to the node's mempool
 //!
-//! Zebra also has diagnostic support
+//! Zebra also has diagnostic support:
 //! * [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md)
 //! * [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
+//! * [progress-bar](https://docs.rs/howudoin/0.1.1/howudoin)
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-use abscissa_core::{config, Command, FrameworkError, Options, Runnable};
+use abscissa_core::{config, Command, FrameworkError, Runnable};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{pin, select, sync::oneshot};
 use tower::{builder::ServiceBuilder, util::BoxService};
 use tracing_futures::Instrument;
 
+use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::server::RpcServer;
 
 use crate::{
-    application::app_version,
+    application::{build_version, user_agent},
     components::{
-        inbound::{self, InboundSetupData},
+        inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{RuntimeRun, TokioComponent},
@@ -89,20 +94,20 @@ use crate::{
     prelude::*,
 };
 
-/// `start` subcommand
-#[derive(Command, Debug, Options, Default)]
+/// Start the application (default command)
+#[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
-    #[options(free, help = "tracing filters which override the zebrad.toml config")]
+    #[clap(help = "tracing filters which override the zebrad.toml config")]
     filters: Vec<String>,
 }
 
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
-        let config = app_config().clone();
+        let config = APPLICATION.config();
 
         info!("initializing node state");
-        let (_, max_checkpoint_height) = zebra_consensus::chain::init_checkpoint_list(
+        let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
             config.network.network,
         );
@@ -127,21 +132,34 @@ impl StartCmd {
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set
         // in response to excess load.
+        //
+        // # Security
+        //
+        // This layer stack is security-sensitive, modifying it can cause hangs,
+        // or enable denial of service attacks.
+        //
+        // See `zebra_network::Connection::drive_peer_request()` for details.
         let (setup_tx, setup_rx) = oneshot::channel();
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
+            .timeout(MAX_INBOUND_RESPONSE_TIME)
             .service(Inbound::new(
                 config.sync.full_verify_concurrency_limit,
                 setup_rx,
             ));
 
-        let (peer_set, address_book) =
-            zebra_network::init(config.network.clone(), inbound, latest_chain_tip.clone()).await;
+        let (peer_set, address_book) = zebra_network::init(
+            config.network.clone(),
+            inbound,
+            latest_chain_tip.clone(),
+            user_agent(),
+        )
+        .await;
 
         info!("initializing verifiers");
-        let (chain_verifier, tx_verifier, mut groth16_download_handle, max_checkpoint_height) =
-            zebra_consensus::chain::init(
+        let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
+            zebra_consensus::router::init(
                 config.consensus.clone(),
                 config.network.network,
                 state.clone(),
@@ -154,7 +172,7 @@ impl StartCmd {
             &config,
             max_checkpoint_height,
             peer_set.clone(),
-            chain_verifier.clone(),
+            block_verifier_router.clone(),
             state.clone(),
             latest_chain_tip.clone(),
         );
@@ -174,27 +192,12 @@ impl StartCmd {
             .buffer(mempool::downloads::MAX_INBOUND_CONCURRENCY)
             .service(mempool);
 
-        // Launch RPC server
-        let (rpc_task_handle, rpc_tx_queue_task_handle, rpc_server) = RpcServer::spawn(
-            config.rpc,
-            #[cfg(feature = "getblocktemplate-rpcs")]
-            config.mining,
-            #[cfg(not(feature = "getblocktemplate-rpcs"))]
-            (),
-            app_version(),
-            mempool.clone(),
-            read_only_state_service,
-            chain_verifier.clone(),
-            sync_status.clone(),
-            address_book.clone(),
-            latest_chain_tip.clone(),
-            config.network.network,
-        );
-
+        info!("fully initializing inbound peer request handler");
+        // Fully start the inbound service as soon as possible
         let setup_data = InboundSetupData {
-            address_book,
+            address_book: address_book.clone(),
             block_download_peer_set: peer_set.clone(),
-            block_verifier: chain_verifier,
+            block_verifier: block_verifier_router.clone(),
             mempool: mempool.clone(),
             state,
             latest_chain_tip: latest_chain_tip.clone(),
@@ -202,9 +205,28 @@ impl StartCmd {
         setup_tx
             .send(setup_data)
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;
+        // And give it time to clear its queue
+        tokio::task::yield_now().await;
 
-        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
+        // Launch RPC server
+        let (rpc_task_handle, rpc_tx_queue_task_handle, rpc_server) = RpcServer::spawn(
+            config.rpc.clone(),
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            config.mining.clone(),
+            #[cfg(not(feature = "getblocktemplate-rpcs"))]
+            (),
+            build_version(),
+            user_agent(),
+            mempool.clone(),
+            read_only_state_service,
+            block_verifier_router,
+            sync_status.clone(),
+            address_book,
+            latest_chain_tip.clone(),
+            config.network.network,
+        );
 
+        // Start concurrent tasks which don't add load to other tasks
         let block_gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
@@ -214,28 +236,44 @@ impl StartCmd {
             .in_current_span(),
         );
 
-        let mempool_crawler_task_handle = mempool::Crawler::spawn(
-            &config.mempool,
-            peer_set.clone(),
-            mempool.clone(),
-            sync_status.clone(),
-            chain_tip_change,
-        );
-
         let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
 
         let tx_gossip_task_handle = tokio::spawn(
-            mempool::gossip_mempool_transaction_id(mempool_transaction_receiver, peer_set)
-                .in_current_span(),
-        );
-
-        let progress_task_handle = tokio::spawn(
-            show_block_chain_progress(config.network.network, latest_chain_tip, sync_status)
+            mempool::gossip_mempool_transaction_id(mempool_transaction_receiver, peer_set.clone())
                 .in_current_span(),
         );
 
         let mut old_databases_task_handle =
             zebra_state::check_and_delete_old_databases(config.state.clone());
+
+        let progress_task_handle = tokio::spawn(
+            show_block_chain_progress(
+                config.network.network,
+                latest_chain_tip.clone(),
+                sync_status.clone(),
+            )
+            .in_current_span(),
+        );
+
+        let end_of_support_task_handle = tokio::spawn(
+            sync::end_of_support::start(config.network.network, latest_chain_tip).in_current_span(),
+        );
+
+        // Give the inbound service more time to clear its queue,
+        // then start concurrent tasks that can add load to the inbound service
+        // (by opening more peer connections, so those peers send us requests)
+        tokio::task::yield_now().await;
+
+        // The crawler only activates immediately in tests that use mempool debug mode
+        let mempool_crawler_task_handle = mempool::Crawler::spawn(
+            &config.mempool,
+            peer_set,
+            mempool.clone(),
+            sync_status,
+            chain_tip_change,
+        );
+
+        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
         info!("spawned initial Zebra tasks");
 
@@ -250,10 +288,20 @@ impl StartCmd {
         pin!(mempool_queue_checker_task_handle);
         pin!(tx_gossip_task_handle);
         pin!(progress_task_handle);
+        pin!(end_of_support_task_handle);
 
         // startup tasks
+        let BackgroundTaskHandles {
+            mut groth16_download_handle,
+            mut state_checkpoint_verify_handle,
+        } = consensus_task_handles;
+
         let groth16_download_handle_fused = (&mut groth16_download_handle).fuse();
         pin!(groth16_download_handle_fused);
+
+        let state_checkpoint_verify_handle_fused = (&mut state_checkpoint_verify_handle).fuse();
+        pin!(state_checkpoint_verify_handle_fused);
+
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
@@ -300,12 +348,18 @@ impl StartCmd {
                     .map(|_| info!("transaction gossip task exited"))
                     .map_err(|e| eyre!(e)),
 
+                // The progress task runs forever, unless it panics.
+                // So we don't need to provide an exit status for it.
                 progress_result = &mut progress_task_handle => {
+                    info!("chain progress task exited");
                     progress_result
                         .expect("unexpected panic in the chain progress task");
-                    info!("chain progress task exited");
-                    Ok(())
                 }
+
+                end_of_support_result = &mut end_of_support_task_handle => end_of_support_result
+                    .expect("unexpected panic in the end of support task")
+                    .map(|_| info!("end of support task exited")),
+
 
                 // Unlike other tasks, we expect the download task to finish while Zebra is running.
                 groth16_download_result = &mut groth16_download_handle_fused => {
@@ -319,7 +373,17 @@ impl StartCmd {
                     Ok(())
                 }
 
-                // The same for the old databases task, we expect it to finish while Zebra is running.
+                // We also expect the state checkpoint verify task to finish.
+                state_checkpoint_verify_result = &mut state_checkpoint_verify_handle_fused => {
+                    state_checkpoint_verify_result
+                        .unwrap_or_else(|_| panic!(
+                            "unexpected panic checking previous state followed the best chain"));
+
+                    exit_when_task_finishes = false;
+                    Ok(())
+                }
+
+                // And the old databases task should finish while Zebra is running.
                 old_databases_result = &mut old_databases_task_handle_fused => {
                     old_databases_result
                         .unwrap_or_else(|_| panic!(
@@ -352,9 +416,11 @@ impl StartCmd {
         mempool_queue_checker_task_handle.abort();
         tx_gossip_task_handle.abort();
         progress_task_handle.abort();
+        end_of_support_task_handle.abort();
 
         // startup tasks
         groth16_download_handle.abort();
+        state_checkpoint_verify_handle.abort();
         old_databases_task_handle.abort();
 
         // Wait until the RPC server shuts down.
@@ -371,7 +437,7 @@ impl StartCmd {
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
     fn state_buffer_bound() -> usize {
-        let config = app_config().clone();
+        let config = APPLICATION.config();
 
         // Ignore the checkpoint verify limit, because it is very large.
         //
@@ -393,9 +459,9 @@ impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
         info!("Starting zebrad");
-        let rt = app_writer()
-            .state_mut()
-            .components
+        let rt = APPLICATION
+            .state()
+            .components_mut()
             .get_downcast_mut::<TokioComponent>()
             .expect("TokioComponent should be available")
             .rt

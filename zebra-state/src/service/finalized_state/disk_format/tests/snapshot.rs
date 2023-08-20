@@ -62,7 +62,12 @@ fn test_raw_rocksdb_column_families_with_network(network: Network) {
     let mut net_suffix = network.to_string();
     net_suffix.make_ascii_lowercase();
 
-    let mut state = FinalizedState::new(&Config::ephemeral(), network);
+    let mut state = FinalizedState::new(
+        &Config::ephemeral(),
+        network,
+        #[cfg(feature = "elasticsearch")]
+        None,
+    );
 
     // Snapshot the column family names
     let mut cf_names = state.db.list_cf().expect("empty database is valid");
@@ -98,7 +103,7 @@ fn test_raw_rocksdb_column_families_with_network(network: Network) {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), "snapshot tests")
+            .commit_finalized_direct(block.into(), None, "snapshot tests")
             .expect("test block is valid");
 
         let mut settings = insta::Settings::clone_current();

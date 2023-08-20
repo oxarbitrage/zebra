@@ -29,9 +29,14 @@ pub use joinsplit::JoinSplitData;
 pub use lock_time::LockTime;
 pub use memo::Memo;
 pub use sapling::FieldNotPresent;
-pub use serialize::SerializedTransaction;
+pub use serialize::{
+    SerializedTransaction, MIN_TRANSPARENT_TX_SIZE, MIN_TRANSPARENT_TX_V4_SIZE,
+    MIN_TRANSPARENT_TX_V5_SIZE,
+};
 pub use sighash::{HashType, SigHash};
-pub use unmined::{UnminedTx, UnminedTxId, VerifiedUnminedTx};
+pub use unmined::{
+    zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
+};
 
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
@@ -58,7 +63,10 @@ use crate::{
 /// internally by different enum variants. Because we checkpoint on Canopy
 /// activation, we do not validate any pre-Sapling transaction types.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
+#[cfg_attr(
+    any(test, feature = "proptest-impl", feature = "elasticsearch"),
+    derive(Serialize)
+)]
 pub enum Transaction {
     /// A fully transparent transaction (`version = 1`).
     V1 {
