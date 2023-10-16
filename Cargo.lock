@@ -450,9 +450,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4682ae6287fcf752ecaabbfcc7b6f9b72aa33933dc23a554d853aea8eea8635"
+checksum = "327762f6e5a765692301e5bb513e0d9fef63be86bbc14528052b1cd3e6f03e07"
 
 [[package]]
 name = "bitflags-serde-legacy"
@@ -460,7 +460,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b64e60c28b6d25ad92e8b367801ff9aa12b41d05fc8798055d296bace4a60cc"
 dependencies = [
- "bitflags 2.4.0",
+ "bitflags 2.4.1",
  "serde",
 ]
 
@@ -1370,6 +1370,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixed-hash"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "835c052cb0c08c1acf6ffd71c022172e18723949c8282f2b9f27efbc51e64534"
+dependencies = [
+ "byteorder",
+ "rand 0.8.5",
+ "rustc-hex",
+ "static_assertions",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1994,9 +2006,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5477fe2230a79769d8dc68e0eabf5437907c0457a5614a9e8dddb67f65eb65d"
+checksum = "ad227c3af19d4914570ad36d30409928b75967c298feb9ea1969db3a610bb14e"
 dependencies = [
  "equivalent",
  "hashbrown 0.14.0",
@@ -3021,7 +3033,18 @@ version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e28720988bff275df1f51b171e1b2a18c30d194c4d2b61defdacecd625a5d94a"
 dependencies = [
- "fixed-hash",
+ "fixed-hash 0.7.0",
+ "impl-codec",
+ "uint",
+]
+
+[[package]]
+name = "primitive-types"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b34d9fd68ae0b74a41b21c03c2f62847aa0ffea044eee893b4c140b37e244e2"
+dependencies = [
+ "fixed-hash 0.8.0",
  "impl-codec",
  "uint",
 ]
@@ -3611,7 +3634,7 @@ version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a962918ea88d644592894bc6dc55acc6c0956488adcebbfb6e273506b7fd6e5"
 dependencies = [
- "bitflags 2.4.0",
+ "bitflags 2.4.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -3894,7 +3917,7 @@ version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "693151e1ac27563d6dbcec9dee9fbd5da8539b20fa14ad3752b2e6d363ace360"
 dependencies = [
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "itoa",
  "ryu",
  "serde",
@@ -3941,7 +3964,7 @@ dependencies = [
  "chrono",
  "hex",
  "indexmap 1.9.3",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "serde",
  "serde_json",
  "serde_with_macros 3.2.0",
@@ -4463,7 +4486,7 @@ version = "0.19.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8123f27e969974a3dfba720fdb560be359f57b44302d280ba72e76a74480e8a"
 dependencies = [
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -5348,7 +5371,7 @@ checksum = "eb611a28a4e13ac715ee712f4344d6b279b767daf6345dafefb2c4bf582b6679"
 dependencies = [
  "blake2b_simd",
  "byteorder",
- "primitive-types",
+ "primitive-types 0.11.1",
 ]
 
 [[package]]
@@ -5463,7 +5486,7 @@ dependencies = [
 name = "zebra-chain"
 version = "1.0.0-beta.28"
 dependencies = [
- "bitflags 2.4.0",
+ "bitflags 2.4.1",
  "bitflags-serde-legacy",
  "bitvec",
  "blake2b_simd",
@@ -5488,7 +5511,7 @@ dependencies = [
  "lazy_static",
  "num-integer",
  "orchard",
- "primitive-types",
+ "primitive-types 0.12.2",
  "proptest",
  "proptest-derive",
  "rand 0.8.5",
@@ -5569,7 +5592,7 @@ dependencies = [
 name = "zebra-network"
 version = "1.0.0-beta.28"
 dependencies = [
- "bitflags 2.4.0",
+ "bitflags 2.4.1",
  "byteorder",
  "bytes",
  "chrono",
@@ -5578,7 +5601,7 @@ dependencies = [
  "hex",
  "howudoin",
  "humantime-serde",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "itertools 0.11.0",
  "lazy_static",
  "metrics",
@@ -5626,7 +5649,7 @@ dependencies = [
  "futures",
  "hex",
  "hyper",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "insta",
  "jsonrpc-core",
  "jsonrpc-derive",
@@ -5676,7 +5699,7 @@ dependencies = [
  "halo2_proofs",
  "hex",
  "howudoin",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "insta",
  "itertools 0.11.0",
  "jubjub",
@@ -5713,7 +5736,7 @@ dependencies = [
  "futures",
  "hex",
  "humantime",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "insta",
  "lazy_static",
  "once_cell",
@@ -5769,7 +5792,7 @@ dependencies = [
  "howudoin",
  "humantime-serde",
  "hyper",
- "indexmap 2.0.0",
+ "indexmap 2.0.1",
  "indicatif",
  "inferno",
  "jsonrpc-core",
