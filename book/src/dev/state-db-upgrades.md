@@ -40,6 +40,28 @@ This means that:
 
 If there is an upgrade failure, it can panic and tell the user to delete their cached state and re-launch Zebra.
 
+### Performance Constraints
+
+Some column family access patterns can lead to very poor performance.
+
+Known performance issues include:
+- using an iterator on a column family which also deletes keys
+- creating large numbers of iterators
+- holding an iterator for a long time
+
+See the performance notes and bug reports in:
+- https://github.com/facebook/rocksdb/wiki/Iterator#iterating-upper-bound-and-lower-bound
+- https://tracker.ceph.com/issues/55324
+- https://jira.mariadb.org/browse/MDEV-19670
+
+But we need to use iterators for some operations, so our alternatives are (in preferred order):
+1. Minimise the number of keys we delete, and how often we delete them
+2. Avoid using iterators on column families where we delete keys
+3. If we must use iterators on those column families, set read bounds to minimise the amount of deleted data that is read
+
+Currently only UTXOs require key deletion, and only `utxo_loc_by_transparent_addr_loc` requires
+deletion and iterators.
+
 ### Implementation Steps
 
 - [ ] update the [database format](https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/state-db-upgrades.md#current) in the Zebra docs
@@ -87,17 +109,19 @@ We use the following rocksdb column families:
 | *Sprout*                           |                        |                               |         |
 | `sprout_nullifiers`                | `sprout::Nullifier`    | `()`                          | Create  |
 | `sprout_anchors`                   | `sprout::tree::Root`   | `sprout::NoteCommitmentTree`  | Create  |
-| `sprout_note_commitment_tree`      | `block::Height`        | `sprout::NoteCommitmentTree`  | Delete  |
+| `sprout_note_commitment_tree`      | `()`                   | `sprout::NoteCommitmentTree`  | Update  |
 | *Sapling*                          |                        |                               |         |
 | `sapling_nullifiers`               | `sapling::Nullifier`   | `()`                          | Create  |
 | `sapling_anchors`                  | `sapling::tree::Root`  | `()`                          | Create  |
 | `sapling_note_commitment_tree`     | `block::Height`        | `sapling::NoteCommitmentTree` | Create  |
+| `sapling_note_commitment_subtree`  | `block::Height`        | `NoteCommitmentSubtreeData`   | Create  |
 | *Orchard*                          |                        |                               |         |
 | `orchard_nullifiers`               | `orchard::Nullifier`   | `()`                          | Create  |
 | `orchard_anchors`                  | `orchard::tree::Root`  | `()`                          | Create  |
 | `orchard_note_commitment_tree`     | `block::Height`        | `orchard::NoteCommitmentTree` | Create  |
+| `orchard_note_commitment_subtree`  | `block::Height`        | `NoteCommitmentSubtreeData`   | Create  |
 | *Chain*                            |                        |                               |         |
-| `history_tree`                     | `block::Height`        | `NonEmptyHistoryTree`         | Delete  |
+| `history_tree`                     | `()`                   | `NonEmptyHistoryTree`         | Update  |
 | `tip_chain_value_pool`             | `()`                   | `ValueBalance`                | Update  |
 
 Zcash structures are encoded using `ZcashSerialize`/`ZcashDeserialize`.
@@ -118,6 +142,8 @@ Block and Transaction Data:
   used instead of a `BTreeSet<OutputLocation>` value, to improve database performance
 - `AddressTransaction`: `AddressLocation \|\| TransactionLocation`
   used instead of a `BTreeSet<TransactionLocation>` value, to improve database performance
+- `NoteCommitmentSubtreeIndex`: 16 bits, big-endian, unsigned
+- `NoteCommitmentSubtreeData<{sapling, orchard}::tree::Node>`: `Height \|\| {sapling, orchard}::tree::Node`
 
 We use big-endian encoding for keys, to allow database index prefix searches.
 
@@ -127,6 +153,7 @@ Amounts:
 
 Derived Formats:
 - `*::NoteCommitmentTree`: `bincode` using `serde`
+  - stored note commitment trees always have cached roots
 - `NonEmptyHistoryTree`: `bincode` using `serde`, using `zcash_history`'s `serde` implementation
 
 
@@ -333,6 +360,9 @@ So they should not be used for consensus-critical checks.
   state for every height, for the specific pool. Each tree is stored
   as a "Merkle tree frontier" which is basically a (logarithmic) subset of
   the Merkle tree nodes as required to insert new items.
+
+- The `{sapling, orchard}_note_commitment_subtree` stores the completion height and
+  root for every completed level 16 note commitment subtree, for the specific pool.
 
 - `history_tree` stores the ZIP-221 history tree state at the tip of the finalized
   state. There is always a single entry for it. The tree is stored as the set of "peaks"

@@ -12,8 +12,9 @@
 # Each stage must define the build arguments (ARGs) it uses.
 #
 # Build zebrad with these features
-# Keep these in sync with:
-# https://github.com/ZcashFoundation/zebra/blob/main/.github/workflows/build-docker-image.yml#L37
+#
+# Keep these argument defaults in sync with GitHub vars.RUST_PROD_FEATURES and vars.RUST_TEST_FEATURES
+# https://github.com/ZcashFoundation/zebra/settings/variables/actions
 ARG FEATURES="default-release-binaries"
 ARG TEST_FEATURES="lightwalletd-grpc-tests zebra-checkpoints"
 
@@ -70,6 +71,9 @@ RUN if [ "$(uname -m)" != "aarch64" ]; then \
 # Build arguments and variables set for tracelog levels and debug information
 #
 # We set defaults to all variables.
+ARG RUST_LOG
+ENV RUST_LOG=${RUST_LOG:-info}
+
 ARG RUST_BACKTRACE
 ENV RUST_BACKTRACE=${RUST_BACKTRACE:-1}
 
@@ -166,8 +170,8 @@ RUN rm -r zebra-original
 # Build zebrad
 RUN cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad
 
-COPY ./docker/runtime-entrypoint.sh /
-RUN chmod u+x /runtime-entrypoint.sh
+COPY ./docker/entrypoint.sh /
+RUN chmod u+x /entrypoint.sh
 
 # This stage is only used when deploying nodes or when only the resulting zebrad binary is needed
 #
@@ -175,7 +179,7 @@ RUN chmod u+x /runtime-entrypoint.sh
 # binary from the `release` stage, and the Zcash Sprout & Sapling parameters from ZCash
 FROM debian:bullseye-slim AS runtime
 COPY --from=release /opt/zebrad/target/release/zebrad /usr/local/bin
-COPY --from=release /runtime-entrypoint.sh /
+COPY --from=release /entrypoint.sh /
 COPY --from=us-docker.pkg.dev/zfnd-dev-zebra/zebra/zcash-params:edge /root/.zcash-params /root/.zcash-params
 
 RUN apt-get update && \
@@ -186,9 +190,14 @@ RUN apt-get update && \
 ARG FEATURES
 ENV FEATURES=${FEATURES}
 
+# Path and name of the config file
+ENV ZEBRA_CONF_DIR=${ZEBRA_CONF_DIR:-/etc/zebrad}
+ENV ZEBRA_CONF_FILE=${ZEBRA_CONF_FILE:-zebrad.toml}
+
 # Expose configured ports
 EXPOSE 8233 18233
 
 # Update the config file based on the Docker run variables,
 # and launch zebrad with it
-ENTRYPOINT [ "/runtime-entrypoint.sh" ]
+ENTRYPOINT [ "/entrypoint.sh" ]
+CMD ["zebrad"]

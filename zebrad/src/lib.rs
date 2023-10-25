@@ -57,13 +57,14 @@
 //!
 //! ### JSON-RPC
 //!
-//! * `getblocktemplate-rpcs`: Experimental mining pool RPC support (currently incomplete)
+//! * `getblocktemplate-rpcs`: Mining pool RPC support, enabled by default in production builds.
 //!
 //! ### Metrics
 //!
-//! * `prometheus`: export metrics to prometheus.
-//! * `progress-bar`: shows key metrics in the terminal using progress bars,
+//! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
 //!   and automatically configures Zebra to send logs to a file.
+//!   (The `progress-bar` feature is activated by default.)
+//! * `prometheus`: export metrics to prometheus.
 //!
 //! Read the [metrics](https://zebra.zfnd.org/user/metrics.html) section of the book
 //! for more details.
@@ -93,6 +94,11 @@
 //!
 //! * `proptest-impl`: enable randomised test data generation.
 //! * `lightwalletd-grpc-tests`: enable Zebra JSON-RPC tests that query `lightwalletd` using gRPC.
+//!
+//! ### Experimental
+//!
+//! * `elasticsearch`: save block data into elasticsearch database. Read the [elasticsearch](https://zebra.zfnd.org/user/elasticsearch.html)
+//! section of the book for more details.
 
 #![doc(html_favicon_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-icon.png")]
@@ -100,6 +106,16 @@
 // Tracing causes false positives on this lint:
 // https://github.com/tokio-rs/tracing/issues/553
 #![allow(clippy::cognitive_complexity)]
+//
+// Rust 1.72 has a false positive when nested generics are used inside Arc.
+// This makes the `arc_with_non_send_sync` lint trigger on a lot of proptest code.
+//
+// TODO: remove this allow when Rust 1.73 is stable, because this lint bug is fixed in that release:
+// <https://github.com/rust-lang/rust-clippy/issues/11076>
+#![cfg_attr(
+    any(test, feature = "proptest-impl"),
+    allow(clippy::arc_with_non_send_sync)
+)]
 
 #[macro_use]
 extern crate tracing;

@@ -6,6 +6,7 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Height},
     orchard, sapling, sprout,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, Transaction},
     transparent,
     value_balance::ValueBalance,
@@ -213,6 +214,15 @@ fn roundtrip_amount() {
     proptest!(|(val in any::<Amount::<NonNegative>>())| assert_value_properties(val));
 }
 
+#[test]
+fn roundtrip_note_commitment_subtree_index() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val in any::<NoteCommitmentSubtreeIndex>())| {
+        assert_value_properties(val)
+    });
+}
+
 // Sprout
 
 #[test]
@@ -361,6 +371,16 @@ fn roundtrip_sapling_tree_root() {
     proptest!(|(val in any::<sapling::tree::Root>())| assert_value_properties(val));
 }
 
+#[test]
+fn roundtrip_sapling_subtree_data() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(mut val in any::<NoteCommitmentSubtreeData<sapling::tree::Node>>())| {
+        val.end.0 %= MAX_ON_DISK_HEIGHT.0 + 1;
+        assert_value_properties(val)
+    });
+}
+
 // TODO: test note commitment tree round-trip, after implementing proptest::Arbitrary
 
 // Orchard
@@ -434,6 +454,17 @@ fn roundtrip_orchard_tree_root() {
     let _init_guard = zebra_test::init();
 
     proptest!(|(val in any::<orchard::tree::Root>())| assert_value_properties(val));
+}
+
+#[test]
+fn roundtrip_orchard_subtree_data() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(mut val in any::<NoteCommitmentSubtreeData<orchard::tree::Node>>())| {
+        val.end = val.end.clamp(Height(0), MAX_ON_DISK_HEIGHT);
+        val.end.0 %= MAX_ON_DISK_HEIGHT.0 + 1;
+        assert_value_properties(val)
+    });
 }
 
 // TODO: test note commitment tree round-trip, after implementing proptest::Arbitrary

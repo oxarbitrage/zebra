@@ -18,7 +18,8 @@ use std::{
 };
 
 use bitvec::prelude::*;
-use bridgetree::{self};
+use bridgetree::{self, NonEmptyFrontier};
+use hex::ToHex;
 use incrementalmerkletree::{frontier::Frontier, Hashable};
 
 use lazy_static::lazy_static;
@@ -28,8 +29,11 @@ use zcash_primitives::merkle_tree::HashSer;
 
 use super::commitment::pedersen_hashes::pedersen_hash;
 
-use crate::serialization::{
-    serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
+use crate::{
+    serialization::{
+        serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
+    },
+    subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
 
 pub mod legacy;
@@ -162,24 +166,66 @@ impl ZcashDeserialize for Root {
 ///
 /// Note that it's handled as a byte buffer and not a point coordinate (jubjub::Fq)
 /// because that's how the spec handles the MerkleCRH^Sapling function inputs and outputs.
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
 pub struct Node([u8; 32]);
+
+impl AsRef<[u8; 32]> for Node {
+    fn as_ref(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.encode_hex::<String>())
+    }
+}
 
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("Node").field(&hex::encode(self.0)).finish()
+        f.debug_tuple("sapling::Node")
+            .field(&self.encode_hex::<String>())
+            .finish()
+    }
+}
+
+impl Node {
+    /// Return the node bytes in little-endian byte order suitable for printing out byte by byte.
+    ///
+    /// `zcashd`'s `z_getsubtreesbyindex` does not reverse the byte order of subtree roots.
+    pub fn bytes_in_display_order(&self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl ToHex for &Node {
+    fn encode_hex<T: FromIterator<char>>(&self) -> T {
+        self.bytes_in_display_order().encode_hex()
+    }
+
+    fn encode_hex_upper<T: FromIterator<char>>(&self) -> T {
+        self.bytes_in_display_order().encode_hex_upper()
+    }
+}
+
+impl ToHex for Node {
+    fn encode_hex<T: FromIterator<char>>(&self) -> T {
+        (&self).encode_hex()
+    }
+
+    fn encode_hex_upper<T: FromIterator<char>>(&self) -> T {
+        (&self).encode_hex_upper()
     }
 }
 
 /// Required to convert [`NoteCommitmentTree`] into [`SerializedTree`].
 ///
-/// Zebra stores Sapling note commitment trees as [`Frontier`][1]s while the
-/// [`z_gettreestate`][2] RPC requires [`CommitmentTree`][3]s. Implementing
+/// Zebra stores Sapling note commitment trees as [`Frontier`]s while the
+/// [`z_gettreestate`][1] RPC requires [`CommitmentTree`][2]s. Implementing
 /// [`incrementalmerkletree::Hashable`] for [`Node`]s allows the conversion.
 ///
-/// [1]: bridgetree::Frontier
-/// [2]: https://zcash.github.io/rpc/z_gettreestate.html
-/// [3]: incrementalmerkletree::frontier::CommitmentTree
+/// [1]: https://zcash.github.io/rpc/z_gettreestate.html
+/// [2]: incrementalmerkletree::frontier::CommitmentTree
 impl HashSer for Node {
     fn read<R: io::Read>(mut reader: R) -> io::Result<Self> {
         let mut node = [0u8; 32];
@@ -218,6 +264,18 @@ impl From<jubjub::Fq> for Node {
     }
 }
 
+impl TryFrom<&[u8]> for Node {
+    type Error = &'static str;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Option::<jubjub::Fq>::from(jubjub::Fq::from_bytes(
+            bytes.try_into().map_err(|_| "wrong byte slice len")?,
+        ))
+        .map(Node::from)
+        .ok_or("invalid jubjub field element")
+    }
+}
+
 impl serde::Serialize for Node {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -251,7 +309,7 @@ pub enum NoteCommitmentTreeError {
 #[serde(into = "LegacyNoteCommitmentTree")]
 #[serde(from = "LegacyNoteCommitmentTree")]
 pub struct NoteCommitmentTree {
-    /// The tree represented as a [`Frontier`](bridgetree::Frontier).
+    /// The tree represented as a [`Frontier`].
     ///
     /// A Frontier is a subset of the tree that allows to fully specify it.
     /// It consists of nodes along the rightmost (newer) branch of the tree that
@@ -310,6 +368,163 @@ impl NoteCommitmentTree {
         } else {
             Err(NoteCommitmentTreeError::FullTree)
         }
+    }
+
+    /// Returns frontier of non-empty tree, or None.
+    fn frontier(&self) -> Option<&NonEmptyFrontier<Node>> {
+        self.inner.value()
+    }
+
+    /// Returns the position of the most recently appended leaf in the tree.
+    ///
+    /// This method is used for debugging, use `incrementalmerkletree::Address` for tree operations.
+    pub fn position(&self) -> Option<u64> {
+        let Some(tree) = self.frontier() else {
+            // An empty tree doesn't have a previous leaf.
+            return None;
+        };
+
+        Some(tree.position().into())
+    }
+
+    /// Returns true if this tree has at least one new subtree, when compared with `prev_tree`.
+    pub fn contains_new_subtree(&self, prev_tree: &Self) -> bool {
+        // Use -1 for the index of the subtree with no notes, so the comparisons are valid.
+        let index = self.subtree_index().map_or(-1, |index| i32::from(index.0));
+        let prev_index = prev_tree
+            .subtree_index()
+            .map_or(-1, |index| i32::from(index.0));
+
+        // This calculation can't overflow, because we're using i32 for u16 values.
+        let index_difference = index - prev_index;
+
+        // There are 4 cases we need to handle:
+        // - lower index: never a new subtree
+        // - equal index: sometimes a new subtree
+        // - next index: sometimes a new subtree
+        // - greater than the next index: always a new subtree
+        //
+        // To simplify the function, we deal with the simple cases first.
+
+        // There can't be any new subtrees if the current index is strictly lower.
+        if index < prev_index {
+            return false;
+        }
+
+        // There is at least one new subtree, even if there is a spurious index difference.
+        if index_difference > 1 {
+            return true;
+        }
+
+        // If the indexes are equal, there can only be a new subtree if `self` just completed it.
+        if index == prev_index {
+            return self.is_complete_subtree();
+        }
+
+        // If `self` is the next index, check if the last note completed a subtree.
+        if self.is_complete_subtree() {
+            return true;
+        }
+
+        // Then check for spurious index differences.
+        //
+        // There is one new subtree somewhere in the trees. It is either:
+        // - a new subtree at the end of the previous tree, or
+        // - a new subtree in this tree (but not at the end).
+        //
+        // Spurious index differences happen because the subtree index only increases when the
+        // first note is added to the new subtree. So we need to exclude subtrees completed by the
+        // last note commitment in the previous tree.
+        //
+        // We also need to exclude empty previous subtrees, because the index changes to zero when
+        // the first note is added, but a subtree wasn't completed.
+        if prev_tree.is_complete_subtree() || prev_index == -1 {
+            return false;
+        }
+
+        // A new subtree was completed by a note commitment that isn't in the previous tree.
+        true
+    }
+
+    /// Returns true if the most recently appended leaf completes the subtree
+    pub fn is_complete_subtree(&self) -> bool {
+        let Some(tree) = self.frontier() else {
+            // An empty tree can't be a complete subtree.
+            return false;
+        };
+
+        tree.position()
+            .is_complete_subtree(TRACKED_SUBTREE_HEIGHT.into())
+    }
+
+    /// Returns the subtree index at [`TRACKED_SUBTREE_HEIGHT`].
+    /// This is the number of complete or incomplete subtrees that are currently in the tree.
+    /// Returns `None` if the tree is empty.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn subtree_index(&self) -> Option<NoteCommitmentSubtreeIndex> {
+        let tree = self.frontier()?;
+
+        let index = incrementalmerkletree::Address::above_position(
+            TRACKED_SUBTREE_HEIGHT.into(),
+            tree.position(),
+        )
+        .index()
+        .try_into()
+        .expect("fits in u16");
+
+        Some(index)
+    }
+
+    /// Returns the number of leaf nodes required to complete the subtree at
+    /// [`TRACKED_SUBTREE_HEIGHT`].
+    ///
+    /// Returns `2^TRACKED_SUBTREE_HEIGHT` if the tree is empty.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn remaining_subtree_leaf_nodes(&self) -> usize {
+        let remaining = match self.frontier() {
+            // If the subtree has at least one leaf node, the remaining number of nodes can be
+            // calculated using the maximum subtree position and the current position.
+            Some(tree) => {
+                let max_position = incrementalmerkletree::Address::above_position(
+                    TRACKED_SUBTREE_HEIGHT.into(),
+                    tree.position(),
+                )
+                .max_position();
+
+                max_position - tree.position().into()
+            }
+            // If the subtree has no nodes, the remaining number of nodes is the number of nodes in
+            // a subtree.
+            None => {
+                let subtree_address = incrementalmerkletree::Address::above_position(
+                    TRACKED_SUBTREE_HEIGHT.into(),
+                    // This position is guaranteed to be in the first subtree.
+                    0.into(),
+                );
+
+                assert_eq!(
+                    subtree_address.position_range_start(),
+                    0.into(),
+                    "address is not in the first subtree"
+                );
+
+                subtree_address.position_range_end()
+            }
+        };
+
+        u64::from(remaining).try_into().expect("fits in usize")
+    }
+
+    /// Returns subtree index and root if the most recently appended leaf completes the subtree
+    pub fn completed_subtree_index_and_root(&self) -> Option<(NoteCommitmentSubtreeIndex, Node)> {
+        if !self.is_complete_subtree() {
+            return None;
+        }
+
+        let index = self.subtree_index()?;
+        let root = self.frontier()?.root(Some(TRACKED_SUBTREE_HEIGHT.into()));
+
+        Some((index, root))
     }
 
     /// Returns the current root of the tree, used as an anchor in Sapling
@@ -424,7 +639,13 @@ impl Eq for NoteCommitmentTree {}
 
 impl PartialEq for NoteCommitmentTree {
     fn eq(&self, other: &Self) -> bool {
-        self.hash() == other.hash()
+        if let (Some(root), Some(other_root)) = (self.cached_root(), other.cached_root()) {
+            // Use cached roots if available
+            root == other_root
+        } else {
+            // Avoid expensive root recalculations which use multiple cryptographic hashes
+            self.inner == other.inner
+        }
     }
 }
 
@@ -449,13 +670,13 @@ impl From<Vec<jubjub::Fq>> for NoteCommitmentTree {
 ///
 /// The format of the serialized data is compatible with
 /// [`CommitmentTree`](incrementalmerkletree::frontier::CommitmentTree) from `librustzcash` and not
-/// with [`Frontier`](bridgetree::Frontier) from the crate
+/// with [`Frontier`] from the crate
 /// [`incrementalmerkletree`]. Zebra follows the former format in order to stay
 /// consistent with `zcashd` in RPCs. Note that [`NoteCommitmentTree`] itself is
-/// represented as [`Frontier`](bridgetree::Frontier).
+/// represented as [`Frontier`].
 ///
 /// The formats are semantically equivalent. The primary difference between them
-/// is that in [`Frontier`](bridgetree::Frontier), the vector of parents is
+/// is that in [`Frontier`], the vector of parents is
 /// dense (we know where the gaps are from the position of the leaf in the
 /// overall tree); whereas in [`CommitmentTree`](incrementalmerkletree::frontier::CommitmentTree),
 /// the vector of parent hashes is sparse with [`None`] values in the gaps.
@@ -466,7 +687,7 @@ impl From<Vec<jubjub::Fq>> for NoteCommitmentTree {
 ///
 /// It is likely that the dense format will be used in future RPCs, in which
 /// case the current implementation will have to change and use the format
-/// compatible with [`Frontier`](bridgetree::Frontier) instead.
+/// compatible with [`Frontier`] instead.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SerializedTree(Vec<u8>);
 

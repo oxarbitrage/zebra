@@ -10,8 +10,12 @@ use std::collections::BTreeMap;
 use bincode::Options;
 
 use zebra_chain::{
-    amount::NonNegative, block::Height, history_tree::NonEmptyHistoryTree, parameters::Network,
-    primitives::zcash_history, value_balance::ValueBalance,
+    amount::NonNegative,
+    block::Height,
+    history_tree::{HistoryTree, NonEmptyHistoryTree},
+    parameters::Network,
+    primitives::zcash_history,
+    value_balance::ValueBalance,
 };
 
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
@@ -30,6 +34,13 @@ impl FromDisk for ValueBalance<NonNegative> {
         ValueBalance::from_bytes(array).unwrap()
     }
 }
+
+// The following implementations for history trees use `serde` and
+// `bincode`. `serde` serializations depend on the inner structure of the type.
+// They should not be used in new code. (This is an issue for any derived serialization format.)
+//
+// We explicitly use `bincode::DefaultOptions`  to disallow trailing bytes; see
+// https://docs.rs/bincode/1.3.3/bincode/config/index.html#options-struct-vs-bincode-functions
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HistoryTreeParts {
@@ -69,5 +80,12 @@ impl FromDisk for NonEmptyHistoryTree {
             parts.current_height,
         )
         .expect("deserialization format should match the serialization format used by IntoDisk")
+    }
+}
+
+// We don't write empty history trees to disk, so we know this one is non-empty.
+impl FromDisk for HistoryTree {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        NonEmptyHistoryTree::from_bytes(bytes).into()
     }
 }

@@ -33,17 +33,34 @@ We try to use Mergify as much as we can, so all PRs get consistent checks.
 Some PRs don't use Mergify:
 - Mergify config updates
 - Admin merges, which happen when there are multiple failures on the `main` branch
-- Manual merges
+  (these are disabled by our branch protection rules, but admins can remove the "don't allow bypassing these rules" setting)
+- Manual merges (these are usually disabled by our branch protection rules)
 
 We use workflow conditions to skip some checks on PRs, Mergify, or the `main` branch.
-For example, some workflow changes skip Rust code checks.
+For example, some workflow changes skip Rust code checks. When a workflow can skip a check, we need to create [a patch workflow](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks)
+with an empty job with the same name. This is a [known Actions issue](https://github.com/orgs/community/discussions/13690#discussioncomment-6653382).
+This lets the branch protection rules pass when the job is skipped. In Zebra, we name these workflows with the extension `.patch.yml`.
+
+Branch protection rules should be added for every failure that should stop a PR merging, break a release, or cause problems for Zebra users.
+We also add branch protection rules for developer or devops features that we need to keep working, like coverage.
+
+But the following jobs don't need branch protection rules:
+* Testnet jobs: testnet is unreliable.
+* Optional linting jobs: some lint jobs are required, but some jobs like spelling and actions are optional.
+* Jobs that rarely run: for example, cached state rebuild jobs.
+* Setup jobs that will fail another later job which always runs, for example: Google Cloud setup jobs.
+  We have branch protection rules for build jobs, but we could remove them if we want.
+
+When a new job is added in a PR, use the `#devops` Slack channel to ask a GitHub admin to add a branch protection rule after it merges.
+Adding a new Zebra crate automatically adds a new job to build that crate by itself in [ci-build-crates.yml](https://github.com/ZcashFoundation/zebra/blob/main/.github/workflows/ci-build-crates.yml),
+so new crate PRs also need to add a branch protection rule.
 
 ### Pull Requests from Forked Repositories
 
 GitHub doesn't allow PRs from forked repositories to have access to our repository secret keys, even after we approve their CI.
 This means that Google Cloud CI fails on these PRs.
 
-Unril we [fix this CI bug](https://github.com/ZcashFoundation/zebra/issues/4529), we can merge external PRs by:
+Until we [fix this CI bug](https://github.com/ZcashFoundation/zebra/issues/4529), we can merge external PRs by:
 1. Reviewing the code to make sure it won't give our secret keys to anyone
 2. Pushing a copy of the branch to the Zebra repository
 3. Opening a PR using that branch
@@ -90,7 +107,7 @@ This means that the entire workflow must be re-run when a single test fails.
 1. Look for the earliest job that failed, and find the earliest failure.
 
 For example, this failure doesn't tell us what actually went wrong:
->  Error: The template is not valid. ZcashFoundation/zebra/.github/workflows/build-docker-image.yml@8bbc5b21c97fafc83b70fbe7f3b5e9d0ffa19593 (Line: 52, Col: 19): Error reading JToken from JsonReader. Path '', line 0, position 0.
+>  Error: The template is not valid. ZcashFoundation/zebra/.github/workflows/sub-build-docker-image.yml@8bbc5b21c97fafc83b70fbe7f3b5e9d0ffa19593 (Line: 52, Col: 19): Error reading JToken from JsonReader. Path '', line 0, position 0.
 
 https://github.com/ZcashFoundation/zebra/runs/8181760421?check_suite_focus=true#step:41:4
 
@@ -115,16 +132,7 @@ CI sync jobs near the tip will take different amounts of time as:
 To fix a CI sync timeout, follow these steps until the timeouts are fixed:
 1. Check for recent PRs that could have caused a performance decrease
 2. [Update Zebra's checkpoints](https://github.com/ZcashFoundation/zebra/blob/main/zebra-utils/README.md#zebra-checkpoints)
-3. Wait for a full or update sync to finish with the new checkpoints
-
-4. The GitHub actions job limit is 6 hours, so the ideal job time is 4-5 hours.
-   If any GitHub actions job times out, or takes over 5 hours:
-
-    a. [Split the job based on the sync height](https://github.com/ZcashFoundation/zebra/pull/4961/files#diff-4c3718f100312ddc9472f5d4ab2ee0a50a46f2af21352a25fca849734e3f7514R732), or
-
-    b. Adjust the sync heights in existing jobs.
-
-5. If a Rust test fails with "command did not log any matches for the given regex, within the ... timeout":
+3. If a Rust test fails with "command did not log any matches for the given regex, within the ... timeout":
 
     a. If it's the full sync test, [increase the full sync timeout](https://github.com/ZcashFoundation/zebra/pull/5129/files)
 
@@ -164,14 +172,19 @@ To fix duplicate dependencies, follow these steps until the duplicate dependenci
 
 4. Repeat step 3 until the dependency warnings are fixed. Adding a single `skip-tree` exception can resolve multiple warnings.
 
-### Fixing Disk Full Errors and Zcash Parameter Errors
+#### Fixing "unmatched skip root" warnings in `Check deny.toml bans`
+
+1. Run `cargo deny --all-features check bans`, or look at the output of the latest "Check deny.toml bans --all-features" job on the `main` branch
+
+2. If there are any "skip tree root was not found in the dependency graph" warnings, delete those versions from `deny.toml`
+
+### Fixing Disk Full Errors
 
 If the Docker cached state disks are full, increase the disk sizes in:
 - [deploy-gcp-tests.yml](https://github.com/ZcashFoundation/zebra/blob/main/.github/workflows/deploy-gcp-tests.yml)
 - [continous-delivery.yml](https://github.com/ZcashFoundation/zebra/blob/main/.github/workflows/continous-delivery.yml)
 
-If the GitHub Actions disks are full, or the Zcash parameter downloads time out without any network messages or errors,
-follow these steps until the errors are fixed:
+If the GitHub Actions disks are full, follow these steps until the errors are fixed:
 
 0. Check if error is also happening on the `main` branch. If it is, skip the next step.
 1. Update your branch to the latest `main` branch, this builds with all the latest dependencies in the `main` branch cache.
@@ -179,11 +192,6 @@ follow these steps until the errors are fixed:
 3. Clear the GitHub Actions code caches for all the branches and the `main` branch.
 
 These errors often happen after a new compiler version is released, because the caches can end up with files from both compiler versions.
-
-If the Zcash Parameter downloads have an error loading the parameters:
-1. Clear the Zcash parameter caches for all branches, including `main`
-
-The correct `*-sprout-and-sapling-params` caches should be around 765 MB.
 
 You can find a list of caches using:
 ```sh

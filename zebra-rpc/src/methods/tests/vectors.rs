@@ -16,6 +16,7 @@ use zebra_chain::{
 };
 use zebra_node_services::BoxError;
 
+use zebra_state::{LatestChainTip, ReadStateService};
 use zebra_test::mock_service::MockService;
 
 use super::super::*;
@@ -288,7 +289,7 @@ async fn rpc_getblock_missing_error() {
     );
 
     // Make sure Zebra returns the correct error code `-8` for missing blocks
-    // https://github.com/adityapk00/lightwalletd/blob/c1bab818a683e4de69cd952317000f9bb2932274/common/common.go#L251-L254
+    // https://github.com/zcash/lightwalletd/blob/v0.4.16/common/common.go#L287-L290
     let block_future = tokio::spawn(rpc.get_block("0".to_string(), Some(0u8)));
 
     // Make the mock service respond with no block
@@ -674,19 +675,36 @@ async fn rpc_getaddresstxids_response() {
             .address(network)
             .unwrap();
 
+        // Create a populated state service
+        let (_state, read_state, latest_chain_tip, _chain_tip_change) =
+            zebra_state::populated_state(blocks.to_owned(), network).await;
+
         if network == Mainnet {
             // Exhaustively test possible block ranges for mainnet.
             //
             // TODO: if it takes too long on slower machines, turn this into a proptest with 10-20 cases
             for start in 1..=10 {
                 for end in start..=10 {
-                    rpc_getaddresstxids_response_with(network, start..=end, &blocks, &address)
-                        .await;
+                    rpc_getaddresstxids_response_with(
+                        network,
+                        start..=end,
+                        &address,
+                        &read_state,
+                        &latest_chain_tip,
+                    )
+                    .await;
                 }
             }
         } else {
             // Just test the full range for testnet.
-            rpc_getaddresstxids_response_with(network, 1..=10, &blocks, &address).await;
+            rpc_getaddresstxids_response_with(
+                network,
+                1..=10,
+                &address,
+                &read_state,
+                &latest_chain_tip,
+            )
+            .await;
         }
     }
 }
@@ -694,13 +712,11 @@ async fn rpc_getaddresstxids_response() {
 async fn rpc_getaddresstxids_response_with(
     network: Network,
     range: RangeInclusive<u32>,
-    blocks: &[Arc<Block>],
     address: &transparent::Address,
+    read_state: &ReadStateService,
+    latest_chain_tip: &LatestChainTip,
 ) {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    // Create a populated state service
-    let (_state, read_state, latest_chain_tip, _chain_tip_change) =
-        zebra_state::populated_state(blocks.to_owned(), network).await;
 
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
         "RPC test",
@@ -710,7 +726,7 @@ async fn rpc_getaddresstxids_response_with(
         true,
         Buffer::new(mempool.clone(), 1),
         Buffer::new(read_state.clone(), 1),
-        latest_chain_tip,
+        latest_chain_tip.clone(),
     );
 
     // call the method with valid arguments
@@ -1148,32 +1164,39 @@ async fn rpc_getnetworksolps() {
     );
 
     let get_network_sol_ps_inputs = [
-        (None, None),
-        (Some(0), None),
-        (Some(0), Some(0)),
-        (Some(0), Some(-1)),
-        (Some(0), Some(10)),
-        (Some(0), Some(i32::MAX)),
-        (Some(1), None),
-        (Some(1), Some(0)),
-        (Some(1), Some(-1)),
-        (Some(1), Some(10)),
-        (Some(1), Some(i32::MAX)),
-        (Some(usize::MAX), None),
-        (Some(usize::MAX), Some(0)),
-        (Some(usize::MAX), Some(-1)),
-        (Some(usize::MAX), Some(10)),
-        (Some(usize::MAX), Some(i32::MAX)),
+        // num_blocks, height, return value
+        (None, None, Ok(2)),
+        (Some(-4), None, Ok(2)),
+        (Some(-3), Some(0), Ok(0)),
+        (Some(-2), Some(-4), Ok(2)),
+        (Some(-1), Some(10), Ok(2)),
+        (Some(-1), Some(i32::MAX), Ok(2)),
+        (Some(0), None, Ok(2)),
+        (Some(0), Some(0), Ok(0)),
+        (Some(0), Some(-3), Ok(2)),
+        (Some(0), Some(10), Ok(2)),
+        (Some(0), Some(i32::MAX), Ok(2)),
+        (Some(1), None, Ok(4096)),
+        (Some(1), Some(0), Ok(0)),
+        (Some(1), Some(-2), Ok(4096)),
+        (Some(1), Some(10), Ok(4096)),
+        (Some(1), Some(i32::MAX), Ok(4096)),
+        (Some(i32::MAX), None, Ok(2)),
+        (Some(i32::MAX), Some(0), Ok(0)),
+        (Some(i32::MAX), Some(-1), Ok(2)),
+        (Some(i32::MAX), Some(10), Ok(2)),
+        (Some(i32::MAX), Some(i32::MAX), Ok(2)),
     ];
 
-    for (num_blocks_input, height_input) in get_network_sol_ps_inputs {
+    for (num_blocks_input, height_input, return_value) in get_network_sol_ps_inputs {
         let get_network_sol_ps_result = get_block_template_rpc
             .get_network_sol_ps(num_blocks_input, height_input)
             .await;
-        assert!(
-            get_network_sol_ps_result
-                .is_ok(),
-            "get_network_sol_ps({num_blocks_input:?}, {height_input:?}) call with should be ok, got: {get_network_sol_ps_result:?}"
+        assert_eq!(
+            get_network_sol_ps_result, return_value,
+            "get_network_sol_ps({num_blocks_input:?}, {height_input:?}) result\n\
+             should be {return_value:?},\n\
+             got: {get_network_sol_ps_result:?}"
         );
     }
 }
@@ -1203,7 +1226,6 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
 
     use crate::methods::{
         get_block_template_rpcs::{
-            config::Config,
             constants::{
                 GET_BLOCK_TEMPLATE_CAPABILITIES_FIELD, GET_BLOCK_TEMPLATE_MUTABLE_FIELD,
                 GET_BLOCK_TEMPLATE_NONCE_RANGE_FIELD,
@@ -1229,7 +1251,7 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         true => Some(transparent::Address::from_pub_key_hash(Mainnet, [0x7e; 20])),
     };
 
-    let mining_config = Config {
+    let mining_config = crate::config::mining::Config {
         miner_address,
         extra_coinbase_data: None,
         debug_like_zcashd: true,
@@ -1668,9 +1690,7 @@ async fn rpc_getdifficulty() {
 
     use zebra_state::{GetBlockTemplateChainInfo, ReadRequest, ReadResponse};
 
-    use crate::methods::{
-        get_block_template_rpcs::config::Config, tests::utils::fake_history_tree,
-    };
+    use crate::{config::mining::Config, methods::tests::utils::fake_history_tree};
 
     let _init_guard = zebra_test::init();
 

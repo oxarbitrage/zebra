@@ -11,6 +11,16 @@
 #![doc(html_favicon_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-icon.png")]
 #![doc(html_root_url = "https://doc.zebra.zfnd.org/zebra_state")]
+//
+// Rust 1.72 has a false positive when nested generics are used inside Arc.
+// This makes the `arc_with_non_send_sync` lint trigger on a lot of proptest code.
+//
+// TODO: remove this allow when Rust 1.73 is stable, because this lint bug is fixed in that release:
+// <https://github.com/rust-lang/rust-clippy/issues/11076>
+#![cfg_attr(
+    any(test, feature = "proptest-impl"),
+    allow(clippy::arc_with_non_send_sync)
+)]
 
 #[macro_use]
 extern crate tracing;
@@ -56,11 +66,14 @@ pub use response::GetBlockTemplateChainInfo;
 pub use service::{
     arbitrary::{populated_state, CHAIN_TIP_UPDATE_WAIT_LIMIT},
     chain_tip::{ChainTipBlock, ChainTipSender},
-    finalized_state::{DiskWriteBatch, WriteDisk, MAX_ON_DISK_HEIGHT},
+    finalized_state::{DiskWriteBatch, MAX_ON_DISK_HEIGHT},
     init_test, init_test_services, ReadStateService,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use config::write_database_format_version_to_disk;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use constants::latest_version_for_adding_subtrees;
 
 pub(crate) use request::ContextuallyVerifiedBlock;

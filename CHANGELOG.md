@@ -5,8 +5,145 @@ All notable changes to Zebra are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [Zebra 1.1.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.1.0) - 2023-07-18
+## [Zebra 1.4.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.4.0) - TODO: DATE
 
+Zebra's mining RPCs are now available in release builds. TODO: rest of intro
+
+This release contains the following changes:
+
+### Mining RPCs in Production Builds
+
+Zebra's mining RPCs are now available in release builds (#7740). Any Zebra instance can be used
+by a solo miner or mining pool. This stabilises 12 RPCs, including  `getblocktemplate`, `submitblock`,
+`getmininginfo`, `getnetworksolps`, `[z_]validateaddress` and `getblocksubsidy`. For more information,
+read our [mining blog post](https://zfnd.org/experimental-mining-support-in-zebra/).
+
+Please [let us know](https://github.com/ZcashFoundation/zebra/issues/new?assignees=&labels=C-enhancement%2CS-needs-triage&projects=&template=feature_request.yml&title=feature%3A+)
+if your mining pool needs extra RPC methods or fields.
+
+### Parameters in Binary
+
+`zebrad` now bundles zk-SNARK parameters directly into its binary. This increases the binary size
+by a few megabytes, but these parameters do not need to be downloaded or stored separately.
+
+Previously, parameters were stored by default in these locations:
+
+* `~/.zcash-params` (on Linux); or
+* `~/Library/Application Support/ZcashParams` (on Mac); or
+* `C:\Users\Username\AppData\Roaming\ZcashParams` (on Windows)
+
+If you have upgraded `zebrad` to 1.4.0 or later, and `zcashd` to 5.7.0 or later, you can delete the
+parameter files in these directories to save approximately 700 MB disk space.
+
+[`zcashd` have deprecated their `fetch-params.sh` script](https://github.com/zcash/zcash/blob/master/doc/release-notes/release-notes-5.7.0.md#deprecation-of-fetch-paramssh),
+so it can't be used to retry failed downloads in `zebrad` 1.3.0 and earlier.
+
+We recommend upgrading to the latest Zebra release to avoid download issues in new installs.
+
+### Security
+
+TODO: rest of changelog
+
+## [Zebra 1.3.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.3.0) - 2023-10-16
+
+This release adds RPC methods for the "Spend before Sync" light wallet feature,
+and fixes performance issues and bugs in the mining solution rate RPCs. Progress
+bars can now be enabled using a config, please help us test them!
+
+It contains the following updates:
+
+### User Testing: Progress Bars
+
+Zebra has progress bars! When progress bars are enabled, you can see Zebra's blocks,
+transactions, and peer connections in your terminal. We're asking Zebra users to test this
+feature, and give us [feedback on the forums](https://forum.zcashcommunity.com/t/zebra-progress-bars/44485).
+
+To show progress bars while running Zebra, add these lines to your `zebrad.toml`:
+```toml
+[tracing]
+progress_bar = "summary"
+```
+
+For more details, including a known issue with time estimates,
+read our [progress bars blog post](https://zfnd.org/experimental-zebra-progress-bars/).
+
+### Security
+
+- Fix database concurrency bugs that could have led to panics or incorrect history tree data (#7590, #7663)
+
+### Added
+
+- Zebra's progress bars can now be enabled using a `zebrad.toml` config (#7615)
+- Add missing elasticsearch flag feature to lib docs (#7568)
+- Add missing Docker variables and examples (#7552)
+- Check database format is valid on startup and shutdown (#7566, #7606). We expect to catch almost all database validity errors in CI (#7602, #7627), so users are unlikely to see them on startup or shutdown.
+
+#### Spend before Sync Support
+
+- Add state requests and support code for the `z_getsubtreesbyindex` RPC (#7408, #7734)
+- Implement the `z_getsubtreesbyindex` RPC (#7436)
+- Test the `z_getsubtreesbyindex` RPC (#7515, #7521, #7566, #7514, #7628)
+- Format subtree roots in little-endian order (#7466)
+- Add note subtree indexes for new and existing blocks (#7437)
+- Upgrade subtrees from the tip backwards, for compatibility with wallet syncing (#7531)
+- Handle a subtree comparison edge case correctly (#7587)
+
+### Changed
+
+- Return errors instead of panicking in methods for Heights (#7591)
+- Update tests for compatibility with the ECC's `lightwalletd` fork (#7349)
+
+### Fixed
+
+- Refactor docs for feature flags (#7567)
+- Match zcashd's getblockchaininfo capitalisation for NU5 (#7454)
+- Fix bugs and performance of `getnetworksolps` & `getnetworkhashps` RPCs (#7647)
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @gustavovalverde, @oxarbitrage, @rex4539, @teor2345 and @upbqdn.
+
+## [Zebra 1.2.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.2.0) - 2023-09-01
+
+### Highlights
+
+This release:
+
+- Starts our work implementing "spend before sync" algorithm for lightwalletd.
+- Contains an automatic database upgrade that reduces the size of Zebra's current cached state from approximately 276GB to 244GB. It does so by automatically pruning unneeded note commitment trees from an existing cache. New Zebra instances will also build their cache without these trees.
+
+### Breaking Changes
+
+`zebrad` 1.2.0 cached states are incompatible with previous `zebrad` versions:
+
+- `zebrad` 1.2.0 upgrades the cached state format. The new format is incompatible with previous `zebrad` versions. After upgrading to this Zebra version, don't downgrade to an earlier version.
+- When earlier versions try to use states upgraded by `zebrad` 1.2.0:
+    - `zebrad` versions 1.0.0 and 1.0.1 will respond to some `z_gettreestate` RPC requests with incorrect empty `final_state` fields
+    - pre-release `zebrad` versions can panic when verifying shielded transactions, updating the state, or responding to RPC requests
+
+### Changed
+
+- Deduplicate note commitment trees stored in the finalized state ([#7312](https://github.com/ZcashFoundation/zebra/pull/7312), [#7379](https://github.com/ZcashFoundation/zebra/pull/7379))
+- Insert only the first tree in each series of identical trees into finalized state ([#7266](https://github.com/ZcashFoundation/zebra/pull/7266))
+- Our testing framework now uses the ECC lightwalletd fork ([#7307](https://github.com/ZcashFoundation/zebra/pull/7307)). This was needed to start the work of implementing fast spendability. The ECC repo is now the supported implementation in Zebra, documentation was changed to reflect this. ([#7427](https://github.com/ZcashFoundation/zebra/pull/7427))
+
+### Added
+
+- Documentation for mining with Docker ([#7179](https://github.com/ZcashFoundation/zebra/pull/7179))
+- Note tree sizes field to `getblock` RPC method ([#7278](https://github.com/ZcashFoundation/zebra/pull/7278))
+- Note commitment subtree types to zebra-chain ([#7371](https://github.com/ZcashFoundation/zebra/pull/7371))
+- Note subtree index handling to zebra-state, but we're not writing subtrees to the finalized state yet ([#7334](https://github.com/ZcashFoundation/zebra/pull/7334))
+
+### Fixed
+
+- Log a warning instead of panicking for unused mining configs ([#7290](https://github.com/ZcashFoundation/zebra/pull/7290))
+- Avoid expensive note commitment tree root recalculations in eq() methods ([#7386](https://github.com/ZcashFoundation/zebra/pull/7386))
+- Use the correct state version for databases without a state version file ([#7385](https://github.com/ZcashFoundation/zebra/pull/7385))
+- Avoid temporary failures verifying the first non-finalized block or attempting to fork the chain before the final checkpoint ([#6810](https://github.com/ZcashFoundation/zebra/pull/6810))
+- If a database format change is cancelled, also cancel the format check, and don't mark the database as upgraded ([#7442](https://github.com/ZcashFoundation/zebra/pull/7442))
+
+## [Zebra 1.1.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.1.0) - 2023-07-18
 
 This release adds new mempool metrics, fixes panics when cancelling tasks on shutdown, detects subcommand name typos on the command-line, and improves the usability of Zebra's Docker images (particularly for mining).
 
