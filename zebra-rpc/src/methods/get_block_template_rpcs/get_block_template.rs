@@ -176,6 +176,7 @@ where
             data: None,
         })?;
 
+    /*
     if !sync_status.is_close_to_tip()
         || estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP
     {
@@ -196,7 +197,9 @@ where
             ),
             data: None,
         });
+        
     }
+    */
 
     Ok(())
 }

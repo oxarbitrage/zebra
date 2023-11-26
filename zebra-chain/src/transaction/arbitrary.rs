@@ -791,6 +791,12 @@ impl Arbitrary for Transaction {
                 Self::v5_strategy(ledger_state)
             ]
             .boxed(),
+            NetworkUpgrade::Nu6 => prop_oneof![
+                Self::v4_strategy(ledger_state),
+                Self::v5_strategy(ledger_state)
+            ]
+            .boxed()
+
         }
     }
 
