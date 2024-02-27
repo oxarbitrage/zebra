@@ -57,7 +57,7 @@ rand = "0.8.5"
 rayon = "1.8.1"
 regex = "1.10.3"
 serde = { version = "1.0.196", features = ["serde_derive"] }
-tempfile = "3.10.0"
+tempfile = "3.10.1"
 thiserror = "1.0.57"
 
 futures = "0.3.30"
