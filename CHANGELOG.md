@@ -5,13 +5,239 @@ All notable changes to Zebra are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [Zebra 1.4.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.4.0) - TODO: DATE
+## [Zebra 1.6.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.6.0) - 2024-02-23
 
-Zebra's mining RPCs are now available in release builds. TODO: rest of intro
+This release exposes the shielded scanning functionality through an initial
+version of a gRPC server, documented in the [Zebra
+Book](https://zebra.zfnd.org/user/shielded-scan-grpc-server.html).
 
-This release contains the following changes:
+> [!NOTE]
+> Building Zebra now depends on
+> [`protoc`](https://github.com/protocolbuffers/protobuf). See the [Build
+> Instructions](https://github.com/ZcashFoundation/zebra?tab=readme-ov-file#building-zebra)
+> for more details.
 
-### Mining RPCs in Production Builds
+### Added
+
+- Add `docker-compose` file to run CI locally ([#8209](https://github.com/ZcashFoundation/zebra/pull/8209))
+- Allow users to use Zebra + LWD with persistent states ([#8215](https://github.com/ZcashFoundation/zebra/pull/8215))
+
+#### Scanner
+
+- Add a new `zebra-grpc` crate ([#8167](https://github.com/ZcashFoundation/zebra/pull/8167))
+- Start scanner gRPC server with `zebrad` ([#8241](https://github.com/ZcashFoundation/zebra/pull/8241))
+- Add gRPC server reflection and document how to use the gRPC server ([#8288](https://github.com/ZcashFoundation/zebra/pull/8288))
+- Add the `GetInfo` gRPC method ([#8178](https://github.com/ZcashFoundation/zebra/pull/8178))
+- Add the `GetResults` gRPC method ([#8255](https://github.com/ZcashFoundation/zebra/pull/8255))
+- Add the `Scan` gRPC method ([#8268](https://github.com/ZcashFoundation/zebra/pull/8268), [#8303](https://github.com/ZcashFoundation/zebra/pull/8303))
+- Add the `RegisterKeys` gRPC method ([#8266](https://github.com/ZcashFoundation/zebra/pull/8266))
+- Add the `ClearResults` and `DeleteKeys` gRPC methods ([#8237](https://github.com/ZcashFoundation/zebra/pull/8237))
+- Add snapshot tests for new gRPCs ([#8277](https://github.com/ZcashFoundation/zebra/pull/8277))
+- Add unit tests for new gRPCs ([#8293](https://github.com/ZcashFoundation/zebra/pull/8293))
+- Create a tower Service in `zebra-scan` ([#8185](https://github.com/ZcashFoundation/zebra/pull/8185))
+- Implement the `SubscribeResults` scan service request ([#8253](https://github.com/ZcashFoundation/zebra/pull/8253))
+- Implement the `ClearResults` scan service request ([#8219](https://github.com/ZcashFoundation/zebra/pull/8219))
+- Implement the `DeleteKeys` scan service request ([#8217](https://github.com/ZcashFoundation/zebra/pull/8217))
+- Implement the `RegisterKeys` scan service request ([#8251](https://github.com/ZcashFoundation/zebra/pull/8251))
+- Implement the `Results` scan service request ([#8224](https://github.com/ZcashFoundation/zebra/pull/8224))
+- Test the `RegisterKeys` scan service request ([#8281](https://github.com/ZcashFoundation/zebra/pull/8281))
+- Add `ViewingKey` type in `zebra-chain` ([#8198](https://github.com/ZcashFoundation/zebra/pull/8198))
+- Handle `RegisterKeys` messages in scan task ([#8222](https://github.com/ZcashFoundation/zebra/pull/8222))
+
+### Changed
+
+- Remove `rfc.md` file ([#8228](https://github.com/ZcashFoundation/zebra/pull/8228))
+- Update Debian from Bullseye to Bookworm in Docker ([#8273](https://github.com/ZcashFoundation/zebra/pull/8273))
+- Remove Zebra RFCs from `CONTRIBUTING.md` ([#8304](https://github.com/ZcashFoundation/zebra/pull/8304))
+- Publish fewer tags in Docker Hub ([#8300](https://github.com/ZcashFoundation/zebra/pull/8300))
+- Add Zebra crate versions to dev-dependencies and remove circular dev-dependencies ([#8171](https://github.com/ZcashFoundation/zebra/pull/8171))
+- Update docs for building Zebra ([#8315](https://github.com/ZcashFoundation/zebra/pull/8315))
+
+### Fixed
+
+- Set log rotation to avoid docker bugs ([#8269](https://github.com/ZcashFoundation/zebra/pull/8269))
+- Improve error message in `non_blocking_logger` test ([#8276](https://github.com/ZcashFoundation/zebra/pull/8276))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @bishopcheckmate, @chairulakmal, @gustavovalverde, @mpguerra, @oxarbitrage and @upbqdn.
+
+## [Zebra 1.5.2](https://github.com/ZcashFoundation/zebra/releases/tag/v1.5.2) - 2024-01-23
+
+This release serves as a hotfix for version 1.5.1, addressing issues encountered after its initial release. For more information about version 1.5.1, refer to [this link](https://github.com/ZcashFoundation/zebra/releases/tag/v1.5.2).
+
+Following the release on GitHub, we identified difficulties in publishing the `zebra-chain` crate to crates.io. Detailed information is available in [issue #8180](https://github.com/ZcashFoundation/zebra/issues/8180) and its references.
+
+Unfortunately, to resolve this challenge, which involves an unpublished dependency, we had to temporarily remove the internal miner support introduced in version 1.5.1.
+
+In our efforts to reinstate this feature, we've opened a tracking ticket to monitor the progress of the required code that must be merged into the `equihash` dependency. You can follow the developments in [issue #8183](https://github.com/ZcashFoundation/zebra/issues/8183), which will only be closed once the feature is successfully restored.
+
+### Breaking Changes
+
+- Temporally remove the internal miner functionality ([#8184](https://github.com/ZcashFoundation/zebra/pull/8184))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@oxarbitrage
+
+
+## [Zebra 1.5.1](https://github.com/ZcashFoundation/zebra/releases/tag/v1.5.1) - 2024-01-18
+
+This release:
+
+- Adds a utility for reading scanning results, and finalizes the MVP features of the scanner.
+- Adds an experimental `internal-miner` feature, which mines blocks within `zebrad`. This feature is only supported on testnet. Use a more efficient GPU or ASIC for mainnet mining.
+- Contains many documentation improvements.
+
+### Added
+
+- Add an internal Zcash miner to Zebra ([#8136](https://github.com/ZcashFoundation/zebra/pull/8136), [#8150](https://github.com/ZcashFoundation/zebra/pull/8150))
+- Blockchain scanner new features:
+  - Don't scan and log if we are below sapling height ([#8121](https://github.com/ZcashFoundation/zebra/pull/8121))
+  - Restart scanning where left ([#8080](https://github.com/ZcashFoundation/zebra/pull/8080))
+  - Add scanning result reader utility ([#8104](https://github.com/ZcashFoundation/zebra/pull/8104), [#8157](https://github.com/ZcashFoundation/zebra/pull/8157))
+- Note default path to config in docs ([#8143](https://github.com/ZcashFoundation/zebra/pull/8143))
+- Document how to add a column family ([#8149](https://github.com/ZcashFoundation/zebra/pull/8149))
+
+### Changed
+
+- Make sure scanner database is accessed using the correct types ([#8112](https://github.com/ZcashFoundation/zebra/pull/8112))
+- Move history tree and value balance to typed column families ([#8115](https://github.com/ZcashFoundation/zebra/pull/8115))
+- Refactor the user documentation for scanning  ([#8124](https://github.com/ZcashFoundation/zebra/pull/8124))
+- Refactor user \& dev documentation ([#8145](https://github.com/ZcashFoundation/zebra/pull/8145))
+- Improve feature flag docs ([#8114](https://github.com/ZcashFoundation/zebra/pull/8114))
+- Allow opening the database in a read-only mode ([#8079](https://github.com/ZcashFoundation/zebra/pull/8079))
+- Send all zebrad logs to the journal under systemd ([#7965](https://github.com/ZcashFoundation/zebra/pull/7965))
+
+### Fixed
+
+- Point to a manually created list of Zebra crates in docs ([#8160](https://github.com/ZcashFoundation/zebra/pull/8160))
+- Add shielded-scan.md to the index ([#8095](https://github.com/ZcashFoundation/zebra/pull/8095))
+- Elasticsearch feature, make bulk size the same for testnet and mainnet ([#8127](https://github.com/ZcashFoundation/zebra/pull/8127))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @bishopcheckmate, @gustavovalverde, @oxarbitrage, @sandakersmann, @teor2345 and @upbqdn
+
+
+## [Zebra 1.5.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.5.0) - 2023-11-28
+
+This release:
+- fixes a panic that was introduced in Zebra v1.4.0, which happens in rare circumstances when reading cached sprout or history trees.
+- further improves how Zebra recovers from network interruptions and prevents potential network hangs.
+- limits the ability of synthetic nodes to spread throughout the network through Zebra to address some of the Ziggurat red team report.
+
+As of this release, Zebra requires Rust 1.73 to build.
+
+Finally, we've added an experimental "shielded-scan" feature and the zebra-scan crate as steps
+towards supporting shielded scanning in Zebra. This feature has known security issues.
+It is for experimental use only. Ongoing development is tracked in issue [#7728](https://github.com/ZcashFoundation/zebra/issues/7728).
+
+### Important Security Warning
+
+Do not use regular or sensitive viewing keys with Zebra's experimental scanning feature. Do not use this
+feature on a shared machine. We suggest generating new keys for experimental use.
+
+### Security
+
+- security(net): Stop sending peer addresses from version messages directly to the address book ([#7977](https://github.com/ZcashFoundation/zebra/pull/7977))
+- security(net): Limit how many addresses are sent directly to the address book for a single peer address message ([#7952](https://github.com/ZcashFoundation/zebra/pull/7952))
+- security(net): Rate-limit GetAddr responses to avoid sharing the entire address book over a short period ([#7955](https://github.com/ZcashFoundation/zebra/pull/7955))
+
+### Added
+
+- feat(config): Add config field for the viewing keys used by zebra-scan ([#7949](https://github.com/ZcashFoundation/zebra/pull/7949))
+- feat(scan): Add on-disk database to store keys and scan results ([#7942](https://github.com/ZcashFoundation/zebra/pull/7942), [#8036](https://github.com/ZcashFoundation/zebra/pull/8036))
+- feat(scan): Spawn zebra-scan task from zebrad with configured viewing keys ([#7989](https://github.com/ZcashFoundation/zebra/pull/7989))
+- feat(scan): Create a scan_block function to use across scanning tasks ([#7994](https://github.com/ZcashFoundation/zebra/pull/7994))
+- feat(scan): Scan blocks with Sapling keys and write the results to the database ([#8040](https://github.com/ZcashFoundation/zebra/pull/8040))
+- poc(scan): Proof of concept for shielded scanning ([#7758](https://github.com/ZcashFoundation/zebra/pull/7758))
+- add(docker): Add `ldb` RocksDB query tool to the Dockerfile ([#8074](https://github.com/ZcashFoundation/zebra/pull/8074))
+
+### Changed
+
+- change(state): Expose ZebraDb methods that can create different kinds of databases ([#8002](https://github.com/ZcashFoundation/zebra/pull/8002))
+- change(state): Make the types for finalized blocks consistent ([#7923](https://github.com/ZcashFoundation/zebra/pull/7923))
+- change(scan): Create a scanner storage database ([#8031](https://github.com/ZcashFoundation/zebra/pull/8031))
+- change(scan): Store scanned TXIDs in "display order" ([#8057](https://github.com/ZcashFoundation/zebra/pull/8057))
+- change(scan): Create a function that scans one block by height, and stores the results in the database ([#8045](https://github.com/ZcashFoundation/zebra/pull/8045))
+- change(scan): Store one transaction ID per database row, to make queries easier ([#8062](https://github.com/ZcashFoundation/zebra/pull/8062))
+- change(log): Silence verbose failed connection logs ([#8072](https://github.com/ZcashFoundation/zebra/pull/8072))
+
+### Fixed
+
+- fix(db): Fix a sprout/history tree read panic in Zebra v1.4.0, which only happens before the 25.3.0 state upgrade completes ([#7972](https://github.com/ZcashFoundation/zebra/pull/7972))
+- fix(net): Fix potential network hangs, and reduce code complexity ([#7859](https://github.com/ZcashFoundation/zebra/pull/7859))
+- fix(scan): Start scanning task only if there are keys to scan ([#8059](https://github.com/ZcashFoundation/zebra/pull/8059))
+- fix(rpc): Make the `verbose` argument of the `getrawtransaction` RPC optional ([#8076](https://github.com/ZcashFoundation/zebra/pull/8076))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @oxarbitrage, @teor2345 and @upbqdn
+
+## [Zebra 1.4.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.4.0) - 2023-11-07
+
+Zebra's mining RPCs are now available in release builds. Our Docker images are significantly
+smaller, because the smaller Zcash verification parameters are now built into the `zebrad` binary.
+Zebra has updated to the shared Rust dependencies from the `zcashd` 5.7.0 release.
+
+Zebra recovers better from brief network interruptions, and avoids some network and verification
+denial of service and performance issues. We have restored our macOS tests in CI, and now support
+macOS on a best-effort basis.
+
+We have changed our documentation website URL, and we are considering deprecating some Docker image
+tags in release 1.5.0 and later.
+
+### Deprecation Warnings
+
+This release has the following deprecation warnings:
+
+#### Warning: Deprecation of DockerHub Image Tags in a future release
+
+Zebra currently publishes 11 [DockerHub tags](https://hub.docker.com/r/zfnd/zebra/tags) for each new release.
+We want to reduce the number of DockerHub tags we publish in a future minor Zebra release.
+
+Based on usage and user feedback, we could stop publishing:
+- The `1` tag, which updates each release until NU6
+- The `1.x` tag, which updates each patch release until the next minor release
+- The `1.x.y` tag, which is the same as `v1.x.y`
+- The `sha-xxxxxxx` tag, which is the same as `v1.x.y` (for production releases)
+
+We also want to standardise experimental image tags to `-experimental`, rather than `.experimental`.
+
+So for release 1.5.0, we might only publish these tags:
+- `latest`
+- `latest-experimental` (a new tag)
+- `v1.5.0`
+- `v1.5.0-experimental`
+
+Please let us know if you need any other tags by [opening a GitHub ticket](https://github.com/ZcashFoundation/zebra/issues/new?assignees=&labels=C-enhancement%2CS-needs-triage&projects=&template=feature_request.yml&title=feature%3A+).
+
+We recommend using the `latest` tag to always get the most recent Zebra release.
+
+#### Warning: Documentation Website URL Change
+
+We have replaced the API documentation on the [doc.zebra.zfnd.org](https://doc.zebra.zfnd.org)
+website with [docs.rs](https://docs.rs/releases/search?query=zebra). All links have been updated.
+
+Zebra's API documentation can be found on:
+- [`docs.rs`](https://docs.rs/releases/search?query=zebra), which renders documentation for the
+  public API of the latest crate releases;
+- [`doc-internal.zebra.zfnd.org`](https://doc-internal.zebra.zfnd.org/), which renders
+  documentation for the internal API on the `main` branch.
+
+[doc.zebra.zfnd.org](https://doc.zebra.zfnd.org) stopped being updated a few days before this release,
+and it will soon be shut down.
+
+### Significant Changes
+
+This release contains the following significant changes:
+
+#### Mining RPCs in Production Builds
 
 Zebra's mining RPCs are now available in release builds (#7740). Any Zebra instance can be used
 by a solo miner or mining pool. This stabilises 12 RPCs, including  `getblocktemplate`, `submitblock`,
@@ -21,10 +247,12 @@ read our [mining blog post](https://zfnd.org/experimental-mining-support-in-zebr
 Please [let us know](https://github.com/ZcashFoundation/zebra/issues/new?assignees=&labels=C-enhancement%2CS-needs-triage&projects=&template=feature_request.yml&title=feature%3A+)
 if your mining pool needs extra RPC methods or fields.
 
-### Parameters in Binary
+#### Zcash Parameters in `zebrad` Binary
 
 `zebrad` now bundles zk-SNARK parameters directly into its binary. This increases the binary size
-by a few megabytes, but these parameters do not need to be downloaded or stored separately.
+by a few megabytes, but reduces the size of the Docker image by around 600 MB because
+the parameters don't contain the Sprout proving key anymore. The `zebrad download`
+command does nothing, so it has been removed.
 
 Previously, parameters were stored by default in these locations:
 
@@ -40,9 +268,44 @@ so it can't be used to retry failed downloads in `zebrad` 1.3.0 and earlier.
 
 We recommend upgrading to the latest Zebra release to avoid download issues in new installs.
 
+#### macOS Support
+
+macOS x86_64 is now supported on a best-effort basis. macOS builds and some tests run in Zebra's CI.
+
 ### Security
 
-TODO: rest of changelog
+- Reconnect with peers after brief network interruption ([#7853](https://github.com/ZcashFoundation/zebra/pull/7853))
+- Add outer timeouts for critical network operations to avoid hangs ([#7869](https://github.com/ZcashFoundation/zebra/pull/7869))
+- Set iterator read bounds where possible in DiskDb, to avoid a known RocksDB denial of service issue ([#7731](https://github.com/ZcashFoundation/zebra/pull/7731), [#7732](https://github.com/ZcashFoundation/zebra/pull/7732))
+- Fix concurrency issues in tree key formats, and CPU usage in genesis tree roots ([#7392](https://github.com/ZcashFoundation/zebra/pull/7392))
+
+### Removed
+
+- Remove the `zebrad download` command, because it no longer does anything ([#7819](https://github.com/ZcashFoundation/zebra/pull/7819))
+
+### Added
+
+- Enable mining RPCs by default in production builds ([#7740](https://github.com/ZcashFoundation/zebra/pull/7740))
+- Re-enable macOS builds and tests in CI ([#7834](https://github.com/ZcashFoundation/zebra/pull/7834))
+- Make macOS x86_64 a tier 2 supported platform in the docs ([#7843](https://github.com/ZcashFoundation/zebra/pull/7843))
+- Add macOS M1 as a tier 3 supported platform ([#7851](https://github.com/ZcashFoundation/zebra/pull/7851))
+
+### Changed
+
+- Build Sprout and Sapling parameters into the zebrad binary, so a download server isn't needed ([#7800](https://github.com/ZcashFoundation/zebra/pull/7800), [#7844](https://github.com/ZcashFoundation/zebra/pull/7844))
+- Bump ECC dependencies for `zcashd` 5.7.0 ([#7784](https://github.com/ZcashFoundation/zebra/pull/7784))
+- Refactor the installation instructions for the `s-nomp` mining pool software ([#7835](https://github.com/ZcashFoundation/zebra/pull/7835))
+
+### Fixed
+
+- Make the `latest` Docker tag point to the production build, rather than the build with experimental features ([#7817](https://github.com/ZcashFoundation/zebra/pull/7817))
+- Fix an incorrect consensus-critical ZIP 212 comment ([#7774](https://github.com/ZcashFoundation/zebra/pull/7774))
+- Fix broken links to `zebra_network` and `zebra_state` `Config` structs on doc-internal.zebra.zfnd.org ([#7838](https://github.com/ZcashFoundation/zebra/pull/7838))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @gustavovalverde, @mpguerra, @oxarbitrage, @rex4539, @teor2345, @upbqdn, and @vuittont60.
 
 ## [Zebra 1.3.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.3.0) - 2023-10-16
 
@@ -992,12 +1255,12 @@ When there are a lot of large user-generated transactions on the network, Zebra 
 
 ### Configuration Changes
 
-- Split the checkpoint and full verification [`sync` concurrency options](https://doc.zebra.zfnd.org/zebrad/config/struct.SyncSection.html) (#4726, #4758):
+- Split the checkpoint and full verification [`sync` concurrency options](https://docs.rs/zebrad/latest/zebrad/components/sync/struct.Config.html) (#4726, #4758):
   - Add a new `full_verify_concurrency_limit`
   - Rename `max_concurrent_block_requests` to `download_concurrency_limit`
   - Rename `lookahead_limit` to `checkpoint_verify_concurrency_limit`
   For backwards compatibility, the old names are still accepted as aliases.
-- Add a new `parallel_cpu_threads` [`sync` concurrency option](https://doc.zebra.zfnd.org/zebrad/config/struct.SyncSection.html) (#4776).
+- Add a new `parallel_cpu_threads` [`sync` concurrency option](https://docs.rs/zebrad/latest/zebrad/components/sync/struct.Config.html) (#4776).
   This option sets the number of threads to use for CPU-bound tasks, such as proof and signature verification.
   By default, Zebra uses all available CPU cores.
 
@@ -1534,7 +1797,7 @@ Zebra's latest beta fixes a `cargo install` build failure in the previous beta r
 
 #### Logging
 
-- Log hashes as hex strings in block committment errors (#4021)
+- Log hashes as hex strings in block commitment errors (#4021)
 
 #### Tests
 
@@ -1576,7 +1839,7 @@ As part of the RPC changes, we made performance improvements to cached state acc
 #### Others
 
 - Added `TransactionsByMinedId` to mempool (#3907)
-- Added code owners and automatic review assigment to the repository (#3677 #3708 #3718)
+- Added code owners and automatic review assignment to the repository (#3677 #3708 #3718)
 - Validate ZIP-212 grace period blocks using checkpoints (#3889)
 - Store Sapling and Orchard note commitment trees in finalized and non-finalized state (#3818)
 - Get addresses from transparent outputs (#3802)
@@ -2299,7 +2562,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 
 - Test consensus-critical Amount deserialization (#2487)
 - Update to use new GitHub action names in Google Cloud workflows (#2533)
-- Add test intialization helper function for tests (#2539)
+- Add test initialization helper function for tests (#2539)
 
 ### Changed
 
@@ -2892,7 +3155,7 @@ Some notable changes include:
 
 ### Changed
 - Export new precompute api in zebra-script (#1493)
-- Rewrite peer block request hander to match the zcashd implementation (#1518)
+- Rewrite peer block request handler to match the zcashd implementation (#1518)
 
 ### Fixed
 - Avoid panics when there are multiple failures on the same connection (#1600)

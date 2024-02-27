@@ -109,16 +109,30 @@
 //! Example of how to run the get_block_template test:
 //!
 //! ```console
-//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test get_block_template --features getblocktemplate-rpcs --release  -- --ignored --nocapture
+//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test get_block_template --features getblocktemplate-rpcs --release -- --ignored --nocapture
 //! ```
 //!
 //! Example of how to run the submit_block test:
 //!
 //! ```console
-//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test submit_block --features getblocktemplate-rpcs --release  -- --ignored --nocapture
+//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test submit_block --features getblocktemplate-rpcs --release -- --ignored --nocapture
 //! ```
 //!
 //! Please refer to the documentation of each test for more information.
+//!
+//! ## Shielded scanning tests
+//!
+//! Example of how to run the scans_for_new_key test:
+//!
+//! ```console
+//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test scans_for_new_key --features shielded-scan --release -- --ignored --nocapture
+//! ```
+//!
+//! Example of how to run the scan_subscribe_results test:
+//!
+//! ```console
+//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test scan_subscribe_results --features shielded-scan -- --ignored --nocapture
+//! ```
 //!
 //! ## Checkpoint Generation Tests
 //!
@@ -159,7 +173,7 @@ use zebra_chain::{
 };
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_node_services::rpc_client::RpcRequestClient;
-use zebra_state::{constants::LOCK_FILE_ERROR, database_format_version_in_code};
+use zebra_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
 
 use zebra_test::{
     args,
@@ -203,6 +217,9 @@ pub const MAX_ASYNC_BLOCKING_TIME: Duration = zebra_test::mock_service::DEFAULT_
 
 /// The test config file prefix for `--feature getblocktemplate-rpcs` configs.
 pub const GET_BLOCK_TEMPLATE_CONFIG_PREFIX: &str = "getblocktemplate-";
+
+/// The test config file prefix for `--feature shielded-scan` configs.
+pub const SHIELDED_SCAN_CONFIG_PREFIX: &str = "shieldedscan-";
 
 #[test]
 fn generate_no_args() -> Result<()> {
@@ -806,18 +823,18 @@ fn last_config_is_stored() -> Result<()> {
          zebrad generate | \n\
          sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' > \n\
          zebrad/tests/common/configs/{}<next-release-tag>.toml",
-        if cfg!(feature = "getblocktemplate-rpcs") {
-            GET_BLOCK_TEMPLATE_CONFIG_PREFIX
+        if cfg!(feature = "shielded-scan") {
+            SHIELDED_SCAN_CONFIG_PREFIX
         } else {
             ""
         },
-        if cfg!(feature = "getblocktemplate-rpcs") {
-            "--features=getblocktemplate-rpcs "
+        if cfg!(feature = "shielded-scan") {
+            "--features=shielded-scan "
         } else {
             ""
         },
-        if cfg!(feature = "getblocktemplate-rpcs") {
-            GET_BLOCK_TEMPLATE_CONFIG_PREFIX
+        if cfg!(feature = "shielded-scan") {
+            SHIELDED_SCAN_CONFIG_PREFIX
         } else {
             ""
         },
@@ -943,6 +960,14 @@ fn stored_configs_work() -> Result<()> {
                 ?config_file_path,
                 "skipping getblocktemplate-rpcs config file path"
             );
+            continue;
+        }
+
+        // ignore files starting with shieldedscan prefix
+        // if we were not built with the shielded-scan feature.
+        #[cfg(not(feature = "shielded-scan"))]
+        if config_file_name.starts_with(SHIELDED_SCAN_CONFIG_PREFIX) {
+            tracing::info!(?config_file_path, "skipping shielded-scan config file path");
             continue;
         }
 
@@ -1167,8 +1192,6 @@ fn create_cached_database(network: Network) -> Result<()> {
     create_cached_database_height(
         network,
         height,
-        // We don't need the ZK parameters, we're only using checkpoints
-        true,
         // Use checkpoints to increase sync performance while caching the database
         true,
         // Check that we're still using checkpoints when we finish the cached sync
@@ -1185,8 +1208,6 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
     create_cached_database_height(
         network,
         height.unwrap(),
-        // We need the ZK parameters for full validation
-        false,
         // Test full validation by turning checkpoints off
         false,
         // Check that we're doing full validation when we finish the cached sync
@@ -1216,8 +1237,6 @@ fn full_sync_test(network: Network, timeout_argument_name: &str) -> Result<()> {
             network,
             // Just keep going until we reach the chain tip
             block::Height::MAX,
-            // We need the ZK parameters for full validation
-            false,
             // Use the checkpoints to sync quickly, then do full validation until the chain tip
             true,
             // Finish when we reach the chain tip
@@ -1672,12 +1691,10 @@ fn non_blocking_logger() -> Result<()> {
         Ok(())
     });
 
-    // Wait until the spawned task finishes or return an error in 45 seconds
-    if done_rx.recv_timeout(Duration::from_secs(45)).is_err() {
-        return Err(eyre!("unexpected test task hang"));
+    // Wait until the spawned task finishes up to 45 seconds before shutting down tokio runtime
+    if done_rx.recv_timeout(Duration::from_secs(45)).is_ok() {
+        rt.shutdown_timeout(Duration::from_secs(3));
     }
-
-    rt.shutdown_timeout(Duration::from_secs(3));
 
     match test_task_handle.now_or_never() {
         Some(Ok(result)) => result,
@@ -1862,7 +1879,7 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
         wait_for_state_version_upgrade(
             &mut zebrad,
             &state_version_message,
-            database_format_version_in_code(),
+            state_database_format_version_in_code(),
             [format!(
                 "Opened RPC endpoint at {}",
                 zebra_rpc_address.expect("lightwalletd test must have RPC port")
@@ -1872,7 +1889,7 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
         wait_for_state_version_upgrade(
             &mut zebrad,
             &state_version_message,
-            database_format_version_in_code(),
+            state_database_format_version_in_code(),
             None,
         )?;
     }
@@ -1984,7 +2001,7 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
                     wait_for_state_version_upgrade(
                         &mut zebrad,
                         &state_version_message,
-                        database_format_version_in_code(),
+                        state_database_format_version_in_code(),
                         None,
                     )?;
                 }
@@ -2010,7 +2027,7 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
                 wait_for_state_version_upgrade(
                     &mut zebrad,
                     &state_version_message,
-                    database_format_version_in_code(),
+                    state_database_format_version_in_code(),
                     None,
                 )?;
             }
@@ -2198,7 +2215,7 @@ fn zebra_state_conflict() -> Result<()> {
         dir_conflict_full.push("state");
         dir_conflict_full.push(format!(
             "v{}",
-            zebra_state::database_format_version_in_code().major,
+            zebra_state::state_database_format_version_in_code().major,
         ));
         dir_conflict_full.push(config.network.network.to_string().to_lowercase());
         format!(
@@ -2337,8 +2354,8 @@ async fn fully_synced_rpc_test() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn delete_old_databases() -> Result<()> {
+#[test]
+fn delete_old_databases() -> Result<()> {
     use std::fs::{canonicalize, create_dir};
 
     let _init_guard = zebra_test::init();
@@ -2385,7 +2402,7 @@ async fn delete_old_databases() -> Result<()> {
 
     // inside dir was deleted
     child.expect_stdout_line_matches(format!(
-        "deleted outdated state directory deleted_state={canonicalized_inside_dir:?}"
+        "deleted outdated state database directory.*deleted_db.*=.*{canonicalized_inside_dir:?}"
     ))?;
     assert!(!inside_dir.as_path().exists());
 
@@ -2532,7 +2549,7 @@ async fn new_state_format() -> Result<()> {
 ///       (or just add a delay during tests)
 #[tokio::test]
 async fn update_state_format() -> Result<()> {
-    let mut fake_version = database_format_version_in_code();
+    let mut fake_version = state_database_format_version_in_code();
     fake_version.minor = 0;
     fake_version.patch = 0;
 
@@ -2549,7 +2566,7 @@ async fn update_state_format() -> Result<()> {
 /// Future version compatibility is a best-effort attempt, this test can be disabled if it fails.
 #[tokio::test]
 async fn downgrade_state_format() -> Result<()> {
-    let mut fake_version = database_format_version_in_code();
+    let mut fake_version = state_database_format_version_in_code();
     fake_version.minor = u16::MAX.into();
     fake_version.patch = 0;
 
@@ -2631,13 +2648,17 @@ async fn state_format_test(
             .zebrad_config(test_name, false, Some(dir.path()), network)
             .expect("already checked config")?;
 
-        zebra_state::write_database_format_version_to_disk(fake_version, &config.state, network)
-            .expect("can't write fake database version to disk");
+        zebra_state::write_state_database_format_version_to_disk(
+            &config.state,
+            fake_version,
+            network,
+        )
+        .expect("can't write fake database version to disk");
 
         // Give zebra_state enough time to actually write the database version to disk.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let running_version = database_format_version_in_code();
+        let running_version = state_database_format_version_in_code();
 
         match fake_version.cmp(&running_version) {
             Ordering::Less => expect_older_version = true,
@@ -2743,7 +2764,7 @@ async fn fully_synced_rpc_z_getsubtreesbyindex_snapshot_test() -> Result<()> {
     wait_for_state_version_upgrade(
         &mut zebrad,
         &state_version_message,
-        database_format_version_in_code(),
+        state_database_format_version_in_code(),
         None,
     )?;
 
@@ -2804,4 +2825,212 @@ async fn fully_synced_rpc_z_getsubtreesbyindex_snapshot_test() -> Result<()> {
         .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
 
     Ok(())
+}
+
+/// Test that the scanner task gets started when the node starts.
+#[test]
+#[cfg(feature = "shielded-scan")]
+fn scan_task_starts() -> Result<()> {
+    use indexmap::IndexMap;
+    use zebra_scan::tests::ZECPAGES_SAPLING_VIEWING_KEY;
+
+    let _init_guard = zebra_test::init();
+
+    let test_type = TestType::LaunchWithEmptyState {
+        launches_lightwalletd: false,
+    };
+    let mut config = default_test_config(Mainnet)?;
+    let mut keys = IndexMap::new();
+    keys.insert(ZECPAGES_SAPLING_VIEWING_KEY.to_string(), 1);
+    config.shielded_scan.sapling_keys_to_scan = keys;
+
+    // Start zebra with the config.
+    let mut zebrad = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zebrad_timeout());
+
+    // Check scanner was started.
+    zebrad.expect_stdout_line_matches("loaded Zebra scanner cache")?;
+
+    // Look for 2 scanner notices indicating we are below sapling activation.
+    zebrad.expect_stdout_line_matches("scanner is waiting for Sapling activation. Current tip: [0-9]{1,4}, Sapling activation: 419200")?;
+    zebrad.expect_stdout_line_matches("scanner is waiting for Sapling activation. Current tip: [0-9]{1,4}, Sapling activation: 419200")?;
+
+    // Kill the node.
+    zebrad.kill(false)?;
+
+    // Check that scan task started and the first scanning is done.
+    let output = zebrad.wait_with_output()?;
+
+    // Make sure the command was killed
+    output.assert_was_killed()?;
+    output.assert_failure()?;
+
+    Ok(())
+}
+
+/// Test that the scanner gRPC server starts when the node starts.
+#[tokio::test]
+#[cfg(feature = "shielded-scan")]
+async fn scan_rpc_server_starts() -> Result<()> {
+    use zebra_grpc::scanner::{scanner_client::ScannerClient, Empty};
+
+    let _init_guard = zebra_test::init();
+
+    let test_type = TestType::LaunchWithEmptyState {
+        launches_lightwalletd: false,
+    };
+
+    let port = random_known_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut config = default_test_config(Mainnet)?;
+    config.shielded_scan.listen_addr = Some(listen_addr.parse()?);
+
+    // Start zebra with the config.
+    let mut zebrad = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zebrad_timeout());
+
+    // Wait until gRPC server is starting.
+    tokio::time::sleep(LAUNCH_DELAY).await;
+    zebrad.expect_stdout_line_matches("starting scan gRPC server")?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut client = ScannerClient::connect(format!("http://{listen_addr}")).await?;
+
+    let request = tonic::Request::new(Empty {});
+
+    client.get_info(request).await?;
+
+    // Kill the node.
+    zebrad.kill(false)?;
+
+    // Check that scan task started and the first scanning is done.
+    let output = zebrad.wait_with_output()?;
+
+    // Make sure the command was killed
+    output.assert_was_killed()?;
+    output.assert_failure()?;
+
+    Ok(())
+}
+
+/// Test that the scanner can continue scanning where it was left when zebrad restarts.
+///
+/// Needs a cache state close to the tip. A possible way to run it locally is:
+///
+/// export ZEBRA_CACHED_STATE_DIR="/path/to/zebra/state"
+/// cargo test scan_start_where_left --features="shielded-scan" -- --ignored --nocapture
+///
+/// The test will run zebrad with a key to scan, scan the first few blocks after sapling and then stops.
+/// Then it will restart zebrad and check that it resumes scanning where it was left.
+///
+/// Note: This test will remove all the contents you may have in the ZEBRA_CACHED_STATE_DIR/private-scan directory
+/// so it can start with an empty scanning state.
+#[ignore]
+#[test]
+#[cfg(feature = "shielded-scan")]
+fn scan_start_where_left() -> Result<()> {
+    use indexmap::IndexMap;
+    use zebra_scan::{storage::db::SCANNER_DATABASE_KIND, tests::ZECPAGES_SAPLING_VIEWING_KEY};
+
+    let _init_guard = zebra_test::init();
+
+    // use `UpdateZebraCachedStateNoRpc` as the test type to make sure a zebrad cache state is available.
+    let test_type = TestType::UpdateZebraCachedStateNoRpc;
+    if let Some(cache_dir) = test_type.zebrad_state_path("scan test") {
+        // Add a key to the config
+        let mut config = default_test_config(Mainnet)?;
+        let mut keys = IndexMap::new();
+        keys.insert(ZECPAGES_SAPLING_VIEWING_KEY.to_string(), 1);
+        config.shielded_scan.sapling_keys_to_scan = keys;
+
+        // Add the cache dir to shielded scan, make it the same as the zebrad cache state.
+        config.shielded_scan.db_config_mut().cache_dir = cache_dir.clone();
+        config.shielded_scan.db_config_mut().ephemeral = false;
+
+        // Add the cache dir to state.
+        config.state.cache_dir = cache_dir.clone();
+        config.state.ephemeral = false;
+
+        // Remove the scan directory before starting.
+        let scan_db_path = cache_dir.join(SCANNER_DATABASE_KIND);
+        fs::remove_dir_all(std::path::Path::new(&scan_db_path)).ok();
+
+        // Start zebra with the config.
+        let mut zebrad = testdir()?
+            .with_exact_config(&config)?
+            .spawn_child(args!["start"])?
+            .with_timeout(test_type.zebrad_timeout());
+
+        // Check scanner was started.
+        zebrad.expect_stdout_line_matches("loaded Zebra scanner cache")?;
+
+        // The first time
+        zebrad.expect_stdout_line_matches(
+            r"Scanning the blockchain for key 0, started at block 419200, now at block 420000",
+        )?;
+
+        // Make sure scanner scans a few blocks.
+        zebrad.expect_stdout_line_matches(
+            r"Scanning the blockchain for key 0, started at block 419200, now at block 430000",
+        )?;
+        zebrad.expect_stdout_line_matches(
+            r"Scanning the blockchain for key 0, started at block 419200, now at block 440000",
+        )?;
+
+        // Kill the node.
+        zebrad.kill(false)?;
+        let output = zebrad.wait_with_output()?;
+
+        // Make sure the command was killed
+        output.assert_was_killed()?;
+        output.assert_failure()?;
+
+        // Start the node again.
+        let mut zebrad = testdir()?
+            .with_exact_config(&config)?
+            .spawn_child(args!["start"])?
+            .with_timeout(test_type.zebrad_timeout());
+
+        // Resuming message.
+        zebrad.expect_stdout_line_matches(
+            "Last scanned height for key number 0 is 439000, resuming at 439001",
+        )?;
+        zebrad.expect_stdout_line_matches("loaded Zebra scanner cache")?;
+
+        // Start scanning where it was left.
+        zebrad.expect_stdout_line_matches(
+            r"Scanning the blockchain for key 0, started at block 439001, now at block 440000",
+        )?;
+        zebrad.expect_stdout_line_matches(
+            r"Scanning the blockchain for key 0, started at block 439001, now at block 450000",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Test successful registration of a new key in the scan task.
+///
+/// See [`common::shielded_scan::scans_for_new_key`] for more information.
+// TODO: Add this test to CI (#8236)
+#[tokio::test]
+#[ignore]
+#[cfg(feature = "shielded-scan")]
+async fn scans_for_new_key() -> Result<()> {
+    common::shielded_scan::scans_for_new_key::run().await
+}
+
+/// Tests SubscribeResults ScanService request.
+///
+/// See [`common::shielded_scan::subscribe_results`] for more information.
+// TODO: Add this test to CI (#8236)
+#[tokio::test]
+#[ignore]
+#[cfg(feature = "shielded-scan")]
+async fn scan_subscribe_results() -> Result<()> {
+    common::shielded_scan::subscribe_results::run().await
 }

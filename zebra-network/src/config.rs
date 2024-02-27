@@ -46,7 +46,7 @@ pub use cache_dir::CacheDir;
 const MAX_SINGLE_SEED_PEER_DNS_RETRIES: usize = 0;
 
 /// Configuration for networking code.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// The address on which this node should listen for connections.
@@ -353,10 +353,10 @@ impl Config {
                     // (But we only make one initial connection attempt to each IP.)
                     metrics::counter!(
                         "zcash.net.peers.initial",
-                        1,
                         "seed" => host.to_string(),
                         "remote_ip" => ip.to_string()
-                    );
+                    )
+                    .increment(1);
                 }
 
                 Ok(ip_addrs.into_iter().collect())
@@ -440,10 +440,10 @@ impl Config {
             // (But we only make one initial connection attempt to each IP.)
             metrics::counter!(
                 "zcash.net.peers.initial",
-                1,
                 "cache" => peer_cache_file.display().to_string(),
                 "remote_ip" => ip.to_string()
-            );
+            )
+            .increment(1);
         }
 
         Ok(peer_list)
@@ -553,10 +553,10 @@ impl Config {
                         for ip in &peer_list {
                             metrics::counter!(
                                 "zcash.net.peers.cache",
-                                1,
                                 "cache" => peer_cache_file.display().to_string(),
                                 "remote_ip" => ip.to_string()
-                            );
+                            )
+                            .increment(1);
                         }
 
                         Ok(())

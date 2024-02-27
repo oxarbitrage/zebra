@@ -15,7 +15,7 @@ use std::{
 use color_eyre::eyre::Result;
 use tempfile::TempDir;
 
-use zebra_chain::parameters::Network::{self, *};
+use zebra_chain::parameters::Network;
 use zebra_test::net::random_known_port;
 use zebrad::{
     components::{mempool, sync, tracing},
@@ -51,10 +51,7 @@ pub fn default_test_config(net: Network) -> Result<ZebradConfig> {
         ..mempool::Config::default()
     };
 
-    let consensus = zebra_consensus::Config {
-        debug_skip_parameter_preload: true,
-        ..zebra_consensus::Config::default()
-    };
+    let consensus = zebra_consensus::Config::default();
 
     let force_use_color = !matches!(
         env::var("ZEBRA_FORCE_USE_COLOR"),
@@ -73,16 +70,38 @@ pub fn default_test_config(net: Network) -> Result<ZebradConfig> {
 
     #[cfg(feature = "getblocktemplate-rpcs")]
     {
-        let miner_address = if network.network == Mainnet {
-            "t3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1"
-        } else {
+        let miner_address = if network.network.is_a_test_network() {
+            // Assume test networks all use the same address prefix and format
             "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
+        } else {
+            "t3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1"
         };
 
         mining.miner_address = Some(miner_address.parse().expect("hard-coded address is valid"));
     }
 
-    let config = ZebradConfig {
+    #[cfg(feature = "shielded-scan")]
+    {
+        let mut shielded_scan = zebra_scan::Config::ephemeral();
+        shielded_scan.db_config_mut().cache_dir = "zebra-scan".into();
+
+        let config = ZebradConfig {
+            network,
+            state,
+            sync,
+            mempool,
+            consensus,
+            tracing,
+            mining,
+            shielded_scan,
+            ..ZebradConfig::default()
+        };
+
+        Ok(config)
+    }
+
+    #[cfg(not(feature = "shielded-scan"))]
+    Ok(ZebradConfig {
         network,
         state,
         sync,
@@ -91,9 +110,7 @@ pub fn default_test_config(net: Network) -> Result<ZebradConfig> {
         tracing,
         mining,
         ..ZebradConfig::default()
-    };
-
-    Ok(config)
+    })
 }
 
 pub fn persistent_test_config(network: Network) -> Result<ZebradConfig> {
@@ -137,7 +154,7 @@ pub fn random_known_rpc_port_config(
     let mut config = default_test_config(network)?;
     config.rpc.listen_addr = Some(zebra_rpc_listener);
     if parallel_cpu_threads {
-        // Auto-configure to the number of CPU cores: most users configre this
+        // Auto-configure to the number of CPU cores: most users configure this
         config.rpc.parallel_cpu_threads = 0;
     } else {
         // Default config, users who want to detect port conflicts configure this

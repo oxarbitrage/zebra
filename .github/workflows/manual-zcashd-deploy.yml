@@ -1,3 +1,10 @@
+# This workflow is designed for manually deploying zcashd nodes to Google Cloud Platform (GCP) based on user inputs.
+# - Allows selection of network type (Mainnet or Testnet) and instance group size.
+# - Converts network name to lowercase to comply with GCP labeling requirements.
+# - Authenticates with Google Cloud using provided credentials.
+# - Creates a GCP instance template from a container image of zcashd.
+# - Checks if the specified instance group already exists.
+# - Depending on the existence check, either creates a new managed instance group or updates the existing one with the new template.
 name: Zcashd Manual Deploy
 
 on:
@@ -45,14 +52,14 @@ jobs:
       # Setup gcloud CLI
       - name: Authenticate to Google Cloud
         id: auth
-        uses: google-github-actions/auth@v1.1.1
+        uses: google-github-actions/auth@v2.1.1
         with:
           retries: '3'
           workload_identity_provider: '${{ vars.GCP_WIF }}'
           service_account: '${{ vars.GCP_DEPLOYMENTS_SA }}'
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v1.1.1
+        uses: google-github-actions/setup-gcloud@v2.1.0
 
       # Create instance template from container image
       - name: Create instance template

@@ -27,10 +27,11 @@ impl MetricsEndpoint {
                     // Expose binary metadata to metrics, using a single time series with
                     // value 1:
                     //     https://www.robustperception.io/exposing-the-software-version-to-prometheus
-                    metrics::increment_counter!(
+                    metrics::counter!(
                         format!("{}.build.info", env!("CARGO_PKG_NAME")),
                         "version" => env!("CARGO_PKG_VERSION")
-                    );
+                    )
+                    .increment(1);
                 }
                 Err(e) => panic!(
                     "Opening metrics endpoint listener {addr:?} failed: {e:?}. \
@@ -59,7 +60,7 @@ impl MetricsEndpoint {
 }
 
 /// Metrics configuration section.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// The address used for the Prometheus metrics endpoint.

@@ -6,17 +6,21 @@ recommend using
 use it in testing. Other `lightwalletd` forks have limited support, see the
 [Sync lightwalletd](#sync-lightwalletd) section for more info.
 
+> [!NOTE]
+> You can also use `docker` to run lightwalletd with zebra. Please see our [docker documentation](./docker.md#running-zebra-with-lightwalletd) for more information.
+
 Contents:
 
-- [Configure zebra for lightwalletd](#configure-zebra-for-lightwalletd)
-  - [JSON-RPC](#json-rpc)
-- [Sync Zebra](#sync-zebra)
-- [Download and build lightwalletd](#download-and-build-lightwalletd)
-- [Sync lightwalletd](#sync-lightwalletd)
-- [Run tests](#run-tests)
-- [Connect wallet to lightwalletd](#connect-wallet-to-lightwalletd)
-  - [Download and build the cli-wallet](#download-and-build-the-cli-wallet)
-  - [Run the wallet](#run-the-wallet)
+- [Running lightwalletd with zebra](#running-lightwalletd-with-zebra)
+  - [Configure zebra for lightwalletd](#configure-zebra-for-lightwalletd)
+    - [JSON-RPC](#json-rpc)
+  - [Sync Zebra](#sync-zebra)
+  - [Download and build lightwalletd](#download-and-build-lightwalletd)
+  - [Sync lightwalletd](#sync-lightwalletd)
+  - [Run tests](#run-tests)
+  - [Connect a wallet to lightwalletd](#connect-a-wallet-to-lightwalletd)
+    - [Download and build the cli-wallet](#download-and-build-the-cli-wallet)
+    - [Run the wallet](#run-the-wallet)
 
 ## Configure zebra for lightwalletd
 
@@ -55,7 +59,7 @@ parallel_cpu_threads = 0
 ```
 
 **WARNING:** This config allows multiple Zebra instances to share the same RPC port.
-See the [RPC config documentation](https://doc.zebra.zfnd.org/zebra_rpc/config/struct.Config.html) for details.
+See the [RPC config documentation](https://docs.rs/zebra_rpc/latest/zebra_rpc/config/struct.Config.html) for details.
 
 ## Sync Zebra
 
@@ -71,7 +75,7 @@ Zebra will display information about sync process:
 
 ```console
 ...
-zebrad::commands::start: estimated progress to chain tip sync_percent=10.783 % 
+zebrad::commands::start: estimated progress to chain tip sync_percent=10.783 %
 ...
 ```
 
@@ -79,13 +83,13 @@ Until eventually it will get there:
 
 ```console
 ...
-zebrad::commands::start: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000 % 
+zebrad::commands::start: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000 %
 ...
 ```
 
 You can interrupt the process at any time with `ctrl-c` and Zebra will resume the next time at around the block you were downloading when stopping the process.
 
-When deploying for production infrastructure, the above command can/should be implemented as a server service or similar configuration. 
+When deploying for production infrastructure, the above command can be run as a service or daemon.
 
 For implementing zebra as a service please see [here](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/systemd/zebrad.service).
 
@@ -144,7 +148,7 @@ Wait until lightwalletd is in sync before connecting any wallet into it. You wil
 ## Run tests
 [#run-tests]: (#run-tests)
 
-The Zebra team created tests for the interaction of `zebrad` and `lightwalletd`. 
+The Zebra team created tests for the interaction of `zebrad` and `lightwalletd`.
 
 To run all the Zebra `lightwalletd` tests:
 1. install `lightwalletd`
@@ -156,7 +160,7 @@ Please refer to [acceptance](https://github.com/ZcashFoundation/zebra/blob/main/
 ## Connect a wallet to lightwalletd
 [#connect-wallet-to-lightwalletd]: (#connect-wallet-to-lightwalletd)
 
-The final goal is to connect wallets to the lightwalletd service backed by Zebra. 
+The final goal is to connect wallets to the lightwalletd service backed by Zebra.
 
 For demo purposes we used [zecwallet-cli](https://github.com/adityapk00/zecwallet-light-cli) with the [adityapk00/lightwalletd](https://github.com/adityapk00/lightwalletd) fork.
 We didn't test [zecwallet-cli](https://github.com/adityapk00/zecwallet-light-cli) with [zcash/lightwalletd](https://github.com/zcash/lightwalletd) yet.
@@ -184,5 +188,5 @@ Lightclient connecting to http://127.0.0.1:9067/
   "total_blocks_synced": 49476
 }
 Ready!
-(main) Block:1683911 (type 'help') >> 
+(main) Block:1683911 (type 'help') >>
 ```

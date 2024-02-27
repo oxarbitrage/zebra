@@ -1,4 +1,7 @@
 //! Zebrad Abscissa Application
+//!
+//! This is the code that starts `zebrad`, and launches its tasks and services.
+//! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
 
 use std::{env, fmt::Write as _, io::Write as _, process, sync::Arc};
 
@@ -13,7 +16,8 @@ use semver::{BuildMetadata, Version};
 
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::{
-    constants::LOCK_FILE_ERROR, database_format_version_in_code, database_format_version_on_disk,
+    constants::LOCK_FILE_ERROR, state_database_format_version_in_code,
+    state_database_format_version_on_disk,
 };
 
 use crate::{
@@ -74,9 +78,7 @@ fn vergen_build_version() -> Option<Version> {
     // - optional pre-release: `-`tag[`.`tag ...]
     // - optional build: `+`tag[`.`tag ...]
     // change the git describe format to the semver 2.0 format
-    let Some(vergen_git_describe) = VERGEN_GIT_DESCRIBE else {
-        return None;
-    };
+    let vergen_git_describe = VERGEN_GIT_DESCRIBE?;
 
     // `git describe` uses "dirty" for uncommitted changes,
     // but users won't understand what that means.
@@ -86,10 +88,7 @@ fn vergen_build_version() -> Option<Version> {
     let mut vergen_git_describe = vergen_git_describe.split('-').peekable();
 
     // Check the "version core" part.
-    let version = vergen_git_describe.next();
-    let Some(mut version) = version else {
-        return None;
-    };
+    let mut version = vergen_git_describe.next()?;
 
     // strip the leading "v", if present.
     version = version.strip_prefix('v').unwrap_or(version);
@@ -264,7 +263,7 @@ impl Application for ZebradApp {
 
         // reads state disk version file, doesn't open RocksDB database
         let disk_db_version =
-            match database_format_version_on_disk(&config.state, config.network.network) {
+            match state_database_format_version_on_disk(&config.state, config.network.network) {
                 Ok(Some(version)) => version.to_string(),
                 // This "version" is specially formatted to match a relaxed version regex in CI
                 Ok(None) => "creating.new.database".to_string(),
@@ -283,7 +282,7 @@ impl Application for ZebradApp {
             // code constant
             (
                 "running state version",
-                database_format_version_in_code().to_string(),
+                state_database_format_version_in_code().to_string(),
             ),
             // state disk file, doesn't open database
             ("initial disk state version", disk_db_version),

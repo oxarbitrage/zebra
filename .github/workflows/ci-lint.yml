@@ -1,3 +1,10 @@
+# This workflow conducts various linting checks for a Rust-based project.
+# 1. Determines if Rust or workflow files have been modified.
+# 2. Runs the Clippy linter on Rust files, producing annotations and failing on warnings.
+# 3. Ensures Rust code formatting complies with 'rustfmt' standards.
+# 4. Lints GitHub Actions workflow files for common issues.
+# 5. Checks for common spelling errors in the codebase.
+# The workflow is designed to maintain code quality and consistency, running checks conditionally based on the changed files.
 name: Lint
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -37,7 +44,7 @@ jobs:
 
       - name: Rust files
         id: changed-files-rust
-        uses: tj-actions/changed-files@v39.2.3
+        uses: tj-actions/changed-files@v42.0.4
         with:
           files: |
             **/*.rs
@@ -49,7 +56,7 @@ jobs:
 
       - name: Workflow files
         id: changed-files-workflows
-        uses: tj-actions/changed-files@v39.2.3
+        uses: tj-actions/changed-files@v42.0.4
         with:
           files: |
             .github/workflows/*.yml
@@ -67,7 +74,7 @@ jobs:
           persist-credentials: false
 
       - name: Install last version of Protoc
-        uses: arduino/setup-protoc@v2.1.0
+        uses: arduino/setup-protoc@v3.0.0
         with:
           # TODO: increase to latest version after https://github.com/arduino/setup-protoc/issues/33 is fixed
           version: '23.x'
@@ -86,7 +93,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=default
 
-      - uses: Swatinem/rust-cache@v2.7.0
+      - uses: Swatinem/rust-cache@v2.7.3
         with:
           shared-key: "clippy-cargo-lock"
 
@@ -98,11 +105,11 @@ jobs:
           # GitHub displays the clippy job and its results as separate entries
           name: Clippy (stable) Results
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features --all-targets -- -D warnings
+          args: --workspace --all-features --all-targets -- -D warnings
 
       - name: Run clippy manually without annotations
         if: ${{ !steps.check_permissions.outputs.has-permission }}
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt
@@ -118,7 +125,7 @@ jobs:
       - uses: r7kamura/rust-problem-matchers@v1.4.0
 
       - name: Install last version of Protoc
-        uses: arduino/setup-protoc@v2.1.0
+        uses: arduino/setup-protoc@v3.0.0
         with:
           # TODO: increase to latest version after https://github.com/arduino/setup-protoc/issues/33 is fixed
           version: '23.x'
@@ -131,7 +138,7 @@ jobs:
 
       # We don't cache `fmt` outputs because the job is quick,
       # and we want to use the limited GitHub actions cache space for slower jobs.
-      #- uses: Swatinem/rust-cache@v2.7.0
+      #- uses: Swatinem/rust-cache@v2.7.3
 
       - run: |
           cargo fmt --all -- --check
@@ -144,19 +151,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4.1.1
       - name: actionlint
-        uses: reviewdog/action-actionlint@v1.39.1
+        uses: reviewdog/action-actionlint@v1.41.0
         with:
           level: warning
           fail_on_error: false
-      - name: validate-dependabot
-        uses: marocchino/validate-dependabot@v2.1.0
+      # This is failing with a JSON schema error, see #8028 for details.        
+      #- name: validate-dependabot
+      #  # This gives an error when run on PRs from external repositories, so we skip it.
+      #  # If this is a PR, check that the PR source is a local branch. Always runs on non-PRs.
+      #  if: ${{ !startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork }}
+      #  uses: marocchino/validate-dependabot@v2.1.0
 
   codespell:
     runs-on: ubuntu-latest
     needs: changed-files
     steps:
       - uses: actions/checkout@v4.1.1
-      - uses: plettich/action-codespell@master
+      - uses: codespell-project/actions-codespell@v2.0
         with:
-          github_token: ${{ secrets.github_token }}
-          level: warning
+          only_warn: 1
+

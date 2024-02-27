@@ -17,9 +17,10 @@
 # https://github.com/ZcashFoundation/zebra/settings/variables/actions
 ARG FEATURES="default-release-binaries"
 ARG TEST_FEATURES="lightwalletd-grpc-tests zebra-checkpoints"
+ARG EXPERIMENTAL_FEATURES=""
 
 # This stage implements cargo-chef for docker layer caching
-FROM rust:bullseye as chef
+FROM rust:bookworm as chef
 RUN cargo install cargo-chef --locked
 WORKDIR /opt/zebrad
 
@@ -48,6 +49,7 @@ RUN apt-get -qq update && \
     ca-certificates \
     protobuf-compiler \
     rsync \
+    rocksdb-tools \
     ; \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
@@ -95,9 +97,7 @@ ENV CARGO_HOME="/opt/zebrad/.cargo/"
 # We also download needed dependencies for tests to work, from other images.
 # An entrypoint.sh is only available in this step for easier test handling with variables.
 FROM deps AS tests
-# TODO: do not hardcode the user /root/ even though is a safe assumption
-# Pre-download Zcash Sprout, Sapling parameters and Lightwalletd binary
-COPY --from=us-docker.pkg.dev/zfnd-dev-zebra/zebra/zcash-params:edge /root/.zcash-params /root/.zcash-params
+
 COPY --from=us-docker.pkg.dev/zfnd-dev-zebra/zebra/lightwalletd:edge /opt/lightwalletd /usr/local/bin
 
 # cargo uses timestamps for its cache, so they need to be in this order:
@@ -112,6 +112,8 @@ ENV ZEBRA_SKIP_IPV6_TESTS=${ZEBRA_SKIP_IPV6_TESTS:-1}
 # separately from the test and production image builds.
 ARG FEATURES
 ARG TEST_FEATURES
+ARG EXPERIMENTAL_FEATURES
+# TODO: add empty $EXPERIMENTAL_FEATURES when we can avoid adding an extra space to the end of the string
 ARG ENTRYPOINT_FEATURES="${FEATURES} ${TEST_FEATURES}"
 
 # Re-hydrate the minimum project skeleton identified by `cargo chef prepare` in the planner stage,
@@ -123,7 +125,6 @@ ARG ENTRYPOINT_FEATURES="${FEATURES} ${TEST_FEATURES}"
 #
 # TODO: add --locked when cargo-chef supports it
 RUN cargo chef cook --tests --release --features "${ENTRYPOINT_FEATURES}" --workspace --recipe-path recipe.json
-
 # Undo the source file changes made by cargo-chef.
 # rsync invalidates the cargo cache for the changed files only, by updating their timestamps.
 # This makes sure the fake empty binaries created by cargo-chef are rebuilt.
@@ -141,6 +142,9 @@ RUN chmod u+x /entrypoint.sh
 
 # Entrypoint environment variables
 ENV ENTRYPOINT_FEATURES=${ENTRYPOINT_FEATURES}
+# We repeat the ARGs here, so they are available in the entrypoint.sh script for $RUN_ALL_EXPERIMENTAL_TESTS
+ARG EXPERIMENTAL_FEATURES="shielded-scan journald prometheus filter-reload"
+ENV ENTRYPOINT_FEATURES_EXPERIMENTAL="${ENTRYPOINT_FEATURES} ${EXPERIMENTAL_FEATURES}"
 
 # By default, runs the entrypoint tests specified by the environmental variables (if any are set)
 ENTRYPOINT [ "/entrypoint.sh" ]
@@ -176,15 +180,16 @@ RUN chmod u+x /entrypoint.sh
 # This stage is only used when deploying nodes or when only the resulting zebrad binary is needed
 #
 # To save space, this step starts from scratch using debian, and only adds the resulting
-# binary from the `release` stage, and the Zcash Sprout & Sapling parameters from ZCash
-FROM debian:bullseye-slim AS runtime
+# binary from the `release` stage
+FROM debian:bookworm-slim AS runtime
 COPY --from=release /opt/zebrad/target/release/zebrad /usr/local/bin
 COPY --from=release /entrypoint.sh /
-COPY --from=us-docker.pkg.dev/zfnd-dev-zebra/zebra/zcash-params:edge /root/.zcash-params /root/.zcash-params
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates
+    ca-certificates \
+    curl \
+    rocksdb-tools
 
 # Config settings for zebrad
 ARG FEATURES

@@ -1,6 +1,10 @@
 # API Reference
 
-Zebra's API documentation is generated using Rustdoc:
+The Zcash Foundation maintains the following API documentation for Zebra:
 
-- [`doc.zebra.zfnd.org`](https://doc.zebra.zfnd.org/) renders documentation for the public API;
-- [`doc-internal.zebra.zfnd.org`](https://doc-internal.zebra.zfnd.org/) renders documentation for the internal API.
+- The [documentation of the public
+  APIs](https://docs.rs/zebrad/latest/zebrad/#zebra-crates) for the latest
+  releases of the individual Zebra crates.
+
+- The [documentation of the internal APIs](https://doc-internal.zebra.zfnd.org)
+  for the `main` branch of the whole Zebra monorepo.

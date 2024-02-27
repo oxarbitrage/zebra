@@ -2,9 +2,8 @@
 //!
 //! Zebra's database is implemented in 4 layers:
 //! - [`FinalizedState`]: queues, validates, and commits blocks, using...
-//! - [`ZebraDb`]: reads and writes [`zebra_chain`] types to the database, using...
-//! - [`DiskDb`](disk_db::DiskDb): reads and writes format-specific types
-//!   to the database, using...
+//! - [`ZebraDb`]: reads and writes [`zebra_chain`] types to the state database, using...
+//! - [`DiskDb`]: reads and writes generic types to any column family in the database, using...
 //! - [`disk_format`]: converts types to raw database bytes.
 //!
 //! These layers allow us to split [`zebra_chain`] types for efficient database storage.
@@ -12,8 +11,8 @@
 //!
 //! # Correctness
 //!
-//! The [`crate::constants::DATABASE_FORMAT_VERSION`] constant must
-//! be incremented each time the database format (column, serialization, etc) changes.
+//! [`crate::constants::state_database_format_version_in_code()`] must be incremented
+//! each time the database format (column, serialization, etc) changes.
 
 use std::{
     io::{stderr, stdout, Write},
@@ -23,10 +22,13 @@ use std::{
 use zebra_chain::{block, parallel::tree::NoteCommitmentTrees, parameters::Network};
 
 use crate::{
-    request::{FinalizableBlock, SemanticallyVerifiedBlockWithTrees, Treestate},
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+    request::{FinalizableBlock, FinalizedBlock, Treestate},
     service::{check, QueuedCheckpointVerified},
     BoxError, CheckpointVerifiedBlock, CloneError, Config,
 };
+
+pub mod column_family;
 
 mod disk_db;
 mod disk_format;
@@ -38,14 +40,61 @@ mod arbitrary;
 #[cfg(test)]
 mod tests;
 
-pub use disk_format::{OutputIndex, OutputLocation, TransactionLocation, MAX_ON_DISK_HEIGHT};
+#[allow(unused_imports)]
+pub use column_family::{TypedColumnFamily, WriteTypedBatch};
+#[allow(unused_imports)]
+pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
+#[allow(unused_imports)]
+pub use disk_format::{
+    FromDisk, IntoDisk, OutputIndex, OutputLocation, RawBytes, TransactionIndex,
+    TransactionLocation, MAX_ON_DISK_HEIGHT,
+};
+pub use zebra_db::ZebraDb;
 
-pub(super) use zebra_db::ZebraDb;
+#[cfg(feature = "shielded-scan")]
+pub use disk_format::{
+    SaplingScannedDatabaseEntry, SaplingScannedDatabaseIndex, SaplingScannedResult,
+    SaplingScanningKey,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use disk_db::DiskWriteBatch;
-#[cfg(not(any(test, feature = "proptest-impl")))]
-use disk_db::DiskWriteBatch;
+pub use disk_format::KV;
+
+/// The column families supported by the running `zebra-state` database code.
+///
+/// Existing column families that aren't listed here are preserved when the database is opened.
+pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
+    // Blocks
+    "hash_by_height",
+    "height_by_hash",
+    "block_header_by_height",
+    // Transactions
+    "tx_by_loc",
+    "hash_by_tx_loc",
+    "tx_loc_by_hash",
+    // Transparent
+    "balance_by_transparent_addr",
+    "tx_loc_by_transparent_addr_loc",
+    "utxo_by_out_loc",
+    "utxo_loc_by_transparent_addr_loc",
+    // Sprout
+    "sprout_nullifiers",
+    "sprout_anchors",
+    "sprout_note_commitment_tree",
+    // Sapling
+    "sapling_nullifiers",
+    "sapling_anchors",
+    "sapling_note_commitment_tree",
+    "sapling_note_commitment_subtree",
+    // Orchard
+    "orchard_nullifiers",
+    "orchard_anchors",
+    "orchard_note_commitment_tree",
+    "orchard_note_commitment_subtree",
+    // Chain
+    "history_tree",
+    "tip_chain_value_pool",
+];
 
 /// The finalized part of the chain state, stored in the db.
 ///
@@ -62,9 +111,6 @@ pub struct FinalizedState {
     // This configuration cannot be modified after the database is initialized,
     // because some clones would have different values.
     //
-    /// The configured network.
-    network: Network,
-
     /// The configured stop height.
     ///
     /// Commit blocks to the finalized state up to this height, then exit Zebra.
@@ -104,6 +150,7 @@ impl FinalizedState {
             false,
             #[cfg(feature = "elasticsearch")]
             elastic_db,
+            false,
         )
     }
 
@@ -116,12 +163,22 @@ impl FinalizedState {
         network: Network,
         debug_skip_format_upgrades: bool,
         #[cfg(feature = "elasticsearch")] elastic_db: Option<elasticsearch::Elasticsearch>,
+        read_only: bool,
     ) -> Self {
-        let db = ZebraDb::new(config, network, debug_skip_format_upgrades);
+        let db = ZebraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            network,
+            debug_skip_format_upgrades,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            read_only,
+        );
 
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
-            network,
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             db,
             elastic_db,
@@ -130,7 +187,6 @@ impl FinalizedState {
 
         #[cfg(not(feature = "elasticsearch"))]
         let new_state = Self {
-            network,
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             db,
         };
@@ -179,7 +235,7 @@ impl FinalizedState {
 
     /// Returns the configured network for this database.
     pub fn network(&self) -> Network {
-        self.network
+        self.db.network()
     }
 
     /// Commit a checkpoint-verified block to the state.
@@ -199,26 +255,20 @@ impl FinalizedState {
         );
 
         if result.is_ok() {
-            metrics::counter!("state.checkpoint.finalized.block.count", 1);
-            metrics::gauge!(
-                "state.checkpoint.finalized.block.height",
-                checkpoint_verified.height.0 as f64,
-            );
+            metrics::counter!("state.checkpoint.finalized.block.count").increment(1);
+            metrics::gauge!("state.checkpoint.finalized.block.height")
+                .set(checkpoint_verified.height.0 as f64);
 
             // This height gauge is updated for both fully verified and checkpoint blocks.
             // These updates can't conflict, because the state makes sure that blocks
             // are committed in order.
-            metrics::gauge!(
-                "zcash.chain.verified.block.height",
-                checkpoint_verified.height.0 as f64,
-            );
-            metrics::counter!("zcash.chain.verified.block.total", 1);
+            metrics::gauge!("zcash.chain.verified.block.height")
+                .set(checkpoint_verified.height.0 as f64);
+            metrics::counter!("zcash.chain.verified.block.total").increment(1);
         } else {
-            metrics::counter!("state.checkpoint.error.block.count", 1);
-            metrics::gauge!(
-                "state.checkpoint.error.block.height",
-                checkpoint_verified.height.0 as f64,
-            );
+            metrics::counter!("state.checkpoint.error.block.count").increment(1);
+            metrics::gauge!("state.checkpoint.error.block.height")
+                .set(checkpoint_verified.height.0 as f64);
         };
 
         // Make the error cloneable, so we can send it to the block verify future,
@@ -290,7 +340,7 @@ impl FinalizedState {
                 // thread, if it shows up in profiles
                 check::block_commitment_is_valid_for_chain_history(
                     block.clone(),
-                    self.network,
+                    self.network(),
                     &history_tree,
                 )?;
 
@@ -302,17 +352,15 @@ impl FinalizedState {
                 let sapling_root = note_commitment_trees.sapling.root();
                 let orchard_root = note_commitment_trees.orchard.root();
                 history_tree_mut.push(self.network(), block.clone(), sapling_root, orchard_root)?;
+                let treestate = Treestate {
+                    note_commitment_trees,
+                    history_tree,
+                };
 
                 (
                     checkpoint_verified.height,
                     checkpoint_verified.hash,
-                    SemanticallyVerifiedBlockWithTrees {
-                        verified: checkpoint_verified.0,
-                        treestate: Treestate {
-                            note_commitment_trees,
-                            history_tree,
-                        },
-                    },
+                    FinalizedBlock::from_checkpoint_verified(checkpoint_verified, treestate),
                     Some(prev_note_commitment_trees),
                 )
             }
@@ -322,10 +370,7 @@ impl FinalizedState {
             } => (
                 contextually_verified.height,
                 contextually_verified.hash,
-                SemanticallyVerifiedBlockWithTrees {
-                    verified: contextually_verified.into(),
-                    treestate,
-                },
+                FinalizedBlock::from_contextually_verified(contextually_verified, treestate),
                 prev_note_commitment_trees,
             ),
         };
@@ -336,7 +381,7 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.db.is_empty() {
             assert_eq!(
-                committed_tip_hash, finalized.verified.block.header.previous_block_hash,
+                committed_tip_hash, finalized.block.header.previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
             );
             assert_eq!(
@@ -352,23 +397,26 @@ impl FinalizedState {
             );
 
             assert_eq!(
-                committed_tip_hash, finalized.verified.block.header.previous_block_hash,
+                committed_tip_hash, finalized.block.header.previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {source}",
             );
         }
 
         #[cfg(feature = "elasticsearch")]
-        let finalized_block = finalized.verified.block.clone();
+        let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
-        let result =
-            self.db
-                .write_block(finalized, prev_note_commitment_trees, self.network, source);
+        let result = self.db.write_block(
+            finalized,
+            prev_note_commitment_trees,
+            self.network(),
+            source,
+        );
 
         if result.is_ok() {
             // Save blocks to elasticsearch if the feature is enabled.
             #[cfg(feature = "elasticsearch")]
-            self.elasticsearch(&finalized_block);
+            self.elasticsearch(&finalized_inner_block);
 
             // TODO: move the stop height check to the syncer (#3442)
             if self.is_at_stop_height(height) {
@@ -404,15 +452,11 @@ impl FinalizedState {
             let block_time = block.header.time.timestamp();
             let local_time = chrono::Utc::now().timestamp();
 
-            // Mainnet bulk size is small enough to avoid the elasticsearch 100mb content
-            // length limitation. MAX_BLOCK_BYTES = 2MB but each block use around 4.1 MB of JSON.
+            // Bulk size is small enough to avoid the elasticsearch 100mb content length limitation.
+            // MAX_BLOCK_BYTES = 2MB but each block use around 4.1 MB of JSON.
             // Each block count as 2 as we send them with a operation/header line. A value of 48
             // is 24 blocks.
-            const MAINNET_AWAY_FROM_TIP_BULK_SIZE: usize = 48;
-
-            // Testnet bulk size is larger as blocks are generally smaller in the testnet.
-            // A value of 800 is 400 blocks as we are not counting the operation line.
-            const TESTNET_AWAY_FROM_TIP_BULK_SIZE: usize = 800;
+            const AWAY_FROM_TIP_BULK_SIZE: usize = 48;
 
             // The number of blocks the bulk will have when we are in sync.
             // A value of 2 means only 1 block as we want to insert them as soon as we get
@@ -423,10 +467,7 @@ impl FinalizedState {
             // less than this number of seconds.
             const CLOSE_TO_TIP_SECONDS: i64 = 14400; // 4 hours
 
-            let mut blocks_size_to_dump = match self.network {
-                Network::Mainnet => MAINNET_AWAY_FROM_TIP_BULK_SIZE,
-                Network::Testnet => TESTNET_AWAY_FROM_TIP_BULK_SIZE,
-            };
+            let mut blocks_size_to_dump = AWAY_FROM_TIP_BULK_SIZE;
 
             // If we are close to the tip, index one block per bulk call.
             if local_time - block_time < CLOSE_TO_TIP_SECONDS {
@@ -453,7 +494,7 @@ impl FinalizedState {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("runtime creation for elasticsearch should not fail.");
                 let blocks = self.elastic_blocks.clone();
-                let network = self.network;
+                let network = self.network();
 
                 rt.block_on(async move {
                     let response = client

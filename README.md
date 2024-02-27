@@ -2,7 +2,7 @@
 
 ---
 
-[![CI Docker](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml) [![CI OSes](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-os.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-os.yml) [![Continuous Delivery](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-delivery.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-delivery.yml) [![codecov](https://codecov.io/gh/ZcashFoundation/zebra/branch/main/graph/badge.svg)](https://codecov.io/gh/ZcashFoundation/zebra) [![Build docs](https://github.com/ZcashFoundation/zebra/actions/workflows/docs.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/docs.yml)
+[![CI Docker](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-integration-tests-gcp.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-integration-tests-gcp.yml) [![CI OSes](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-unit-tests-os.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-unit-tests-os.yml) [![Continuous Delivery](https://github.com/ZcashFoundation/zebra/actions/workflows/cd-deploy-nodes-gcp.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/cd-deploy-nodes-gcp.yml) [![codecov](https://codecov.io/gh/ZcashFoundation/zebra/branch/main/graph/badge.svg)](https://codecov.io/gh/ZcashFoundation/zebra) [![Build docs](https://github.com/ZcashFoundation/zebra/actions/workflows/docs-deploy-firebase.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/docs-deploy-firebase.yml)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 ## Contents
@@ -27,14 +27,13 @@ consensus-compatible implementation of a Zcash node.
 Zebra's network stack is interoperable with `zcashd`, and Zebra implements all
 the features required to reach Zcash network consensus, including the validation
 of all the consensus rules for the NU5 network upgrade.
-[Here](https://doc.zebra.zfnd.org/zebrad/index.html#zebra-advantages) are some
+[Here](https://docs.rs/zebrad/latest/zebrad/index.html#zebra-advantages) are some
 benefits of Zebra.
 
 Zebra validates blocks and transactions, but needs extra software to generate
 them:
 
-- To generate transactions, [run Zebra with
-  `lightwalletd`](https://zebra.zfnd.org/user/lightwalletd.html).
+- To generate transactions, [run Zebra with `lightwalletd`](https://zebra.zfnd.org/user/lightwalletd.html).
 - To generate blocks, use a mining pool or miner with Zebra's mining JSON-RPCs.
   Currently Zebra can only send mining rewards to a single fixed address.
   To distribute rewards, use mining software that creates its own distribution transactions,
@@ -62,8 +61,8 @@ For more information, read our [Docker documentation](https://zebra.zfnd.org/use
 ### Building Zebra
 
 Building Zebra requires [Rust](https://www.rust-lang.org/tools/install),
-[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html),
-[pkg-config](http://pkgconf.org/), and a C++ compiler.
+[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html), and a C++
+compiler.
 
 Zebra is tested with the latest `stable` Rust version. Earlier versions are not
 supported or tested. Any Zebra release can start depending on new features in the
@@ -73,9 +72,11 @@ Every few weeks, we release a [new Zebra version](https://github.com/ZcashFounda
 
 Below are quick summaries for installing the dependencies on your machine.
 
-<details>
+[//]: # "The empty line in the `summary` tag below is required for correct Markdown rendering."
+<details><summary>
 
-<summary><h4>General instructions for installing dependencies</h4></summary>
+#### General instructions for installing dependencies
+</summary>
 
 1. Install [`cargo` and `rustc`](https://www.rust-lang.org/tools/install).
 
@@ -85,16 +86,25 @@ Below are quick summaries for installing the dependencies on your machine.
      package manager. Typical names are `libclang`, `libclang-dev`, `llvm`, or
      `llvm-dev`.
    - **clang** or another C++ compiler: `g++` (all platforms) or `Xcode` (macOS).
-   - **pkg-config**
+   - **[`protoc`](https://grpc.io/docs/protoc-installation/)**
+
+> [!NOTE]
+> Zebra uses the `--experimental_allow_proto3_optional` flag with `protoc`
+> during compilation. This flag was introduced in [Protocol Buffers
+> v3.12.0](https://github.com/protocolbuffers/protobuf/releases/tag/v3.12.0)
+> released in May 16, 2020, so make sure you're not using a version of `protoc`
+> older than 3.12.
 
 </details>
 
-<details>
+[//]: # "The empty line in the `summary` tag below is required for correct Markdown rendering."
+<details><summary>
 
-<summary><h4>Dependencies on Arch</h4></summary>
+#### Dependencies on Arch
+</summary>
 
 ```sh
-sudo pacman -S rust clang pkgconf
+sudo pacman -S rust clang protobuf
 ```
 
 Note that the package `clang` includes `libclang` as well as the C++ compiler.
@@ -117,6 +127,14 @@ See the [Installing Zebra](https://zebra.zfnd.org/user/install.html) and [Runnin
 sections in the book for more details.
 
 #### Optional Configs & Features
+
+##### Initializing Configuration File
+
+```console
+zebrad generate -o ~/.config/zebrad.toml
+```
+
+The above command places the generated `zebrad.toml` config file in the default preferences directory of Linux. For other OSes default locations [see here](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html).
 
 ##### Configuring Progress Bars
 
@@ -142,6 +160,7 @@ You can also build Zebra with additional [Cargo features](https://doc.rust-lang.
 - `prometheus` for [Prometheus metrics](https://zebra.zfnd.org/user/metrics.html)
 - `sentry` for [Sentry monitoring](https://zebra.zfnd.org/user/tracing.html#sentry-production-monitoring)
 - `elasticsearch` for [experimental Elasticsearch support](https://zebra.zfnd.org/user/elasticsearch.html)
+- `shielded-scan` for [experimental shielded scan support](https://zebra.zfnd.org/user/shielded-scan.html)
 
 You can combine multiple features by listing them as parameters of the `--features` flag:
 
@@ -149,8 +168,7 @@ You can combine multiple features by listing them as parameters of the `--featur
 cargo install --features="<feature1> <feature2> ..." ...
 ```
 
-Our full list of experimental and developer features is in [the API
-documentation](https://doc.zebra.zfnd.org/zebrad/index.html#zebra-feature-flags).
+Our full list of experimental and developer features is in [the API documentation](https://docs.rs/zebrad/latest/zebrad/index.html#zebra-feature-flags).
 
 Some debugging and monitoring features are disabled in release builds to increase
 performance.
@@ -159,30 +177,33 @@ performance.
 
 There are a few bugs in Zebra that we're still working on fixing:
 
+- [The `getpeerinfo` RPC shows current and recent outbound connections](https://github.com/ZcashFoundation/zebra/issues/7893), rather than current inbound and outbound connections.
+
 - [Progress bar estimates can become extremely large](https://github.com/console-rs/indicatif/issues/556). We're waiting on a fix in the progress bar library.
 
 - Zebra currently gossips and connects to [private IP addresses](https://en.wikipedia.org/wiki/IP_address#Private_addresses), we want to [disable private IPs but provide a config (#3117)](https://github.com/ZcashFoundation/zebra/issues/3117) in an upcoming release
 
 - Block download and verification sometimes times out during Zebra's initial sync [#5709](https://github.com/ZcashFoundation/zebra/issues/5709). The full sync still finishes reasonably quickly.
 
-- Rust 1.70 [causes crashes during shutdown on macOS x86_64 (#6812)](https://github.com/ZcashFoundation/zebra/issues/6812). The state cache should stay valid despite the crash.
-
 - No Windows support [#3801](https://github.com/ZcashFoundation/zebra/issues/3801). We used to test with Windows Server 2019, but not any more; see the issue for details.
 
 - Experimental Tor support is disabled until [Zebra upgrades to the latest `arti-client`](https://github.com/ZcashFoundation/zebra/issues/5492). This happened due to a Rust dependency conflict, which could only be resolved by `arti` upgrading to a version of `x25519-dalek` with the dependency fix.
 
-## Future Work
-
-We will continue to add new features as part of future network upgrades, and in response to community feedback.
-
 ## Documentation
 
-The [Zebra website](https://zebra.zfnd.org/) contains user documentation, such
-as how to run or configure Zebra, set up metrics integrations, etc., as well as
-developer documentation, such as design documents. We also render [API
-documentation](https://doc.zebra.zfnd.org) for the external API of our crates,
-as well as [internal documentation](https://doc-internal.zebra.zfnd.org) for
-private APIs.
+The Zcash Foundation maintains the following resources documenting Zebra:
+
+- The Zebra Book:
+  - [General Introduction](https://zebra.zfnd.org/index.html),
+  - [User Documentation](https://zebra.zfnd.org/user.html),
+  - [Developer Documentation](https://zebra.zfnd.org/dev.html).
+
+- The [documentation of the public
+  APIs](https://docs.rs/zebrad/latest/zebrad/#zebra-crates) for the latest
+  releases of the individual Zebra crates.
+
+- The [documentation of the internal APIs](https://doc-internal.zebra.zfnd.org)
+  for the `main` branch of the whole Zebra monorepo.
 
 ## User support
 

@@ -1,13 +1,7 @@
 //! ![Zebra logotype](https://zfnd.org/wp-content/uploads/2022/03/zebra-logotype.png)
 //!
-//! Zebra is a Zcash node written in Rust.
-//!
-//! The `zebrad` binary uses a collection of `zebra-*` crates,
-//! which implement the different components of a Zcash node
-//! (networking, chain structures, validation, rpc, etc).
-//!
-//! [Rendered docs from the `main` branch](https://doc.zebra.zfnd.org).
-//! [Join us on the Zcash Foundation Engineering Discord](https://discord.gg/na6QZNd).
+//! Zebra is a Zcash full node written in Rust. Follow the [introductory
+//! page](https://zebra.zfnd.org/index.html#documentation) in the Zebra Book to learn more.
 //!
 //! ## About Zcash
 //!
@@ -51,9 +45,21 @@
 //! - Additional contexts: wider target deployments for people to use a consensus
 //!   node in more contexts e.g. mobile, wasm, etc.
 //!
+//! ## Configuration
+//!
+//! The command below places the generated `zebrad.toml` config file in the default preferences directory of Linux:
+//!
+//! ```console
+//! zebrad generate -o ~/.config/zebrad.toml
+//! ```
+//!
+//! See [`config::ZebradConfig`] for other OSes default locations or more information about how to configure Zebra.
+//!
 //! ## Zebra Feature Flags
 //!
-//! The following `zebrad` feature flags are available at compile time:
+//! The following [Cargo
+//! features](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options)
+//! are available at compile time:
 //!
 //! ### JSON-RPC
 //!
@@ -98,24 +104,42 @@
 //! ### Experimental
 //!
 //! * `elasticsearch`: save block data into elasticsearch database. Read the [elasticsearch](https://zebra.zfnd.org/user/elasticsearch.html)
-//! section of the book for more details.
+//!   section of the book for more details.
+//! * `shielded-scan`: enable experimental support for scanning shielded transactions. Read the [shielded-scan](https://zebra.zfnd.org/user/shielded-scan.html)
+//!   section of the book for more details.
+//! * `internal-miner`: enable experimental support for mining inside Zebra, without an external
+//!   mining pool. This feature is only supported on testnet. Use a GPU or ASIC on mainnet for
+//!   efficient mining.
+//!
+//! ## Zebra crates
+//!
+//! [The Zebra monorepo](https://github.com/ZcashFoundation/zebra) is a collection of the following
+//! crates:
+//!
+//! - [tower-batch-control](https://docs.rs/tower-batch-control/latest/tower_batch_control/)
+//! - [tower-fallback](https://docs.rs/tower-fallback/latest/tower_fallback/)
+//! - [zebra-chain](https://docs.rs/zebra-chain/latest/zebra_chain/)
+//! - [zebra-consensus](https://docs.rs/zebra-consensus/latest/zebra_consensus/)
+//! - [zebra-network](https://docs.rs/zebra-network/latest/zebra_network/)
+//! - [zebra-node-services](https://docs.rs/zebra-node-services/latest/zebra_node_services/)
+//! - [zebra-rpc](https://docs.rs/zebra-rpc/latest/zebra_rpc/)
+//! - [zebra-scan](https://docs.rs/zebra-scan/latest/zebra_scan/)
+//! - [zebra-script](https://docs.rs/zebra-script/latest/zebra_script/)
+//! - [zebra-state](https://docs.rs/zebra-state/latest/zebra_state/)
+//! - [zebra-test](https://docs.rs/zebra-test/latest/zebra_test/)
+//! - [zebra-utils](https://docs.rs/zebra-utils/latest/zebra_utils/)
+//! - [zebrad](https://docs.rs/zebrad/latest/zebrad/)
+//!
+//! The links in the list above point to the documentation of the public APIs of the crates. For
+//! the documentation of the internal APIs, follow <https://doc-internal.zebra.zfnd.org> that lists
+//! all Zebra crates as well in the left sidebar.
 
 #![doc(html_favicon_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-icon.png")]
-#![doc(html_root_url = "https://doc.zebra.zfnd.org/zebrad")]
+#![doc(html_root_url = "https://docs.rs/zebrad")]
 // Tracing causes false positives on this lint:
 // https://github.com/tokio-rs/tracing/issues/553
 #![allow(clippy::cognitive_complexity)]
-//
-// Rust 1.72 has a false positive when nested generics are used inside Arc.
-// This makes the `arc_with_non_send_sync` lint trigger on a lot of proptest code.
-//
-// TODO: remove this allow when Rust 1.73 is stable, because this lint bug is fixed in that release:
-// <https://github.com/rust-lang/rust-clippy/issues/11076>
-#![cfg_attr(
-    any(test, feature = "proptest-impl"),
-    allow(clippy::arc_with_non_send_sync)
-)]
 
 #[macro_use]
 extern crate tracing;

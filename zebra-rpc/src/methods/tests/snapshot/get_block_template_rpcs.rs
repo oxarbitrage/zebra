@@ -86,21 +86,19 @@ pub async fn test_responses<State, ReadState>(
         _transaction_verifier,
         _parameter_download_task_handle,
         _max_checkpoint_height,
-    ) = zebra_consensus::router::init(
-        zebra_consensus::Config::default(),
-        network,
-        state.clone(),
-        true,
-    )
-    .await;
+    ) = zebra_consensus::router::init(zebra_consensus::Config::default(), network, state.clone())
+        .await;
 
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
 
+    #[allow(clippy::unnecessary_struct_initialization)]
     let mining_config = crate::config::mining::Config {
         miner_address: Some(transparent::Address::from_script_hash(network, [0xad; 20])),
         extra_coinbase_data: None,
         debug_like_zcashd: true,
+        // TODO: Use default field values when optional features are enabled in tests #8183
+        //..Default::default()
     };
 
     // nu5 block height

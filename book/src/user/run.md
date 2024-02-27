@@ -7,14 +7,15 @@ changing the config.
 
 The configuration format is the TOML encoding of the internal config
 structure, and documentation for all of the config options can be found
-[here](https://doc.zebra.zfnd.org/zebrad/config/struct.ZebradConfig.html).
+[here](https://docs.rs/zebrad/latest/zebrad/config/struct.ZebradConfig.html).
 
 - `zebrad start` starts a full node.
 
 You can run Zebra as a:
 
-- [`lightwalletd` backend](https://zebra.zfnd.org/user/lightwalletd.html), and
-- experimental [mining backend](https://zebra.zfnd.org/user/mining.html).
+- [`lightwalletd` backend](https://zebra.zfnd.org/user/lightwalletd.html),
+- [mining backend](https://zebra.zfnd.org/user/mining.html), or
+- experimental [Sapling shielded transaction scanner](https://zebra.zfnd.org/user/shielded-scan.html).
 
 ## Supported versions
 

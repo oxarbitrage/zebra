@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     convert::{self, TryFrom},
     pin::Pin,
-    sync::{Arc, TryLockError},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -154,6 +154,17 @@ pub enum BlockDownloadVerifyError {
         height: block::Height,
         hash: block::Hash,
     },
+
+    #[error(
+        "timeout during service readiness, download, verification, or internal downloader operation"
+    )]
+    Timeout,
+}
+
+impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
+    fn from(_value: tokio::time::error::Elapsed) -> Self {
+        BlockDownloadVerifyError::Timeout
+    }
 }
 
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
@@ -319,7 +330,7 @@ where
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
         if self.cancel_handles.contains_key(&hash) {
-            metrics::counter!("sync.already.queued.dropped.block.hash.count", 1);
+            metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
         }
 
@@ -357,7 +368,7 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to download completion");
-                        metrics::counter!("sync.cancelled.download.count", 1);
+                        metrics::counter!("sync.cancelled.download.count").increment(1);
                         return Err(BlockDownloadVerifyError::CancelledDuringDownload { hash })
                     }
                     rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
@@ -378,7 +389,7 @@ where
                 } else {
                     unreachable!("wrong response to block request");
                 };
-                metrics::counter!("sync.downloaded.block.count", 1);
+                metrics::counter!("sync.downloaded.block.count").increment(1);
 
                 // Security & Performance: reject blocks that are too far ahead of our tip.
                 // Avoids denial of service attacks, and reduces wasted work on high blocks
@@ -429,7 +440,7 @@ where
                         ?hash,
                         "synced block with no height: dropped downloaded block"
                     );
-                    metrics::counter!("sync.no.height.dropped.block.count", 1);
+                    metrics::counter!("sync.no.height.dropped.block.count").increment(1);
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash });
                 };
@@ -469,21 +480,16 @@ where
                         );
                     }
 
-                    metrics::counter!("sync.max.height.limit.paused.count", 1);
+                    metrics::counter!("sync.max.height.limit.paused.count").increment(1);
                 } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
-                    // Try to reset the watched value to false, since we're well under the limit.
-                    match past_lookahead_limit_sender.try_lock() {
-                        Ok(watch_sender_guard) => {
-                            // If Zebra is shutting down, ignore the send error.
-                            let _ = watch_sender_guard.send(true);
-                            metrics::counter!("sync.max.height.limit.reset.count", 1);
-                        },
-                        Err(TryLockError::Poisoned(_)) => panic!("thread panicked while holding the past_lookahead_limit_sender mutex guard"),
-                        // We'll try allowing new downloads when we get the next block
-                        Err(TryLockError::WouldBlock) => {}
-                    }
+                    // Reset the watched value to false, since we're well under the limit.
+                    // We need to block here, because if we don't the syncer can hang.
 
-                    metrics::counter!("sync.max.height.limit.reset.attempt.count", 1);
+                    // But if Zebra is shutting down, ignore the send error.
+                    let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
+                    metrics::counter!("sync.max.height.limit.reset.count").increment(1);
+
+                    metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                 }
 
                 if block_height < min_accepted_height {
@@ -495,7 +501,7 @@ where
                         behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
                         "synced block height behind the finalized tip: dropped downloaded block"
                     );
-                    metrics::counter!("gossip.min.height.limit.dropped.block.count", 1);
+                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
 
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
@@ -507,7 +513,7 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled waiting for verifier service readiness");
-                        metrics::counter!("sync.cancelled.verify.ready.count", 1);
+                        metrics::counter!("sync.cancelled.verify.ready.count").increment(1);
                         return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
                     }
                     verifier = readiness => verifier,
@@ -530,14 +536,14 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to verification");
-                        metrics::counter!("sync.cancelled.verify.count", 1);
+                        metrics::counter!("sync.cancelled.verify.count").increment(1);
                         return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash })
                     }
                     verification = rsp => verification,
                 };
 
                 if verification.is_ok() {
-                    metrics::counter!("sync.verified.block.count", 1);
+                    metrics::counter!("sync.verified.block.count").increment(1);
                 }
 
                 verification
@@ -571,14 +577,26 @@ where
     pub fn cancel_all(&mut self) {
         // Replace the pending task list with an empty one and drop it.
         let _ = std::mem::take(&mut self.pending);
+
         // Signal cancellation to all running tasks.
         // Since we already dropped the JoinHandles above, they should
         // fail silently.
         for (_hash, cancel) in self.cancel_handles.drain() {
             let _ = cancel.send(());
         }
+
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
+
+        // Set the lookahead limit to false, since we're empty (so we're under the limit).
+        //
+        // It is ok to block here, because we're doing a reset and sleep anyway.
+        // But if Zebra is shutting down, ignore the send error.
+        let _ = self
+            .past_lookahead_limit_sender
+            .lock()
+            .expect("thread panicked while holding the past_lookahead_limit_sender mutex guard")
+            .send(false);
     }
 
     /// Get the number of currently in-flight download and verify tasks.

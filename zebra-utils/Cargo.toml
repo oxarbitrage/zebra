@@ -1,6 +1,6 @@
 [package]
 name = "zebra-utils"
-version = "1.0.0-beta.30"
+version = "1.0.0-beta.35"
 authors = ["Zcash Foundation <zebra@zfnd.org>"]
 description = "Developer tools for Zebra maintenance and testing"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 # Zebra is only supported on the latest stable Rust version. See the README for details.
 # Any Zebra release can break compatibility with older Rust versions.
-rust-version = "1.70"
+rust-version = "1.73"
 
 [[bin]]
 name = "zebra-checkpoints"
@@ -35,6 +35,11 @@ name = "block-template-to-proposal"
 # this setting is required for Zebra's Docker build caches
 path = "src/bin/block-template-to-proposal/main.rs"
 required-features = ["getblocktemplate-rpcs"]
+
+[[bin]]
+name = "scanning-results-reader"
+path = "src/bin/scanning-results-reader/main.rs"
+required-features = ["shielded-scan"]
 
 [features]
 default = []
@@ -61,6 +66,14 @@ getblocktemplate-rpcs = [
     "zebra-chain/getblocktemplate-rpcs",
 ]
 
+shielded-scan = [
+    "itertools",
+    "jsonrpc",
+    "zcash_primitives",
+    "zcash_client_backend",
+    "zebra-scan"
+]
+
 [dependencies]
 color-eyre = "0.6.2"
 # This is a transitive dependency via color-eyre.
@@ -69,24 +82,30 @@ tinyvec = { version = "1.6.0", features = ["rustc_1_55"] }
 
 structopt = "0.3.26"
 hex = "0.4.3"
-serde_json = "1.0.107"
+serde_json = "1.0.113"
 tracing-error = "0.2.0"
-tracing-subscriber = "0.3.17"
-thiserror = "1.0.48"
+tracing-subscriber = "0.3.18"
+thiserror = "1.0.57"
 
-zebra-node-services = { path = "../zebra-node-services", version = "1.0.0-beta.30" }
-zebra-chain = { path = "../zebra-chain", version = "1.0.0-beta.30" }
+zebra-node-services = { path = "../zebra-node-services", version = "1.0.0-beta.35" }
+zebra-chain = { path = "../zebra-chain", version = "1.0.0-beta.35" }
+zebra-scan = { path = "../zebra-scan", version = "0.1.0-alpha.4", optional = true }
 
 # These crates are needed for the block-template-to-proposal binary
-zebra-rpc = { path = "../zebra-rpc", version = "1.0.0-beta.30", optional = true }
+zebra-rpc = { path = "../zebra-rpc", version = "1.0.0-beta.35", optional = true }
 
 # These crates are needed for the zebra-checkpoints binary
-itertools = { version = "0.11.0", optional = true }
+itertools = { version = "0.12.1", optional = true }
 
 # These crates are needed for the search-issue-refs binary
-regex = { version = "1.10.2", optional = true }
+regex = { version = "1.10.3", optional = true }
 # Avoid default openssl dependency to reduce the dependency tree and security alerts. 
-reqwest = { version = "0.11.22", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.11.24", default-features = false, features = ["rustls-tls"], optional = true }
 
 # These crates are needed for the zebra-checkpoints and search-issue-refs binaries
-tokio = { version = "1.33.0", features = ["full"], optional = true }
+tokio = { version = "1.36.0", features = ["full"], optional = true }
+
+jsonrpc = { version = "0.17.0", optional = true }
+
+zcash_primitives = { version = "0.13.0-rc.1", optional = true }
+zcash_client_backend = {version = "0.10.0-rc.1", optional = true}

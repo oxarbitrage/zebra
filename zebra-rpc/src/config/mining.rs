@@ -15,6 +15,9 @@ pub struct Config {
     /// `getblocktemplate` RPC coinbase transaction.
     pub miner_address: Option<transparent::Address>,
 
+    // TODO: Internal miner config code was removed as part of https://github.com/ZcashFoundation/zebra/issues/8180
+    // Find the removed code at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-rpc/src/config/mining.rs#L18-L38
+    // Restore the code when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
     /// Extra data to include in coinbase transaction inputs.
     /// Limited to around 95 bytes by the consensus rules.
     ///
@@ -36,6 +39,9 @@ impl Default for Config {
             // TODO: do we want to default to v5 transactions and Zebra coinbase data?
             extra_coinbase_data: None,
             debug_like_zcashd: true,
+            // TODO: Internal miner config code was removed as part of https://github.com/ZcashFoundation/zebra/issues/8180
+            // Find the removed code at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-rpc/src/config/mining.rs#L61-L66
+            // Restore the code when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
         }
     }
 }
@@ -47,5 +53,14 @@ impl Config {
     /// enabled, allowing us to log a warning when the config found is different from the default.
     pub fn skip_getblocktemplate(&self) -> bool {
         !cfg!(feature = "getblocktemplate-rpcs")
+    }
+
+    /// Is the internal miner enabled using at least one thread?
+    #[cfg(feature = "internal-miner")]
+    pub fn is_internal_miner_enabled(&self) -> bool {
+        // TODO: Changed to return always false so internal miner is never started. Part of https://github.com/ZcashFoundation/zebra/issues/8180
+        // Find the removed code at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-rpc/src/config/mining.rs#L83
+        // Restore the code when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
+        false
     }
 }

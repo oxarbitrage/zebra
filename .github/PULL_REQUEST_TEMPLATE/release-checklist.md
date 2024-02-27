@@ -9,7 +9,7 @@ assignees: ''
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful full sync test](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml?query=event%3Aschedule) since the last state change, or start a manual full sync.
+- [ ] Make sure there has been [at least one successful full sync test](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-integration-tests-gcp.yml?query=event%3Aschedule) since the last state change, or start a manual full sync.
 - [ ] Make sure the PRs with the new checkpoint hashes and missed dependencies are already merged.
       (See the release ticket checklist for details)
 
@@ -83,13 +83,22 @@ Check that the release will work:
 - [ ] Update crate versions, commit the changes to the release branch, and do a release dry-run:
 
 ```sh
-cargo release version --verbose --execute --allow-branch '*' --workspace --exclude zebrad beta
+# Update everything except for alpha crates and zebrad:
+cargo release version --verbose --execute --allow-branch '*' --workspace --exclude zebrad --exclude zebra-scan --exclude zebra-grpc beta
+# Due to a bug in cargo-release, we need to pass exact versions for alpha crates:
+cargo release version --verbose --execute --allow-branch '*' --package zebra-scan 0.1.0-alpha.4
+cargo release version --verbose --execute --allow-branch '*' --package zebra-grpc 0.1.0-alpha.2
+# Update zebrad:
 cargo release version --verbose --execute --allow-branch '*' --package zebrad patch # [ major | minor | patch ]
+# Continue with the release process:
 cargo release replace --verbose --execute --allow-branch '*' --package zebrad
 cargo release commit --verbose --execute --allow-branch '*'
 ```
 
-Crate publishing is [automatically checked in CI](https://github.com/ZcashFoundation/zebra/actions/workflows/release-crates-io.yml) using "dry run" mode.
+Crate publishing is [automatically checked in CI](https://github.com/ZcashFoundation/zebra/actions/workflows/release-crates-io.yml) using "dry run" mode, however due to a bug in `cargo-release` we need to pass exact versions to the alpha crates:
+
+- [ ] Update `zebra-scan` and `zebra-grpc` alpha crates in the [release-crates-dry-run workflow script](https://github.com/ZcashFoundation/zebra/blob/main/.github/workflows/scripts/release-crates-dry-run.sh)
+- [ ] Push the above version changes to the release branch.
 
 ## Update End of Support
 
@@ -131,8 +140,10 @@ The end of support height is calculated from the current blockchain height:
 
 ## Test the Pre-Release
 
-- [ ] Wait until the [Docker binaries have been built on `main`](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml), and the quick tests have passed.
-- [ ] Wait until the [pre-release deployment machines have successfully launched](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-delivery.yml)
+- [ ] Wait until the Docker binaries have been built on `main`, and the quick tests have passed:
+    - [ ] [ci-unit-tests-docker.yml](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-unit-tests-docker.yml?query=branch%3Amain)
+    - [ ] [ci-integration-tests-gcp.yml](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-integration-tests-gcp.yml?query=branch%3Amain)
+- [ ] Wait until the [pre-release deployment machines have successfully launched](https://github.com/ZcashFoundation/zebra/actions/workflows/cd-deploy-nodes-gcp.yml?query=event%3Arelease)
 
 ## Publish Release
 
@@ -148,7 +159,7 @@ The end of support height is calculated from the current blockchain height:
       and put the output in a comment on the PR.
 
 ## Publish Docker Images
-- [ ] Wait for the [the Docker images to be published successfully](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml).
+- [ ] Wait for the [the Docker images to be published successfully](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease).
 - [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/ZcashFoundation/repo/zebra/queues) using Mergify.
 - [ ] Remove `do-not-merge` from the PRs you added it to
 

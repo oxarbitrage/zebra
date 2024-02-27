@@ -2,8 +2,8 @@
 //!
 //! # Correctness
 //!
-//! The [`crate::constants::DATABASE_FORMAT_VERSION`] constant must
-//! be incremented each time the database format (column, serialization, etc) changes.
+//! [`crate::constants::state_database_format_version_in_code()`] must be incremented
+//! each time the database format (column, serialization, etc) changes.
 
 use std::sync::Arc;
 
@@ -13,11 +13,23 @@ pub mod shielded;
 pub mod transparent;
 pub mod upgrade;
 
-#[cfg(test)]
+#[cfg(feature = "shielded-scan")]
+pub mod scan;
+
+#[cfg(any(test, feature = "proptest-impl"))]
 mod tests;
 
 pub use block::{TransactionIndex, TransactionLocation, MAX_ON_DISK_HEIGHT};
 pub use transparent::{OutputIndex, OutputLocation};
+
+#[cfg(feature = "shielded-scan")]
+pub use scan::{
+    SaplingScannedDatabaseEntry, SaplingScannedDatabaseIndex, SaplingScannedResult,
+    SaplingScanningKey,
+};
+
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use tests::KV;
 
 /// Helper type for writing types to disk as raw bytes.
 /// Also used to convert key types to raw bytes for disk lookups.

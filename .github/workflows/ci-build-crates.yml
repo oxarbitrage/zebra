@@ -1,3 +1,13 @@
+# This workflow facilitates the individual building of Rust crates present in the repository.
+# 1. A matrix is generated dynamically to identify each crate in the repository.
+# 2. This matrix is checked for validity.
+# 3. Each identified crate undergoes three build processes:
+#    - With no features.
+#    - With the default features.
+#    - With all the features enabled.
+# 4. In case of build failures outside of pull requests, an issue is either opened or updated
+#    in the repository to report the failure.
+# Throughout the workflow, various setup steps ensure the correct environment and tools are present.
 name: Build crates individually
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -61,17 +71,18 @@ jobs:
       # This step is meant to dynamically create a JSON containing the values of each crate
       # available in this repo in the root directory. We use `cargo tree` to accomplish this task.
       #
-      # The result from `cargo tree` is then transform to JSON values between double quotes,
-      # and separated by commas, then added to a `crates.txt` and assigned to a $JSON_CRATES variable.
+      # The result from `cargo tree` is then sorted so the longest job (zebrad) runs first,
+      # transformed to JSON values between double quotes, and separated by commas,
+      # then added to a `crates.txt`.
       #
-      # A JSON object is created and assigned to a $MATRIX variable, which is use to create an output
-      # named `matrix`, which is then used as the input in following steps,
+      # A JSON object is created and assigned to a $MATRIX variable, which is use to create an
+      # output named `matrix`, which is then used as the input in following steps,
       # using ` ${{ fromJson(needs.matrix.outputs.matrix) }}`
       - id: set-matrix
         name: Dynamically build crates JSON
         run: |
           TEMP_DIR=$(mktemp -d)
-          echo "$(cargo tree --depth 0 --edges no-normal,no-dev,no-build,no-proc-macro --prefix none | cut -d ' ' -f1 | sed '/^$/d' | awk '{ printf "\"%s\",\n", $0 }' | sed '$ s/.$//')" > $TEMP_DIR/crates.txt
+          cargo tree --depth 0 --edges no-normal,no-dev,no-build,no-proc-macro --prefix none | cut -d ' ' -f1 | sed '/^$/d' | LC_ALL=C sort --reverse | awk '{ printf "\"%s\",\n", $0 }' | sed '$ s/.$//' > $TEMP_DIR/crates.txt
           MATRIX=$( (
             echo '{ "crate" : ['
             echo "$(cat $TEMP_DIR/crates.txt)"
@@ -101,10 +112,12 @@ jobs:
     name: Build ${{ matrix.crate }} crate
     timeout-minutes: 90
     needs: [ matrix, check-matrix ]
-    runs-on: ubuntu-latest
+    # Some of these builds take more than 14GB disk space
+    runs-on: ubuntu-latest-m
     strategy:
-      # avoid rate-limit errors by only launching a few of these jobs at a time
-      max-parallel: 2
+      # avoid rate-limit errors by only launching a few of these jobs at a time,
+      # but still finish in a similar time to the longest tests
+      max-parallel: 4
       fail-fast: true
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
 
@@ -115,7 +128,7 @@ jobs:
       - uses: r7kamura/rust-problem-matchers@v1.4.0
 
       - name: Install last version of Protoc
-        uses: arduino/setup-protoc@v2.1.0
+        uses: arduino/setup-protoc@v3.0.0
         with:
           # TODO: increase to latest version after https://github.com/arduino/setup-protoc/issues/33 is fixed
           version: '23.x'
@@ -126,21 +139,30 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal
 
-        # We could use `features: ['', '--all-features', '--no-default-features']` as a matrix argument,
-        # but it's faster to run these commands sequentially, so they can re-use the local cargo cache.
-        #
-        # Some Zebra crates do not have any features, and most don't have any default features.
-      - name: Build ${{ matrix.crate }} crate with no default features
+      # We could use `features: ['', '--all-features', '--no-default-features']` as a matrix argument,
+      # but it's faster to run these commands sequentially, so they can re-use the local cargo cache.
+      #
+      # Some Zebra crates do not have any features, and most don't have any default features.
+      # Some targets activate features, but we still need to be able to build without them.
+      - name: Build ${{ matrix.crate }} crate with default features
         run: |
-          cargo build --package ${{ matrix.crate }} --no-default-features
-
-      - name: Build ${{ matrix.crate }} crate normally
-        run: |
+          cargo clippy --package ${{ matrix.crate }} -- -D warnings
           cargo build --package ${{ matrix.crate }}
 
-      - name: Build ${{ matrix.crate }} crate with all features
+      - name: Build ${{ matrix.crate }} crate with no default features and all targets
         run: |
-          cargo build --package ${{ matrix.crate }} --all-features
+          cargo clippy --package ${{ matrix.crate }} --no-default-features --all-targets -- -D warnings
+          cargo build --package ${{ matrix.crate }} --no-default-features --all-targets
+
+      - name: Build ${{ matrix.crate }} crate with default features and all targets
+        run: |
+          cargo clippy --package ${{ matrix.crate }} --all-targets -- -D warnings
+          cargo build --package ${{ matrix.crate }} --all-targets
+
+      - name: Build ${{ matrix.crate }} crate with all features and all targets
+        run: |
+          cargo clippy --package ${{ matrix.crate }} --all-features --all-targets -- -D warnings
+          cargo build --package ${{ matrix.crate }} --all-features --all-targets
 
   failure-issue:
     name: Open or update issues for building crates individually failures

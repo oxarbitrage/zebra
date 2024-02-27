@@ -1,17 +1,16 @@
 # Zebra Utilities
 
-This crate contains tools for zebra maintainers.
-
-## Programs
+Tools for maintaining and testing Zebra:
 
 - [zebra-checkpoints](#zebra-checkpoints)
 - [zebrad-hash-lookup](#zebrad-hash-lookup)
 - [zebrad-log-filter](#zebrad-log-filter)
 - [zcash-rpc-diff](#zcash-rpc-diff)
+- [scanning-results-reader](#scanning-results-reader)
 
 Binaries are easier to use if they are located in your system execution path.
 
-### zebra-checkpoints
+## zebra-checkpoints
 
 This command generates a list of zebra checkpoints, and writes them to standard output. Each checkpoint consists of a block height and hash.
 
@@ -21,7 +20,7 @@ Zebra's GitHub workflows automatically generate checkpoints after every `main` b
 These checkpoints can be copied into the `main-checkpoints.txt` and `test-checkpoints.txt` files.
 
 To find the latest checkpoints on the `main` branch:
-1. Find the [latest completed `CI Docker` workflow run on `main`](https://github.com/ZcashFoundation/zebra/actions/workflows/continous-integration-docker.yml?query=branch%3Amain).
+1. Find the [latest completed `CI Docker` workflow run on `main`](https://github.com/ZcashFoundation/zebra/actions/workflows/ci-integration-tests-gcp.yml?query=branch%3Amain).
    Due to GitHub UI issues, some runs will show as waiting, cancelled, or failed,
    but the checkpoints have still been generated.
 2. Go to the `Result of checkpoints-mainnet` step in the
@@ -39,10 +38,10 @@ To create checkpoints, you need a synchronized instance of `zebrad` or `zcashd`.
 
 #### Checkpoint Generation Setup
 
-Make sure your `zebrad` or `zcashd` is [listening for RPC requests](https://doc.zebra.zfnd.org/zebra_rpc/config/struct.Config.html#structfield.listen_addr),
+Make sure your `zebrad` or `zcashd` is [listening for RPC requests](https://doc-internal.zebra.zfnd.org/zebra_rpc/config/struct.Config.html#structfield.listen_addr),
 and synced to the network tip.
 
-If you are on a Debian system, `zcash-cli` [can be installed as a package](https://zcash.readthedocs.io/en/latest/rtd_pages/install_debian_bin_packages.html).
+If you are on a Debian system, `zcash-cli` [can be installed as a package](https://zcash.readthedocs.io/en/master/rtd_pages/install_debian_bin_packages.html).
 
 `zebra-checkpoints` is a standalone rust binary, you can compile it using:
 
@@ -81,10 +80,10 @@ For more details about checkpoint lists, see the [`zebra-checkpoints` README.](h
 To update the testnet checkpoints, `zebra-checkpoints` needs to connect to a testnet node.
 
 To launch a testnet node, you can either:
-- start `zebrad` [with a `zebrad.toml` with `network.network` set to `Testnet`](https://doc.zebra.zfnd.org/zebra_network/struct.Config.html#structfield.network), or
+- start `zebrad` [with a `zebrad.toml` with `network.network` set to `Testnet`](https://docs.rs/zebra-network/latest/zebra_network/struct.Config.html#structfield.network), or
 - run `zcashd -testnet`.
 
-Then use the commands above to renegerate the checkpoints.
+Then use the commands above to regenerate the checkpoints.
 
 #### Submit new checkpoints as pull request
 
@@ -93,7 +92,7 @@ Then use the commands above to renegerate the checkpoints.
 - Open a pull request with the updated Mainnet and Testnet lists at:
   https://github.com/ZcashFoundation/zebra/pulls
 
-### zebrad-hash-lookup
+## zebrad-hash-lookup
 
 Given a block hash the script will get additional information using `zcash-cli`.
 
@@ -108,7 +107,7 @@ $
 ```
 This program is commonly used as part of `zebrad-log-filter` where hashes will be captured from `zebrad` output.
 
-### zebrad-log-filter
+## zebrad-log-filter
 
 The program is designed to filter the output from the zebra terminal or log file. Each time a hash is seen the script will capture it and get the additional information using `zebrad-hash-lookup`.
 
@@ -127,7 +126,7 @@ next: 00000001436277884eef900772f0fcec9566becccebaab4713fd665b60fab309
 ...
 ```
 
-### zcash-rpc-diff
+## zcash-rpc-diff
 
 This program compares `zebrad` and `zcashd` RPC responses.
 
@@ -188,3 +187,48 @@ You can override the binaries the script calls using these environmental variabl
 - `$ZCASH_CLI`
 - `$DIFF`
 - `$JQ`
+
+## Scanning Results Reader
+
+A utility for displaying Zebra's scanning results.
+
+### How It Works
+
+1. Opens Zebra's scanning storage and reads the results containing scanning keys
+   and TXIDs.
+2. Fetches the transactions by their TXIDs from Zebra using the
+   `getrawtransaction` RPC.
+3. Decrypts the tx outputs using the corresponding scanning key.
+4. Prints the memos in the outputs.
+
+### How to Try It
+
+#### Scan the Block Chain with Zebra
+
+1. Follow the [Build & Install](https://zebra.zfnd.org/user/shielded-scan.html#build--install)
+   and [Configuration](https://zebra.zfnd.org/user/shielded-scan.html#configuration)
+   instructions in the Zebra Book.
+
+2. Make sure Zebra runs on Mainnet and listens on the default RPC port by having
+   the following in the config file:
+
+    ``` toml
+    [network]
+    network = 'Mainnet'
+
+    [rpc]
+    listen_addr = "127.0.0.1:8232"
+    ```
+
+3. Run Zebra with your config file. You can follow the
+   [Scanning the Block Chain](https://zebra.zfnd.org/user/shielded-scan.html#scanning-the-block-chain)
+   section in the book for more details.
+
+#### Run the Reader
+
+4. To print the memos in outputs decryptable by the provided scanning keys, run
+   the reader while also running Zebra. For example:
+
+   ``` bash
+   cargo run --release --features shielded-scan --bin scanning-results-reader
+   ```

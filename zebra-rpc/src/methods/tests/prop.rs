@@ -45,7 +45,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -100,7 +100,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -160,7 +160,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -228,7 +228,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -285,7 +285,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -340,7 +340,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -441,12 +441,12 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
 
-            let send_task = tokio::spawn(rpc.get_raw_transaction(non_hex_string, 0));
+            let send_task = tokio::spawn(rpc.get_raw_transaction(non_hex_string, Some(0)));
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -500,12 +500,12 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
 
-            let send_task = tokio::spawn(rpc.get_raw_transaction(hex::encode(random_bytes), 0));
+            let send_task = tokio::spawn(rpc.get_raw_transaction(hex::encode(random_bytes), Some(0)));
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -548,7 +548,7 @@ proptest! {
             network,
             false,
             true,
-            Buffer::new(mempool.clone(), 1),
+            mempool.clone(),
             Buffer::new(state.clone(), 1),
             NoChainTip,
         );
@@ -599,7 +599,7 @@ proptest! {
             network,
             false,
             true,
-            Buffer::new(mempool.clone(), 1),
+            mempool.clone(),
             Buffer::new(state.clone(), 1),
             chain_tip,
         );
@@ -686,7 +686,7 @@ proptest! {
                 network,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
             );
@@ -750,7 +750,7 @@ proptest! {
                 network,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 chain_tip,
             );
@@ -802,7 +802,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );
@@ -892,7 +892,7 @@ proptest! {
                 Mainnet,
                 false,
                 true,
-                Buffer::new(mempool.clone(), 1),
+                mempool.clone(),
                 Buffer::new(state.clone(), 1),
                 NoChainTip,
             );

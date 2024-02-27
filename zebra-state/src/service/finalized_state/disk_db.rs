@@ -7,8 +7,8 @@
 //!
 //! # Correctness
 //!
-//! The [`crate::constants::DATABASE_FORMAT_VERSION`] constants must
-//! be incremented each time the database format (column, serialization, etc) changes.
+//! [`crate::constants::state_database_format_version_in_code()`] must be incremented
+//! each time the database format (column, serialization, etc) changes.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,12 +22,17 @@ use itertools::Itertools;
 use rlimit::increase_nofile_limit;
 
 use rocksdb::ReadOptions;
-use zebra_chain::parameters::Network;
+use semver::Version;
+use zebra_chain::{parameters::Network, primitives::byte_array::increment_big_endian};
 
 use crate::{
     service::finalized_state::disk_format::{FromDisk, IntoDisk},
     Config,
 };
+
+// Doc-only imports
+#[allow(unused_imports)]
+use super::{TypedColumnFamily, WriteTypedBatch};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod tests;
@@ -65,6 +70,12 @@ pub struct DiskDb {
     // This configuration cannot be modified after the database is initialized,
     // because some clones would have different values.
     //
+    /// The configured database kind for this database.
+    db_kind: String,
+
+    /// The format version of the running Zebra code.
+    format_version_in_code: Version,
+
     /// The configured network for this database.
     network: Network,
 
@@ -93,10 +104,6 @@ pub struct DiskDb {
 ///
 /// [`rocksdb::WriteBatch`] is a batched set of database updates,
 /// which must be written to the database using `DiskDb::write(batch)`.
-//
-// TODO: move DiskDb, FinalizedBlock, and the source String into this struct,
-//       (DiskDb can be cloned),
-//       and make them accessible via read-only methods
 #[must_use = "batches must be written to the database"]
 #[derive(Default)]
 pub struct DiskWriteBatch {
@@ -104,10 +111,30 @@ pub struct DiskWriteBatch {
     batch: rocksdb::WriteBatch,
 }
 
-/// Helper trait for inserting (Key, Value) pairs into rocksdb with a consistently
-/// defined format
+impl Debug for DiskWriteBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskWriteBatch")
+            .field("batch", &format!("{} bytes", self.batch.size_in_bytes()))
+            .finish()
+    }
+}
+
+impl PartialEq for DiskWriteBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch.data() == other.batch.data()
+    }
+}
+
+impl Eq for DiskWriteBatch {}
+
+/// Helper trait for inserting serialized typed (Key, Value) pairs into rocksdb.
+///
+/// # Deprecation
+///
+/// This trait should not be used in new code, use [`WriteTypedBatch`] instead.
 //
-// TODO: just implement these methods directly on WriteBatch
+// TODO: replace uses of this trait with WriteTypedBatch,
+//       implement these methods directly on WriteTypedBatch, and delete the trait.
 pub trait WriteDisk {
     /// Serialize and insert the given key and value into a rocksdb column family,
     /// overwriting any existing `value` for `key`.
@@ -117,20 +144,29 @@ pub trait WriteDisk {
         K: IntoDisk + Debug,
         V: IntoDisk;
 
-    /// Remove the given key from rocksdb column family if it exists.
+    /// Remove the given key from a rocksdb column family, if it exists.
     fn zs_delete<C, K>(&mut self, cf: &C, key: K)
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + Debug;
 
-    /// Deletes the given key range from rocksdb column family if it exists, including `from` and
-    /// excluding `to`.
-    fn zs_delete_range<C, K>(&mut self, cf: &C, from: K, to: K)
+    /// Delete the given key range from a rocksdb column family, if it exists, including `from`
+    /// and excluding `until_strictly_before`.
+    //
+    // TODO: convert zs_delete_range() to take std::ops::RangeBounds
+    //       see zs_range_iter() for an example of the edge cases
+    fn zs_delete_range<C, K>(&mut self, cf: &C, from: K, until_strictly_before: K)
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + Debug;
 }
 
+/// # Deprecation
+///
+/// These impls should not be used in new code, use [`WriteTypedBatch`] instead.
+//
+// TODO: replace uses of these impls with WriteTypedBatch,
+//       implement these methods directly on WriteTypedBatch, and delete the trait.
 impl WriteDisk for DiskWriteBatch {
     fn zs_insert<C, K, V>(&mut self, cf: &C, key: K, value: V)
     where
@@ -154,22 +190,57 @@ impl WriteDisk for DiskWriteBatch {
 
     // TODO: convert zs_delete_range() to take std::ops::RangeBounds
     //       see zs_range_iter() for an example of the edge cases
-    fn zs_delete_range<C, K>(&mut self, cf: &C, from: K, to: K)
+    fn zs_delete_range<C, K>(&mut self, cf: &C, from: K, until_strictly_before: K)
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + Debug,
     {
         let from_bytes = from.as_bytes();
-        let to_bytes = to.as_bytes();
-        self.batch.delete_range_cf(cf, from_bytes, to_bytes);
+        let until_strictly_before_bytes = until_strictly_before.as_bytes();
+        self.batch
+            .delete_range_cf(cf, from_bytes, until_strictly_before_bytes);
     }
 }
 
-/// Helper trait for retrieving values from rocksdb column familys with a consistently
-/// defined format
+// Allow &mut DiskWriteBatch as well as owned DiskWriteBatch
+impl<T> WriteDisk for &mut T
+where
+    T: WriteDisk,
+{
+    fn zs_insert<C, K, V>(&mut self, cf: &C, key: K, value: V)
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + Debug,
+        V: IntoDisk,
+    {
+        (*self).zs_insert(cf, key, value)
+    }
+
+    fn zs_delete<C, K>(&mut self, cf: &C, key: K)
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + Debug,
+    {
+        (*self).zs_delete(cf, key)
+    }
+
+    fn zs_delete_range<C, K>(&mut self, cf: &C, from: K, until_strictly_before: K)
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + Debug,
+    {
+        (*self).zs_delete_range(cf, from, until_strictly_before)
+    }
+}
+
+/// Helper trait for retrieving and deserializing values from rocksdb column families.
+///
+/// # Deprecation
+///
+/// This trait should not be used in new code, use [`TypedColumnFamily`] instead.
 //
-// TODO: just implement these methods directly on DiskDb
-//       move this trait, its methods, and support methods to another module
+// TODO: replace uses of this trait with TypedColumnFamily,
+//       implement these methods directly on DiskDb, and delete the trait.
 pub trait ReadDisk {
     /// Returns true if a rocksdb column family `cf` does not contain any entries.
     fn zs_is_empty<C>(&self, cf: &C) -> bool
@@ -217,11 +288,31 @@ pub trait ReadDisk {
         K: IntoDisk + FromDisk,
         V: FromDisk;
 
+    /// Returns the first key strictly greater than `lower_bound` in `cf`,
+    /// and the corresponding value.
+    ///
+    /// Returns `None` if there are no keys greater than `lower_bound`.
+    fn zs_next_key_value_strictly_after<C, K, V>(&self, cf: &C, lower_bound: &K) -> Option<(K, V)>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk;
+
     /// Returns the first key less than or equal to `upper_bound` in `cf`,
     /// and the corresponding value.
     ///
     /// Returns `None` if there are no keys less than or equal to `upper_bound`.
     fn zs_prev_key_value_back_from<C, K, V>(&self, cf: &C, upper_bound: &K) -> Option<(K, V)>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk;
+
+    /// Returns the first key strictly less than `upper_bound` in `cf`,
+    /// and the corresponding value.
+    ///
+    /// Returns `None` if there are no keys less than `upper_bound`.
+    fn zs_prev_key_value_strictly_before<C, K, V>(&self, cf: &C, upper_bound: &K) -> Option<(K, V)>
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + FromDisk,
@@ -269,6 +360,12 @@ impl PartialEq for DiskDb {
 
 impl Eq for DiskDb {}
 
+/// # Deprecation
+///
+/// These impls should not be used in new code, use [`TypedColumnFamily`] instead.
+//
+// TODO: replace uses of these impls with TypedColumnFamily,
+//       implement these methods directly on DiskDb, and delete the trait.
 impl ReadDisk for DiskDb {
     fn zs_is_empty<C>(&self, cf: &C) -> bool
     where
@@ -318,7 +415,6 @@ impl ReadDisk for DiskDb {
             .is_some()
     }
 
-    #[allow(clippy::unwrap_in_result)]
     fn zs_first_key_value<C, K, V>(&self, cf: &C) -> Option<(K, V)>
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -326,10 +422,9 @@ impl ReadDisk for DiskDb {
         V: FromDisk,
     {
         // Reading individual values from iterators does not seem to cause database hangs.
-        self.zs_range_iter(cf, .., false).next()
+        self.zs_forward_range_iter(cf, ..).next()
     }
 
-    #[allow(clippy::unwrap_in_result)]
     fn zs_last_key_value<C, K, V>(&self, cf: &C) -> Option<(K, V)>
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -337,29 +432,47 @@ impl ReadDisk for DiskDb {
         V: FromDisk,
     {
         // Reading individual values from iterators does not seem to cause database hangs.
-        self.zs_range_iter(cf, .., true).next()
+        self.zs_reverse_range_iter(cf, ..).next()
     }
 
-    #[allow(clippy::unwrap_in_result)]
     fn zs_next_key_value_from<C, K, V>(&self, cf: &C, lower_bound: &K) -> Option<(K, V)>
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + FromDisk,
         V: FromDisk,
     {
-        // Reading individual values from iterators does not seem to cause database hangs.
-        self.zs_range_iter(cf, lower_bound.., false).next()
+        self.zs_forward_range_iter(cf, lower_bound..).next()
     }
 
-    #[allow(clippy::unwrap_in_result)]
+    fn zs_next_key_value_strictly_after<C, K, V>(&self, cf: &C, lower_bound: &K) -> Option<(K, V)>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+    {
+        use std::ops::Bound::*;
+
+        // There is no standard syntax for an excluded start bound.
+        self.zs_forward_range_iter(cf, (Excluded(lower_bound), Unbounded))
+            .next()
+    }
+
     fn zs_prev_key_value_back_from<C, K, V>(&self, cf: &C, upper_bound: &K) -> Option<(K, V)>
     where
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk + FromDisk,
         V: FromDisk,
     {
-        // Reading individual values from iterators does not seem to cause database hangs.
-        self.zs_range_iter(cf, ..=upper_bound, true).next()
+        self.zs_reverse_range_iter(cf, ..=upper_bound).next()
+    }
+
+    fn zs_prev_key_value_strictly_before<C, K, V>(&self, cf: &C, upper_bound: &K) -> Option<(K, V)>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+    {
+        self.zs_reverse_range_iter(cf, ..upper_bound).next()
     }
 
     fn zs_items_in_range_ordered<C, K, V, R>(&self, cf: &C, range: R) -> BTreeMap<K, V>
@@ -369,7 +482,7 @@ impl ReadDisk for DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter(cf, range, false).collect()
+        self.zs_forward_range_iter(cf, range).collect()
     }
 
     fn zs_items_in_range_unordered<C, K, V, R>(&self, cf: &C, range: R) -> HashMap<K, V>
@@ -379,7 +492,7 @@ impl ReadDisk for DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter(cf, range, false).collect()
+        self.zs_forward_range_iter(cf, range).collect()
     }
 }
 
@@ -399,18 +512,13 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
-    /// Returns an iterator over the items in `cf` in `range`.
-    ///
-    /// Accepts a `reverse` argument. If it is `true`, creates the iterator with an
-    /// [`IteratorMode`](rocksdb::IteratorMode) of [`End`](rocksdb::IteratorMode::End), or
-    /// [`From`](rocksdb::IteratorMode::From) with [`Direction::Reverse`](rocksdb::Direction::Reverse).
+    /// Returns a forward iterator over the items in `cf` in `range`.
     ///
     /// Holding this iterator open might delay block commit transactions.
-    pub fn zs_range_iter<C, K, V, R>(
+    pub fn zs_forward_range_iter<C, K, V, R>(
         &self,
         cf: &C,
         range: R,
-        reverse: bool,
     ) -> impl Iterator<Item = (K, V)> + '_
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -418,14 +526,12 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, reverse)
+        self.zs_range_iter_with_direction(cf, range, false)
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.
     ///
     /// Holding this iterator open might delay block commit transactions.
-    ///
-    /// This code is copied from `zs_range_iter()`, but with the mode reversed.
     pub fn zs_reverse_range_iter<C, K, V, R>(
         &self,
         cf: &C,
@@ -534,11 +640,8 @@ impl DiskDb {
             Included(mut bound) => {
                 // Increment the last byte in the upper bound that is less than u8::MAX, and
                 // clear any bytes after it to increment the next key in lexicographic order
-                // (next big-endian number) this Vec represents to RocksDB.
-                let is_wrapped_overflow = bound.iter_mut().rev().all(|v| {
-                    *v = v.wrapping_add(1);
-                    v == &0
-                });
+                // (next big-endian number). RocksDB uses lexicographic order for keys.
+                let is_wrapped_overflow = increment_big_endian(&mut bound);
 
                 if is_wrapped_overflow {
                     bound.insert(0, 0x01)
@@ -617,44 +720,19 @@ impl DiskDb {
     /// <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning>
     const MEMTABLE_RAM_CACHE_MEGABYTES: usize = 128;
 
-    /// The column families supported by the running database code.
-    const COLUMN_FAMILIES_IN_CODE: &'static [&'static str] = &[
-        // Blocks
-        "hash_by_height",
-        "height_by_hash",
-        "block_header_by_height",
-        // Transactions
-        "tx_by_loc",
-        "hash_by_tx_loc",
-        "tx_loc_by_hash",
-        // Transparent
-        "balance_by_transparent_addr",
-        "tx_loc_by_transparent_addr_loc",
-        "utxo_by_out_loc",
-        "utxo_loc_by_transparent_addr_loc",
-        // Sprout
-        "sprout_nullifiers",
-        "sprout_anchors",
-        "sprout_note_commitment_tree",
-        // Sapling
-        "sapling_nullifiers",
-        "sapling_anchors",
-        "sapling_note_commitment_tree",
-        "sapling_note_commitment_subtree",
-        // Orchard
-        "orchard_nullifiers",
-        "orchard_anchors",
-        "orchard_note_commitment_tree",
-        "orchard_note_commitment_subtree",
-        // Chain
-        "history_tree",
-        "tip_chain_value_pool",
-    ];
-
-    /// Opens or creates the database at `config.path` for `network`,
+    /// Opens or creates the database at a path based on the kind, major version and network,
+    /// with the supplied column families, preserving any existing column families,
     /// and returns a shared low-level database wrapper.
-    pub fn new(config: &Config, network: Network) -> DiskDb {
-        let path = config.db_path(network);
+    pub fn new(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: Network,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+    ) -> DiskDb {
+        let db_kind = db_kind.as_ref();
+        let path = config.db_path(db_kind, format_version_in_code.major, network);
 
         let db_options = DiskDb::options();
 
@@ -666,9 +744,7 @@ impl DiskDb {
         //
         // <https://github.com/facebook/rocksdb/wiki/Column-Families#reference>
         let column_families_on_disk = DB::list_cf(&db_options, &path).unwrap_or_default();
-        let column_families_in_code = Self::COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string);
+        let column_families_in_code = column_families_in_code.into_iter();
 
         let column_families = column_families_on_disk
             .into_iter()
@@ -676,13 +752,19 @@ impl DiskDb {
             .unique()
             .map(|cf_name| rocksdb::ColumnFamilyDescriptor::new(cf_name, db_options.clone()));
 
-        let db_result = DB::open_cf_descriptors(&db_options, &path, column_families);
+        let db_result = if read_only {
+            DB::open_cf_descriptors_read_only(&db_options, &path, column_families, false)
+        } else {
+            DB::open_cf_descriptors(&db_options, &path, column_families)
+        };
 
         match db_result {
             Ok(db) => {
                 info!("Opened Zebra state cache at {}", path.display());
 
                 let db = DiskDb {
+                    db_kind: db_kind.to_string(),
+                    format_version_in_code: format_version_in_code.clone(),
                     network,
                     ephemeral: config.ephemeral,
                     db: Arc::new(db),
@@ -704,6 +786,21 @@ impl DiskDb {
 
     // Accessor methods
 
+    /// Returns the configured database kind for this database.
+    pub fn db_kind(&self) -> String {
+        self.db_kind.clone()
+    }
+
+    /// Returns the format version of the running code that created this `DiskDb` instance in memory.
+    pub fn format_version_in_code(&self) -> Version {
+        self.format_version_in_code.clone()
+    }
+
+    /// Returns the fixed major version for this database.
+    pub fn major_version(&self) -> u64 {
+        self.format_version_in_code().major
+    }
+
     /// Returns the configured network for this database.
     pub fn network(&self) -> Network {
         self.network
@@ -714,8 +811,18 @@ impl DiskDb {
         self.db.path()
     }
 
+    /// Returns the low-level rocksdb inner database.
+    #[allow(dead_code)]
+    fn inner(&self) -> &Arc<DB> {
+        &self.db
+    }
+
     /// Returns the column family handle for `cf_name`.
-    pub fn cf_handle(&self, cf_name: &str) -> Option<impl rocksdb::AsColumnFamilyRef + '_> {
+    pub fn cf_handle(&self, cf_name: &str) -> Option<rocksdb::ColumnFamilyRef<'_>> {
+        // Note: the lifetime returned by this method is subtly wrong. As of December 2023 it is
+        // the shorter of &self and &str, but RocksDB clones column family names internally, so it
+        // should just be &self. To avoid this restriction, clone the string before passing it to
+        // this method. Currently Zebra uses static strings, so this doesn't matter.
         self.db.cf_handle(cf_name)
     }
 

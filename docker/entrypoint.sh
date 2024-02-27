@@ -58,6 +58,9 @@ fi
 ####
 
 : "${RUN_ALL_TESTS:=}"
+: "${RUN_ALL_EXPERIMENTAL_TESTS:=}"
+: "${TEST_FAKE_ACTIVATION_HEIGHTS:=}"
+: "${TEST_ZEBRA_EMPTY_SYNC:=}"
 : "${ZEBRA_TEST_LIGHTWALLETD:=}"
 : "${FULL_SYNC_MAINNET_TIMEOUT_MINUTES:=}"
 : "${FULL_SYNC_TESTNET_TIMEOUT_MINUTES:=}"
@@ -73,6 +76,7 @@ fi
 : "${TEST_LWD_TRANSACTIONS:=}"
 : "${TEST_GET_BLOCK_TEMPLATE:=}"
 : "${TEST_SUBMIT_BLOCK:=}"
+: "${TEST_SCAN_START_WHERE_LEFT:=}"
 : "${ENTRYPOINT_FEATURES:=}"
 
 # Configuration file path
@@ -220,12 +224,27 @@ case "$1" in
       # For these tests, we activate the test features to avoid recompiling `zebrad`,
       # but we don't actually run any gRPC tests.
       if [[ "${RUN_ALL_TESTS}" -eq "1" ]]; then
-          # Run all the available tests for the current environment.
-          # If the lightwalletd environmental variables are set, we will also run those tests.
-          exec cargo test --locked --release --features "${ENTRYPOINT_FEATURES}" --workspace -- --nocapture --include-ignored
+        # Run unit, basic acceptance tests, and ignored tests, only showing command output if the test fails.
+        # If the lightwalletd environmental variables are set, we will also run those tests.
+        exec cargo test --locked --release --features "${ENTRYPOINT_FEATURES}" --workspace -- --nocapture --include-ignored
 
-      # For these tests, we activate the gRPC feature to avoid recompiling `zebrad`,
-      # but we don't actually run any gRPC tests.
+      elif [[ "${RUN_ALL_EXPERIMENTAL_TESTS}" -eq "1" ]]; then
+        # Run unit, basic acceptance tests, and ignored tests with experimental features.
+        # If the lightwalletd environmental variables are set, we will also run those tests.
+        exec cargo test --locked --release --features "${ENTRYPOINT_FEATURES_EXPERIMENTAL}" --workspace -- --nocapture --include-ignored
+
+      elif [[ "${TEST_FAKE_ACTIVATION_HEIGHTS}" -eq "1" ]]; then
+        # Run state tests with fake activation heights.
+        exec cargo test --locked --release --features "zebra-test" --package zebra-state --lib -- --nocapture --include-ignored with_fake_activation_heights
+
+      elif [[ "${TEST_ZEBRA_EMPTY_SYNC}" -eq "1" ]]; then
+        # Test that Zebra syncs and checkpoints a few thousand blocks from an empty state.
+        run_cargo_test "${ENTRYPOINT_FEATURES}" "sync_large_checkpoints_"
+
+      elif [[ "${ZEBRA_TEST_LIGHTWALLETD}" -eq "1" ]]; then
+        # Test launching lightwalletd with an empty lightwalletd and Zebra state.
+        run_cargo_test "${ENTRYPOINT_FEATURES}" "lightwalletd_integration"
+
       elif [[ -n "${FULL_SYNC_MAINNET_TIMEOUT_MINUTES}" ]]; then
         # Run a Zebra full sync test on mainnet.
         run_cargo_test "${ENTRYPOINT_FEATURES}" "full_sync_mainnet"
@@ -325,6 +344,11 @@ case "$1" in
         # Starting with a cached Zebra tip, test sending a block to Zebra's RPC port.
         check_directory_files "${ZEBRA_CACHED_STATE_DIR}"
         run_cargo_test "${ENTRYPOINT_FEATURES}" "submit_block"
+
+      elif [[ "${TEST_SCAN_START_WHERE_LEFT}" -eq "1" ]]; then
+        # Test that the scanner can continue scanning where it was left when zebrad restarts.
+        check_directory_files "${ZEBRA_CACHED_STATE_DIR}"
+        run_cargo_test "shielded-scan" "scan_start_where_left"
 
       else
           exec "$@"

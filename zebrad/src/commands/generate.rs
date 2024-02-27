@@ -37,13 +37,22 @@ impl Runnable for GenerateCmd {
 #
 # The config format (including a complete list of sections and fields) is
 # documented here:
-# https://doc.zebra.zfnd.org/zebrad/config/struct.ZebradConfig.html
+# https://docs.rs/zebrad/latest/zebrad/config/struct.ZebradConfig.html
 #
 # zebrad attempts to load configs in the following order:
 #
 # 1. The -c flag on the command line, e.g., `zebrad -c myconfig.toml start`;
 # 2. The file `zebrad.toml` in the users's preference directory (platform-dependent);
 # 3. The default config.
+#
+# The user's preference directory and the default path to the `zebrad` config are platform dependent,
+# based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
+#
+# | Platform | Value                                 | Example                                        |
+# | -------- | ------------------------------------- | ---------------------------------------------- |
+# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zebrad.toml`              |
+# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zebrad.toml` |
+# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zebrad.toml`     |
 
 "
         .to_owned();

@@ -1,3 +1,16 @@
+# Google Cloud unit tests that run when Rust code or dependencies are modified,
+# but only on PRs from the ZcashFoundation/zebra repository. (External PRs are tested by mergify.)
+#
+# This workflow is designed for running various unit tests within Docker containers.
+# Jobs:
+# 1. Builds a Docker image for tests, adaptable to the specified network (Mainnet or Testnet).
+# 2. 'test-all': Executes all Zebra tests, including normally ignored ones, in a Docker environment.
+# 3. 'test-fake-activation-heights': Runs state tests with fake activation heights, isolating its build products.
+# 4. 'test-empty-sync': Tests Zebra's ability to sync and checkpoint from an empty state.
+# 5. 'test-lightwalletd-integration': Validates integration with 'lightwalletd' starting from an empty state.
+# 6. 'test-configuration-file': Assesses the default Docker configuration for Zebra.
+# 7. 'test-configuration-file-testnet': Checks the Docker image reconfiguration for the Testnet.
+# 8. 'test-zebra-conf-path': Tests Zebra using a custom Docker configuration.
 name: Docker Unit Tests
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -21,6 +34,7 @@ on:
         default: false
 
   pull_request:
+    # Skip PRs where Rust code and dependencies aren't modified.
     paths:
       # code and tests
       - '**/*.rs'
@@ -40,10 +54,12 @@ on:
       - '.github/workflows/sub-deploy-integration-tests-gcp.yml'
       - '.github/workflows/sub-build-docker-image.yml'
       - '.github/workflows/sub-find-cached-disks.yml'
+      - '.github/workflows/sub-test-zebra-config.yml'
 
   push:
     branches:
       - main
+    # Skip main branch updates where Rust code and dependencies aren't modified.
     paths:
       # code and tests
       - '**/*.rs'
@@ -66,15 +82,16 @@ on:
       - '.github/workflows/sub-build-docker-image.yml'
 
 env:
-  # We need to combine the features manually because some tests don't use the Docker entrypoint
-  TEST_FEATURES: ${{ format('{0} {1}', vars.RUST_PROD_FEATURES, vars.RUST_TEST_FEATURES) }}
-  EXPERIMENTAL_FEATURES: ${{ format('{0} {1} {2}', vars.RUST_PROD_FEATURES, vars.RUST_TEST_FEATURES, vars.RUST_EXPERIMENTAL_FEATURES) }}
   RUST_LOG: ${{ vars.RUST_LOG }}
   RUST_BACKTRACE: ${{ vars.RUST_BACKTRACE }}
   RUST_LIB_BACKTRACE: ${{ vars.RUST_LIB_BACKTRACE }}
   COLORBT_SHOW_HIDDEN: ${{ vars.COLORBT_SHOW_HIDDEN }}
   CARGO_INCREMENTAL: ${{ vars.CARGO_INCREMENTAL }}
 
+# IMPORTANT
+#
+# The job names in `ci-unit-tests-docker.yml`, `ci-unit-tests-docker.patch.yml` and
+# `ci-unit-tests-docker.patch-external.yml` must be kept in sync.
 jobs:
   # Build the docker image used by the tests.
   #
@@ -83,6 +100,8 @@ jobs:
   # testnet when running the image.
   build:
     name: Build CI Docker
+    # Skip PRs from external repositories, let them pass, and then Mergify will check them
+    if: ${{ !startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork }}
     uses: ./.github/workflows/sub-build-docker-image.yml
     with:
       dockerfile_path: ./docker/Dockerfile
@@ -113,18 +132,21 @@ jobs:
       #
       # If some tests hang, add "-- --nocapture" for just that test, or for all the tests.
       #
-      # TODO: move this test command into entrypoint.sh
-      #       add a separate experimental workflow job if this job is slow
       - name: Run zebrad tests
-        run: |
-          docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
-          docker run -e NETWORK --name zebrad-tests --tty ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }} cargo test --locked --release --features "${{ env.TEST_FEATURES }}" --workspace -- --include-ignored
-          # Currently GitHub doesn't allow empty variables
-          if [[ -n "${{ vars.RUST_EXPERIMENTAL_FEATURES }}" && "${{ vars.RUST_EXPERIMENTAL_FEATURES }}" != " " ]]; then
-            docker run -e NETWORK --name zebrad-tests-experimental --tty ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }} cargo test --locked --release --features "${{ env.EXPERIMENTAL_FEATURES }} " --workspace -- --include-ignored
-          fi
         env:
           NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
+        run: |
+          docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
+          docker run --tty -e NETWORK -e RUN_ALL_TESTS=1 ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
+
+      # Run unit, basic acceptance tests, and ignored tests with experimental features.
+      #
+      - name: Run zebrad tests with experimental features
+        env:
+          NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
+        run: |
+          docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
+          docker run --tty -e NETWORK -e RUN_ALL_EXPERIMENTAL_TESTS=1 ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
 
   # Run state tests with fake activation heights.
   #
@@ -148,15 +170,12 @@ jobs:
         with:
           short-length: 7
 
-      # TODO: move this test command into entrypoint.sh
-      #       make sure that at least one test runs, and that it doesn't skip itself due to the environmental variable
       - name: Run tests with fake activation heights
+        env:
+          NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
         run: |
           docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
-          docker run -e NETWORK -e TEST_FAKE_ACTIVATION_HEIGHTS --name zebrad-tests -t ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }} cargo test --locked --release --features "zebra-test" --package zebra-state --lib -- --nocapture --include-ignored with_fake_activation_heights
-        env:
-          TEST_FAKE_ACTIVATION_HEIGHTS: '1'
-          NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
+          docker run --tty -e NETWORK -e TEST_FAKE_ACTIVATION_HEIGHTS=1 ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
 
   # Test that Zebra syncs and checkpoints a few thousand blocks from an empty state.
   test-empty-sync:
@@ -172,13 +191,12 @@ jobs:
         with:
           short-length: 7
 
-      # TODO: move this test command into entrypoint.sh
       - name: Run zebrad large sync tests
-        run: |
-          docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
-          docker run -e NETWORK --name zebrad-tests -t ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }} cargo test --locked --release --features "${{ env.TEST_FEATURES }}" --package zebrad --test acceptance -- --nocapture --include-ignored sync_large_checkpoints_
         env:
           NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
+        run: |
+          docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
+          docker run --tty -e NETWORK -e TEST_ZEBRA_EMPTY_SYNC=1 ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
 
   # Test launching lightwalletd with an empty lightwalletd and Zebra state.
   test-lightwalletd-integration:
@@ -194,14 +212,12 @@ jobs:
         with:
           short-length: 7
 
-      # TODO: move this test command into entrypoint.sh
       - name: Run tests with empty lightwalletd launch
+        env:
+          NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
         run: |
           docker pull ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
-          docker run -e NETWORK -e ZEBRA_TEST_LIGHTWALLETD --name lightwalletd-tests -t ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }} cargo test --locked --release --features "${{ env.TEST_FEATURES }}" --package zebrad --test acceptance -- --nocapture --include-ignored lightwalletd_integration
-        env:
-          ZEBRA_TEST_LIGHTWALLETD: '1'
-          NETWORK: ${{ inputs.network || vars.ZCASH_NETWORK }}
+          docker run --tty -e NETWORK -e ZEBRA_TEST_LIGHTWALLETD=1 ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
 
   # Test that Zebra works using the default config with the latest Zebra version.
   test-configuration-file:
@@ -237,7 +253,7 @@ jobs:
     with:
       test_id: 'custom-conf'
       docker_image: ${{ vars.GAR_BASE }}/${{ vars.CI_IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
-      grep_patterns: '-e "v1.0.0-rc.2.toml"'
+      grep_patterns: '-e "loaded zebrad config.*config_path.*=.*v1.0.0-rc.2.toml"'
       test_variables: '-e NETWORK -e ZEBRA_CONF_PATH="zebrad/tests/common/configs/v1.0.0-rc.2.toml"'
       network: ${{ inputs.network || vars.ZCASH_NETWORK }}
 

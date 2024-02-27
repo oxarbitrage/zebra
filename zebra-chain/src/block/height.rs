@@ -2,6 +2,7 @@
 
 use std::ops::{Add, Sub};
 use thiserror::Error;
+use zcash_primitives::consensus::BlockHeight;
 
 use crate::{serialization::SerializationError, BoxError};
 
@@ -23,6 +24,7 @@ pub mod json_conversion;
 /// There are multiple formats for serializing a height, so we don't implement
 /// `ZcashSerialize` or `ZcashDeserialize` for `Height`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Default))]
 pub struct Height(pub u32);
 
 #[derive(Error, Debug)]
@@ -101,6 +103,21 @@ impl Height {
     /// Returns the value as a `usize`.
     pub fn as_usize(self) -> usize {
         self.0.try_into().expect("fits in usize")
+    }
+}
+
+impl From<Height> for BlockHeight {
+    fn from(height: Height) -> Self {
+        BlockHeight::from_u32(height.0)
+    }
+}
+
+impl TryFrom<BlockHeight> for Height {
+    type Error = &'static str;
+
+    /// Checks that the `height` is within the valid [`Height`] range.
+    fn try_from(height: BlockHeight) -> Result<Self, Self::Error> {
+        Self::try_from(u32::from(height))
     }
 }
 

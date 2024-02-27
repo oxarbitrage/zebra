@@ -11,20 +11,33 @@ use serde::{Deserialize, Serialize};
 /// The `zebrad` config is a TOML-encoded version of this structure. The meaning
 /// of each field is described in the documentation, although it may be necessary
 /// to click through to the sub-structures for each section.
-#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+///
+/// The path to the configuration file can also be specified with the `--config` flag when running Zebra.
+///
+/// The default path to the `zebrad` config is platform dependent, based on
+/// [`dirs::preference_dir`](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html):
+///
+/// | Platform | Value                                 | Example                                        |
+/// | -------- | ------------------------------------- | ---------------------------------------------- |
+/// | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zebrad.toml`              |
+/// | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zebrad.toml` |
+/// | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zebrad.toml`     |
+#[derive(Clone, Default, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZebradConfig {
     /// Consensus configuration
-    pub consensus: zebra_consensus::Config,
+    //
+    // These configs use full paths to avoid a rustdoc link bug (#7048).
+    pub consensus: zebra_consensus::config::Config,
 
     /// Metrics configuration
     pub metrics: crate::components::metrics::Config,
 
     /// Networking configuration
-    pub network: zebra_network::Config,
+    pub network: zebra_network::config::Config,
 
     /// State configuration
-    pub state: zebra_state::Config,
+    pub state: zebra_state::config::Config,
 
     /// Tracing configuration
     pub tracing: crate::components::tracing::Config,
@@ -41,4 +54,8 @@ pub struct ZebradConfig {
     #[serde(skip_serializing_if = "zebra_rpc::config::mining::Config::skip_getblocktemplate")]
     /// Mining configuration
     pub mining: zebra_rpc::config::mining::Config,
+
+    #[cfg(feature = "shielded-scan")]
+    /// Scanner configuration
+    pub shielded_scan: zebra_scan::config::Config,
 }

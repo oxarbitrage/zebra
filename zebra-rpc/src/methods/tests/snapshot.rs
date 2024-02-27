@@ -8,6 +8,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use insta::dynamic_redaction;
+use tower::buffer::Buffer;
 
 use zebra_chain::{
     block::Block,
@@ -252,7 +253,7 @@ async fn test_rpc_response_data_for_network(network: Network) {
 
     // make the api call
     let get_raw_transaction =
-        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), 0u8);
+        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), Some(0u8));
     let (response, _) = futures::join!(get_raw_transaction, mempool_req);
     let get_raw_transaction = response.expect("We should have a GetRawTransaction struct");
 
@@ -269,7 +270,7 @@ async fn test_rpc_response_data_for_network(network: Network) {
 
     // make the api call
     let get_raw_transaction =
-        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), 1u8);
+        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), Some(1u8));
     let (response, _) = futures::join!(get_raw_transaction, mempool_req);
     let get_raw_transaction = response.expect("We should have a GetRawTransaction struct");
 
@@ -338,7 +339,7 @@ async fn test_mocked_rpc_response_data_for_network(network: Network) {
         network,
         false,
         true,
-        Buffer::new(mempool, 1),
+        mempool,
         state.clone(),
         latest_chain_tip,
     );

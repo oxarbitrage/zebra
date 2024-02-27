@@ -12,16 +12,24 @@ use crate::{
     },
 };
 
-/// The error type for Equihash
+#[cfg(feature = "internal-miner")]
+use crate::serialization::AtLeastOne;
+
+/// The error type for Equihash validation.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 #[error("invalid equihash solution for BlockHeader")]
 pub struct Error(#[from] equihash::Error);
 
+/// The error type for Equihash solving.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("solver was cancelled")]
+pub struct SolverCancelled;
+
 /// The size of an Equihash solution in bytes (always 1344).
 pub(crate) const SOLUTION_SIZE: usize = 1344;
 
-/// Equihash Solution.
+/// Equihash Solution in compressed format.
 ///
 /// A wrapper around [u8; 1344] because Rust doesn't implement common
 /// traits like `Debug`, `Clone`, etc for collections like array
@@ -53,6 +61,8 @@ impl Solution {
             .zcash_serialize(&mut input)
             .expect("serialization into a vec can't fail");
 
+        // The part of the header before the nonce and solution.
+        // This data is kept constant during solver runs, so the verifier API takes it separately.
         let input = &input[0..Solution::INPUT_LENGTH];
 
         equihash::is_valid_solution(n, k, input, nonce.as_ref(), solution)?;
@@ -60,11 +70,58 @@ impl Solution {
         Ok(())
     }
 
-    #[cfg(feature = "getblocktemplate-rpcs")]
+    /// Returns a [`Solution`] containing the bytes from `solution`.
+    /// Returns an error if `solution` is the wrong length.
+    pub fn from_bytes(solution: &[u8]) -> Result<Self, SerializationError> {
+        if solution.len() != SOLUTION_SIZE {
+            return Err(SerializationError::Parse(
+                "incorrect equihash solution size",
+            ));
+        }
+
+        let mut bytes = [0; SOLUTION_SIZE];
+        // Won't panic, because we just checked the length.
+        bytes.copy_from_slice(solution);
+
+        Ok(Self(bytes))
+    }
+
     /// Returns a [`Solution`] of `[0; SOLUTION_SIZE]` to be used in block proposals.
+    #[cfg(feature = "getblocktemplate-rpcs")]
     pub fn for_proposal() -> Self {
         Self([0; SOLUTION_SIZE])
     }
+
+    /// Mines and returns one or more [`Solution`]s based on a template `header`.
+    /// The returned header contains a valid `nonce` and `solution`.
+    ///
+    /// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
+    ///
+    /// The `nonce` in the header template is taken as the starting nonce. If you are running multiple
+    /// solvers at the same time, start them with different nonces.
+    /// The `solution` in the header template is ignored.
+    ///
+    /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core while running.
+    /// It can run for minutes or hours if the network difficulty is high.
+    #[cfg(feature = "internal-miner")]
+    #[allow(clippy::unwrap_in_result)]
+    pub fn solve<F>(
+        mut _header: Header,
+        mut _cancel_fn: F,
+    ) -> Result<AtLeastOne<Header>, SolverCancelled>
+    where
+        F: FnMut() -> Result<(), SolverCancelled>,
+    {
+        // TODO: Function code was removed as part of https://github.com/ZcashFoundation/zebra/issues/8180
+        // Find the removed code at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-chain/src/work/equihash.rs#L115-L166
+        // Restore the code when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
+
+        Err(SolverCancelled)
+    }
+
+    // TODO: Some methods were removed as part of https://github.com/ZcashFoundation/zebra/issues/8180
+    // Find the removed code at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-chain/src/work/equihash.rs#L171-L196
+    // Restore the code when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
 }
 
 impl PartialEq<Solution> for Solution {
@@ -93,6 +150,13 @@ impl Clone for Solution {
 
 impl Eq for Solution {}
 
+#[cfg(any(test, feature = "proptest-impl"))]
+impl Default for Solution {
+    fn default() -> Self {
+        Self([0; SOLUTION_SIZE])
+    }
+}
+
 impl ZcashSerialize for Solution {
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
         zcash_serialize_bytes(&self.0.to_vec(), writer)
@@ -102,17 +166,6 @@ impl ZcashSerialize for Solution {
 impl ZcashDeserialize for Solution {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         let solution: Vec<u8> = (&mut reader).zcash_deserialize_into()?;
-
-        if solution.len() != SOLUTION_SIZE {
-            return Err(SerializationError::Parse(
-                "incorrect equihash solution size",
-            ));
-        }
-
-        let mut bytes = [0; SOLUTION_SIZE];
-        // Won't panic, because we just checked the length.
-        bytes.copy_from_slice(&solution);
-
-        Ok(Self(bytes))
+        Self::from_bytes(&solution)
     }
 }
