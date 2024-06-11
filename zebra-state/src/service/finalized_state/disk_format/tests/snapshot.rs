@@ -29,11 +29,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use zebra_chain::{
-    block::Block,
-    parameters::Network::{self, *},
-    serialization::ZcashDeserializeInto,
-};
+use zebra_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
 
 use crate::{
     service::finalized_state::{
@@ -50,9 +46,9 @@ use crate::{
 #[test]
 fn test_raw_rocksdb_column_families() {
     let _init_guard = zebra_test::init();
-
-    test_raw_rocksdb_column_families_with_network(Mainnet);
-    test_raw_rocksdb_column_families_with_network(Testnet);
+    for network in Network::iter() {
+        test_raw_rocksdb_column_families_with_network(network);
+    }
 }
 
 /// Snapshot raw column families for `network`.
@@ -64,7 +60,7 @@ fn test_raw_rocksdb_column_families_with_network(network: Network) {
 
     let mut state = FinalizedState::new(
         &Config::ephemeral(),
-        network,
+        &network,
         #[cfg(feature = "elasticsearch")]
         None,
     );
@@ -89,10 +85,7 @@ fn test_raw_rocksdb_column_families_with_network(network: Network) {
     // Snapshot raw database data for:
     // - mainnet and testnet
     // - genesis, block 1, and block 2
-    let blocks = match network {
-        Mainnet => &*zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS,
-        Testnet => &*zebra_test::vectors::CONTINUOUS_TESTNET_BLOCKS,
-    };
+    let blocks = network.blockchain_map();
 
     // We limit the number of blocks, because the serialized data is a few kilobytes per block.
     for height in 0..=2 {

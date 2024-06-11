@@ -6,8 +6,6 @@ use color_eyre::eyre;
 use eyre::Result;
 use hex::FromHex;
 
-use zebra_test::vectors;
-
 use crate::{
     block::Block,
     parameters::{Network, NetworkUpgrade},
@@ -81,36 +79,19 @@ fn incremental_roots() {
 
 #[test]
 fn incremental_roots_with_blocks() -> Result<()> {
-    incremental_roots_with_blocks_for_network(Network::Mainnet)?;
-    incremental_roots_with_blocks_for_network(Network::Testnet)?;
-
+    for network in Network::iter() {
+        incremental_roots_with_blocks_for_network(network)?;
+    }
     Ok(())
 }
 
 fn incremental_roots_with_blocks_for_network(network: Network) -> Result<()> {
-    // The mainnet block height at which the first JoinSplit occurred.
-    const MAINNET_FIRST_JOINSPLIT_HEIGHT: u32 = 396;
-
-    // The testnet block height at which the first JoinSplit occurred.
-    const TESTNET_FIRST_JOINSPLIT_HEIGHT: u32 = 2259;
-
     // Load the test data.
-    let (blocks, sprout_roots, next_height) = match network {
-        Network::Mainnet => (
-            &*vectors::MAINNET_BLOCKS,
-            &*vectors::MAINNET_FINAL_SPROUT_ROOTS,
-            MAINNET_FIRST_JOINSPLIT_HEIGHT,
-        ),
-        Network::Testnet => (
-            &*vectors::TESTNET_BLOCKS,
-            &*vectors::TESTNET_FINAL_SPROUT_ROOTS,
-            TESTNET_FIRST_JOINSPLIT_HEIGHT,
-        ),
-    };
+    let (blocks, sprout_roots, next_height) = network.block_sprout_roots_height();
 
     // Load the Genesis height.
     let genesis_height = NetworkUpgrade::Genesis
-        .activation_height(network)
+        .activation_height(&network)
         .unwrap()
         .0;
 

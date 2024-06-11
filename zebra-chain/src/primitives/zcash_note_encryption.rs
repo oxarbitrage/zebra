@@ -15,34 +15,28 @@ use crate::{
 ///
 /// If passed a network/height without matching consensus branch ID (pre-Overwinter),
 /// since `librustzcash` won't be able to parse it.
-pub fn decrypts_successfully(transaction: &Transaction, network: Network, height: Height) -> bool {
+pub fn decrypts_successfully(transaction: &Transaction, network: &Network, height: Height) -> bool {
     let network_upgrade = NetworkUpgrade::current(network, height);
     let alt_tx = convert_tx_to_librustzcash(transaction, network_upgrade)
         .expect("zcash_primitives and Zebra transaction formats must be compatible");
 
-    let alt_height = height.0.into();
-    let null_sapling_ovk = zcash_primitives::keys::OutgoingViewingKey([0u8; 32]);
+    let null_sapling_ovk = sapling::keys::OutgoingViewingKey([0u8; 32]);
+
+    // Note that, since this function is used to validate coinbase transactions, we can ignore
+    // the "grace period" mentioned in ZIP-212.
+    let zip_212_enforcement = if network_upgrade >= NetworkUpgrade::Canopy {
+        sapling::note_encryption::Zip212Enforcement::On
+    } else {
+        sapling::note_encryption::Zip212Enforcement::Off
+    };
 
     if let Some(bundle) = alt_tx.sapling_bundle() {
         for output in bundle.shielded_outputs().iter() {
-            let recovery = match network {
-                Network::Mainnet => {
-                    zcash_primitives::sapling::note_encryption::try_sapling_output_recovery(
-                        &zcash_primitives::consensus::MAIN_NETWORK,
-                        alt_height,
-                        &null_sapling_ovk,
-                        output,
-                    )
-                }
-                Network::Testnet => {
-                    zcash_primitives::sapling::note_encryption::try_sapling_output_recovery(
-                        &zcash_primitives::consensus::TEST_NETWORK,
-                        alt_height,
-                        &null_sapling_ovk,
-                        output,
-                    )
-                }
-            };
+            let recovery = sapling::note_encryption::try_sapling_output_recovery(
+                &null_sapling_ovk,
+                output,
+                zip_212_enforcement,
+            );
             if recovery.is_none() {
                 return false;
             }

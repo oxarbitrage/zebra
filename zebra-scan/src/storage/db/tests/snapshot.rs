@@ -28,10 +28,7 @@ use std::collections::BTreeMap;
 
 use itertools::Itertools;
 
-use zebra_chain::{
-    block::Height,
-    parameters::Network::{self, *},
-};
+use zebra_chain::{block::Height, parameters::Network};
 use zebra_state::{RawBytes, ReadDisk, SaplingScannedDatabaseIndex, TransactionLocation, KV};
 
 use crate::storage::{db::ScannerDb, Storage};
@@ -45,8 +42,9 @@ use crate::storage::{db::ScannerDb, Storage};
 fn test_database_format() {
     let _init_guard = zebra_test::init();
 
-    test_database_format_with_network(Mainnet);
-    test_database_format_with_network(Testnet);
+    for network in Network::iter() {
+        test_database_format_with_network(network);
+    }
 }
 
 /// Snapshot raw and typed database formats for `network`.
@@ -56,7 +54,7 @@ fn test_database_format_with_network(network: Network) {
     let mut net_suffix = network.to_string();
     net_suffix.make_ascii_lowercase();
 
-    let mut storage = super::new_test_storage(network);
+    let mut storage = super::new_test_storage(&network);
 
     // Snapshot the column family names
     let mut cf_names = storage.db.list_cf().expect("empty database is valid");
@@ -89,8 +87,8 @@ fn test_database_format_with_network(network: Network) {
     //
     // We limit the number of blocks, because we create 2 snapshots per block, one for each network.
     for height in 0..=2 {
-        super::add_fake_results(&mut storage, network, Height(height), true);
-        super::add_fake_results(&mut storage, network, Height(height), false);
+        super::add_fake_results(&mut storage, &network, Height(height), true);
+        super::add_fake_results(&mut storage, &network, Height(height), false);
 
         let mut settings = insta::Settings::clone_current();
         settings.set_snapshot_suffix(format!("{net_suffix}_{height}"));

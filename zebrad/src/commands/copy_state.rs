@@ -35,7 +35,7 @@
 
 use std::{cmp::min, path::PathBuf};
 
-use abscissa_core::{config, Command, FrameworkError, Runnable};
+use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use tokio::time::Instant;
 use tower::{Service, ServiceExt};
@@ -97,7 +97,7 @@ impl CopyStateCmd {
 
         info!(?base_config, "state copy base config");
 
-        self.copy(base_config.network.network, source_config, target_config)
+        self.copy(&base_config.network.network, source_config, target_config)
             .await
             .map_err(|e| eyre!(e))
     }
@@ -106,7 +106,7 @@ impl CopyStateCmd {
     /// then copy from the source to the target state.
     async fn copy(
         &self,
-        network: Network,
+        network: &Network,
         source_config: old_zs::Config,
         target_config: new_zs::Config,
     ) -> Result<(), BoxError> {

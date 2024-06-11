@@ -37,7 +37,7 @@ use serde::Serialize;
 use zebra_chain::{
     block::{self, Block, Height, SerializedBlock},
     orchard,
-    parameters::Network::{self, *},
+    parameters::Network,
     sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, Transaction},
@@ -153,9 +153,9 @@ impl TransactionData {
 #[test]
 fn test_block_and_transaction_data() {
     let _init_guard = zebra_test::init();
-
-    test_block_and_transaction_data_with_network(Mainnet);
-    test_block_and_transaction_data_with_network(Testnet);
+    for network in Network::iter() {
+        test_block_and_transaction_data_with_network(network);
+    }
 }
 
 /// Snapshot finalized block and transaction data for `network`.
@@ -167,7 +167,7 @@ fn test_block_and_transaction_data_with_network(network: Network) {
 
     let mut state = FinalizedState::new(
         &Config::ephemeral(),
-        network,
+        &network,
         #[cfg(feature = "elasticsearch")]
         None,
     );
@@ -181,10 +181,7 @@ fn test_block_and_transaction_data_with_network(network: Network) {
     // Snapshot block and transaction database data for:
     // - mainnet and testnet
     // - genesis, block 1, and block 2
-    let blocks = match network {
-        Mainnet => &*zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS,
-        Testnet => &*zebra_test::vectors::CONTINUOUS_TESTNET_BLOCKS,
-    };
+    let blocks = network.blockchain_map();
 
     // We limit the number of blocks, because the serialized data is a few kilobytes per block.
     //
@@ -321,7 +318,7 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
                 // Skip these checks for empty history trees.
                 if let Some(history_tree_at_tip) = history_tree_at_tip.as_ref().as_ref() {
                     assert_eq!(history_tree_at_tip.current_height(), max_height);
-                    assert_eq!(history_tree_at_tip.network(), state.network());
+                    assert_eq!(history_tree_at_tip.network(), &state.network());
                 }
             }
 
@@ -553,7 +550,7 @@ fn snapshot_transparent_address_data(state: &FinalizedState, height: u32) {
         // The default raw data serialization is very verbose, so we hex-encode the bytes.
         stored_address_balances.push((address.to_string(), stored_address_balance_location));
         stored_address_utxo_locations.push((stored_address_location, stored_utxo_locations));
-        stored_address_utxos.push((address, stored_utxos));
+        stored_address_utxos.push((address.clone(), stored_utxos));
         stored_address_transaction_locations.push((address, stored_transaction_locations));
     }
 

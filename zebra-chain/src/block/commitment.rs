@@ -103,27 +103,40 @@ impl Commitment {
     // TODO: rename as from_bytes_in_serialized_order()
     pub(super) fn from_bytes(
         bytes: [u8; 32],
-        network: Network,
+        network: &Network,
         height: block::Height,
     ) -> Result<Commitment, CommitmentError> {
         use Commitment::*;
         use CommitmentError::*;
 
-        match NetworkUpgrade::current(network, height) {
-            Genesis | BeforeOverwinter | Overwinter => Ok(PreSaplingReserved(bytes)),
-            Sapling | Blossom => match sapling::tree::Root::try_from(bytes) {
+        match NetworkUpgrade::current_with_activation_height(network, height) {
+            (Genesis | BeforeOverwinter | Overwinter, _) => Ok(PreSaplingReserved(bytes)),
+            (Sapling | Blossom, _) => match sapling::tree::Root::try_from(bytes) {
                 Ok(root) => Ok(FinalSaplingRoot(root)),
                 _ => Err(InvalidSapingRootBytes),
             },
-            Heartwood if Some(height) == Heartwood.activation_height(network) => {
+            (Heartwood, activation_height) if height == activation_height => {
                 if bytes == CHAIN_HISTORY_ACTIVATION_RESERVED {
                     Ok(ChainHistoryActivationReserved)
                 } else {
                     Err(InvalidChainHistoryActivationReserved { actual: bytes })
                 }
             }
-            Heartwood | Canopy => Ok(ChainHistoryRoot(ChainHistoryMmrRootHash(bytes))),
-            Nu5 => Ok(ChainHistoryBlockTxAuthCommitment(
+            // NetworkUpgrade::current() returns the latest network upgrade that's activated at the provided height, so
+            // on Regtest for heights above height 0, it returns NU5, and it's possible for the current network upgrade
+            // to be NU5 (or Canopy, or any network upgrade above Heartwood) at the Heartwood activation height.
+            (Canopy | Nu5, activation_height)
+                if height == activation_height
+                    && Some(height) == Heartwood.activation_height(network) =>
+            {
+                if bytes == CHAIN_HISTORY_ACTIVATION_RESERVED {
+                    Ok(ChainHistoryActivationReserved)
+                } else {
+                    Err(InvalidChainHistoryActivationReserved { actual: bytes })
+                }
+            }
+            (Heartwood | Canopy, _) => Ok(ChainHistoryRoot(ChainHistoryMmrRootHash(bytes))),
+            (Nu5, _) => Ok(ChainHistoryBlockTxAuthCommitment(
                 ChainHistoryBlockTxAuthCommitmentHash(bytes),
             )),
         }

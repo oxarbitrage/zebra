@@ -78,8 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # TODO: Windows was removed for now, see https://github.com/ZcashFoundation/zebra/issues/3801
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
         # TODO: When vars.EXPERIMENTAL_FEATURES has features in it, add it here.
         #       Or work out a way to trim the space from the variable: GitHub doesn't allow empty variables.
@@ -95,10 +94,10 @@ jobs:
             rust: beta
 
     steps:
-      - uses: actions/checkout@v4.1.1
+      - uses: actions/checkout@v4.1.6
         with:
           persist-credentials: false
-      - uses: r7kamura/rust-problem-matchers@v1.4.0
+      - uses: r7kamura/rust-problem-matchers@v1.5.0
 
       - name: Install last version of Protoc
         uses: arduino/setup-protoc@v3.0.0
@@ -184,10 +183,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4.1.1
+      - uses: actions/checkout@v4.1.6
         with:
           persist-credentials: false
-      - uses: r7kamura/rust-problem-matchers@v1.4.0
+      - uses: r7kamura/rust-problem-matchers@v1.5.0
 
       # Setup Rust with stable toolchain and minimal profile
       - name: Setup Rust
@@ -206,10 +205,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4.1.1
+      - uses: actions/checkout@v4.1.6
         with:
           persist-credentials: false
-      - uses: r7kamura/rust-problem-matchers@v1.4.0
+      - uses: r7kamura/rust-problem-matchers@v1.5.0
 
       - name: Install last version of Protoc
         uses: arduino/setup-protoc@v3.0.0
@@ -249,10 +248,10 @@ jobs:
     continue-on-error: ${{ matrix.checks == 'advisories' }}
 
     steps:
-      - uses: actions/checkout@v4.1.1
+      - uses: actions/checkout@v4.1.6
         with:
           persist-credentials: false
-      - uses: r7kamura/rust-problem-matchers@v1.4.0
+      - uses: r7kamura/rust-problem-matchers@v1.5.0
 
       - name: Check ${{ matrix.checks }} with features ${{ matrix.features }}
         uses: EmbarkStudios/cargo-deny-action@v1
@@ -270,10 +269,10 @@ jobs:
 
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4.1.6
         with:
           persist-credentials: false
-      - uses: r7kamura/rust-problem-matchers@v1.4.0
+      - uses: r7kamura/rust-problem-matchers@v1.5.0
 
       # Setup Rust with stable toolchain and minimal profile
       - name: Setup Rust
@@ -281,7 +280,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=stable --profile=minimal
 
       - name: Install cargo-machete
-        uses: baptiste0928/cargo-install@v3.0.0
+        uses: baptiste0928/cargo-install@v3.1.0
         with:
           crate: cargo-machete
 

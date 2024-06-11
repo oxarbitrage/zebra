@@ -7,20 +7,8 @@ use lazy_static::lazy_static;
 use zebra_chain::{
     amount::COIN,
     block::{Height, HeightDiff},
-    parameters::Network,
+    parameters::{Network, NetworkKind, NetworkUpgrade},
 };
-
-/// An initial period from Genesis to this Height where the block subsidy is gradually incremented. [What is slow-start mining][slow-mining]
-///
-/// [slow-mining]: https://z.cash/support/faq/#what-is-slow-start-mining
-pub const SLOW_START_INTERVAL: Height = Height(20_000);
-
-/// `SlowStartShift()` as described in [protocol specification §7.8][7.8]
-///
-/// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
-///
-/// This calculation is exact, because `SLOW_START_INTERVAL` is divisible by 2.
-pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 
 /// The largest block subsidy, used before the first halving.
 ///
@@ -104,15 +92,17 @@ lazy_static! {
     /// as described in [protocol specification §7.10.1][7.10.1].
     ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
-    pub static ref FUNDING_STREAM_HEIGHT_RANGES: HashMap<Network, std::ops::Range<Height>> = {
+    // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+    pub static ref FUNDING_STREAM_HEIGHT_RANGES: HashMap<NetworkKind, std::ops::Range<Height>> = {
         let mut hash_map = HashMap::new();
-        hash_map.insert(Network::Mainnet, Height(1_046_400)..Height(2_726_400));
-        hash_map.insert(Network::Testnet, Height(1_028_500)..Height(2_796_000));
+        hash_map.insert(NetworkKind::Mainnet, Height(1_046_400)..Height(2_726_400));
+        hash_map.insert(NetworkKind::Testnet, Height(1_028_500)..Height(2_796_000));
+        hash_map.insert(NetworkKind::Regtest, Height(1_028_500)..Height(2_796_000));
         hash_map
     };
 
     /// Convenient storage for all addresses, for all receivers and networks
-    pub static ref FUNDING_STREAM_ADDRESSES: HashMap<Network, HashMap<FundingStreamReceiver, Vec<String>>> = {
+    pub static ref FUNDING_STREAM_ADDRESSES: HashMap<NetworkKind, HashMap<FundingStreamReceiver, Vec<String>>> = {
         let mut addresses_by_network = HashMap::with_capacity(2);
 
         // Mainnet addresses
@@ -120,14 +110,24 @@ lazy_static! {
         mainnet_addresses.insert(FundingStreamReceiver::Ecc, FUNDING_STREAM_ECC_ADDRESSES_MAINNET.iter().map(|a| a.to_string()).collect());
         mainnet_addresses.insert(FundingStreamReceiver::ZcashFoundation, FUNDING_STREAM_ZF_ADDRESSES_MAINNET.iter().map(|a| a.to_string()).collect());
         mainnet_addresses.insert(FundingStreamReceiver::MajorGrants, FUNDING_STREAM_MG_ADDRESSES_MAINNET.iter().map(|a| a.to_string()).collect());
-        addresses_by_network.insert(Network::Mainnet, mainnet_addresses);
+        addresses_by_network.insert(NetworkKind::Mainnet, mainnet_addresses);
 
         // Testnet addresses
         let mut testnet_addresses = HashMap::with_capacity(3);
         testnet_addresses.insert(FundingStreamReceiver::Ecc, FUNDING_STREAM_ECC_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
         testnet_addresses.insert(FundingStreamReceiver::ZcashFoundation, FUNDING_STREAM_ZF_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
         testnet_addresses.insert(FundingStreamReceiver::MajorGrants, FUNDING_STREAM_MG_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
-        addresses_by_network.insert(Network::Testnet, testnet_addresses);
+        addresses_by_network.insert(NetworkKind::Testnet, testnet_addresses);
+
+
+        // Regtest addresses
+        // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+        //       There are no funding stream addresses on Regtest in zcashd, zebrad should do the same for compatibility.
+        let mut regtest_addresses = HashMap::with_capacity(3);
+        regtest_addresses.insert(FundingStreamReceiver::Ecc, FUNDING_STREAM_ECC_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
+        regtest_addresses.insert(FundingStreamReceiver::ZcashFoundation, FUNDING_STREAM_ZF_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
+        regtest_addresses.insert(FundingStreamReceiver::MajorGrants, FUNDING_STREAM_MG_ADDRESSES_TESTNET.iter().map(|a| a.to_string()).collect());
+        addresses_by_network.insert(NetworkKind::Testnet, regtest_addresses);
 
         addresses_by_network
     };
@@ -198,6 +198,41 @@ pub const FUNDING_STREAM_ECC_ADDRESSES_MAINNET: [&str; FUNDING_STREAMS_NUM_ADDRE
     "t3XHAGxRP2FNfhAjxGjxbrQPYtQQjc3RCQD",
 ];
 
+/// Functionality specific to block subsidy-related consensus rules
+pub trait ParameterSubsidy {
+    /// Number of addresses for each funding stream in the Network.
+    /// [7.10]: <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
+    fn num_funding_streams(&self) -> usize;
+    /// Returns the minimum height after the first halving
+    /// as described in [protocol specification §7.10][7.10]
+    ///
+    /// [7.10]: <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
+    fn height_for_first_halving(&self) -> Height;
+}
+
+/// Network methods related to Block Subsidy and Funding Streams
+impl ParameterSubsidy for Network {
+    fn num_funding_streams(&self) -> usize {
+        match self {
+            Network::Mainnet => FUNDING_STREAMS_NUM_ADDRESSES_MAINNET,
+            // TODO: Check what zcashd does here, consider adding a field to `NetworkParamters` to make this configurable.
+            Network::Testnet(_params) => FUNDING_STREAMS_NUM_ADDRESSES_TESTNET,
+        }
+    }
+
+    fn height_for_first_halving(&self) -> Height {
+        // First halving on Mainnet is at Canopy
+        // while in Testnet is at block constant height of `1_116_000`
+        // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
+        match self {
+            Network::Mainnet => NetworkUpgrade::Canopy
+                .activation_height(self)
+                .expect("canopy activation height should be available"),
+            // TODO: Check what zcashd does here, consider adding a field to `testnet::Parameters` to make this configurable.
+            Network::Testnet(_params) => FIRST_HALVING_TESTNET,
+        }
+    }
+}
 /// List of addresses for the Zcash Foundation funding stream in the Mainnet.
 pub const FUNDING_STREAM_ZF_ADDRESSES_MAINNET: [&str; FUNDING_STREAMS_NUM_ADDRESSES_MAINNET] =
     ["t3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1"; FUNDING_STREAMS_NUM_ADDRESSES_MAINNET];

@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use zebra_chain::{
     block::{Height, HeightDiff, TryIntoHeight},
-    parameters::Network::{self, *},
+    parameters::Network,
     transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
 use zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP;
@@ -71,7 +71,7 @@ pub async fn run(network: Network) -> Result<()> {
 
     // Sync zebrad to the network chain tip
     let (mut zebrad, zebra_rpc_address) = if let Some(zebrad_and_address) =
-        spawn_zebrad_for_rpc(network, test_name, test_type, true)?
+        spawn_zebrad_for_rpc(network.clone(), test_name, test_type, true)?
     {
         zebrad_and_address
     } else {
@@ -82,7 +82,7 @@ pub async fn run(network: Network) -> Result<()> {
     // Wait for the upgrade if needed.
     // Currently we only write an image for testnet, which is quick.
     // (Mainnet would need to wait at the end of this function, if the upgrade is long.)
-    if network == Testnet {
+    if network.is_a_test_network() {
         let state_version_message = wait_for_state_version_message(&mut zebrad)?;
 
         // Before we write a cached state image, wait for a database upgrade.
@@ -155,8 +155,12 @@ pub async fn run(network: Network) -> Result<()> {
         "zebrad synced to the tip, launching zebra-checkpoints...",
     );
 
-    let zebra_checkpoints =
-        spawn_zebra_checkpoints_direct(network, test_type, zebra_rpc_address, last_checkpoint)?;
+    let zebra_checkpoints = spawn_zebra_checkpoints_direct(
+        network.clone(),
+        test_type,
+        zebra_rpc_address,
+        last_checkpoint,
+    )?;
 
     let show_zebrad_logs = env::var(LOG_ZEBRAD_CHECKPOINTS).is_ok();
     if !show_zebrad_logs {

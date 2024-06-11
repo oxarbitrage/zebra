@@ -4,7 +4,6 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    iter::Extend,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Instant,
@@ -138,7 +137,7 @@ impl AddressBook {
     /// Uses the supplied [`tracing::Span`] for address book operations.
     pub fn new(
         local_listener: SocketAddr,
-        network: Network,
+        network: &Network,
         max_connections_per_ip: usize,
         span: Span,
     ) -> AddressBook {
@@ -157,7 +156,7 @@ impl AddressBook {
         let mut new_book = AddressBook {
             by_addr: OrderedMap::new(|meta_addr| Reverse(*meta_addr)),
             local_listener: canonical_socket_addr(local_listener),
-            network,
+            network: network.clone(),
             addr_limit: constants::MAX_ADDRS_IN_ADDRESS_BOOK,
             span,
             address_metrics_tx,
@@ -183,7 +182,7 @@ impl AddressBook {
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_with_addrs(
         local_listener: SocketAddr,
-        network: Network,
+        network: &Network,
         max_connections_per_ip: usize,
         addr_limit: usize,
         span: Span,
@@ -293,7 +292,7 @@ impl AddressBook {
         // Then sanitize and shuffle
         let mut peers: Vec<MetaAddr> = peers
             .descending_values()
-            .filter_map(|meta_addr| meta_addr.sanitize(self.network))
+            .filter_map(|meta_addr| meta_addr.sanitize(&self.network))
             // # Security
             //
             // Remove peers that:
@@ -431,7 +430,7 @@ impl AddressBook {
         if let Some(updated) = updated {
             // Ignore invalid outbound addresses.
             // (Inbound connections can be monitored via Zebra's metrics.)
-            if !updated.address_is_valid_for_outbound(self.network) {
+            if !updated.address_is_valid_for_outbound(&self.network) {
                 return None;
             }
 
@@ -440,7 +439,7 @@ impl AddressBook {
             //
             // Otherwise, if we got the info directly from the peer,
             // store it in the address book, so we know not to reconnect.
-            if !updated.last_known_info_is_valid_for_outbound(self.network)
+            if !updated.last_known_info_is_valid_for_outbound(&self.network)
                 && updated.last_connection_state.is_never_attempted()
             {
                 return None;
@@ -598,7 +597,7 @@ impl AddressBook {
         self.by_addr
             .descending_values()
             .filter(move |peer| {
-                peer.is_ready_for_connection_attempt(instant_now, chrono_now, self.network)
+                peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
             .cloned()
@@ -630,7 +629,7 @@ impl AddressBook {
         self.by_addr
             .descending_values()
             .filter(move |peer| {
-                !peer.is_ready_for_connection_attempt(instant_now, chrono_now, self.network)
+                !peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
             })
             .cloned()
     }
@@ -800,7 +799,7 @@ impl Clone for AddressBook {
         AddressBook {
             by_addr: self.by_addr.clone(),
             local_listener: self.local_listener,
-            network: self.network,
+            network: self.network.clone(),
             addr_limit: self.addr_limit,
             span: self.span.clone(),
             address_metrics_tx,

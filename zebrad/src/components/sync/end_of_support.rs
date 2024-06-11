@@ -13,7 +13,7 @@ use zebra_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 2_413_000;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 2_496_122;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
@@ -22,6 +22,7 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 2_413_000;
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the `ESTIMATED_RELEASE_HEIGHT`
 ///  plus this number of days.
+/// - Currently set to 16 weeks.
 pub const EOS_PANIC_AFTER: u32 = 112;
 
 /// The number of days before the end of support where Zebra will display warnings.
@@ -51,7 +52,7 @@ pub async fn start(
     loop {
         if network == Network::Mainnet {
             if let Some(tip_height) = latest_chain_tip.best_tip_height() {
-                check(tip_height, network);
+                check(tip_height, &network);
             }
         } else {
             info!("Release always valid in Testnet");
@@ -61,7 +62,7 @@ pub async fn start(
 }
 
 /// Check if the current release is too old and panic if so.
-pub fn check(tip_height: Height, network: Network) {
+pub fn check(tip_height: Height, network: &Network) {
     info!("Checking if Zebra release is inside support range ...");
 
     // Get the current block spacing

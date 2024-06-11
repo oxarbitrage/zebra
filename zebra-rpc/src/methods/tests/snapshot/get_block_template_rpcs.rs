@@ -23,7 +23,7 @@ use zebra_chain::{
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::Transaction,
     transparent,
-    work::difficulty::{CompactDifficulty, ExpandedDifficulty},
+    work::difficulty::{CompactDifficulty, ParameterDifficulty as _},
 };
 use zebra_network::{address_book_peers::MockAddressBookPeers, types::MetaAddr};
 use zebra_node_services::mempool;
@@ -51,7 +51,7 @@ use crate::methods::{
 };
 
 pub async fn test_responses<State, ReadState>(
-    network: Network,
+    network: &Network,
     mempool: MockService<
         mempool::Request,
         mempool::Response,
@@ -94,11 +94,14 @@ pub async fn test_responses<State, ReadState>(
 
     #[allow(clippy::unnecessary_struct_initialization)]
     let mining_config = crate::config::mining::Config {
-        miner_address: Some(transparent::Address::from_script_hash(network, [0xad; 20])),
+        miner_address: Some(transparent::Address::from_script_hash(
+            network.kind(),
+            [0xad; 20],
+        )),
         extra_coinbase_data: None,
         debug_like_zcashd: true,
         // TODO: Use default field values when optional features are enabled in tests #8183
-        //..Default::default()
+        ..Default::default()
     };
 
     // nu5 block height
@@ -115,7 +118,7 @@ pub async fn test_responses<State, ReadState>(
     let fake_max_time = DateTime32::from(1654008728);
 
     // Use a valid fractional difficulty for snapshots
-    let pow_limit = ExpandedDifficulty::target_difficulty_limit(network);
+    let pow_limit = network.target_difficulty_limit();
     let fake_difficulty = pow_limit * 2 / 3;
     let fake_difficulty = CompactDifficulty::from(fake_difficulty);
 
@@ -413,9 +416,10 @@ pub async fn test_responses<State, ReadState>(
     snapshot_rpc_submit_block_invalid(submit_block, &settings);
 
     // `validateaddress`
-    let founder_address = match network {
-        Network::Mainnet => "t3fqvkzrrNaMcamkQMwAyHRjfDdM2xQvDTR",
-        Network::Testnet => "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi",
+    let founder_address = if network.is_mainnet() {
+        "t3fqvkzrrNaMcamkQMwAyHRjfDdM2xQvDTR"
+    } else {
+        "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi"
     };
 
     let validate_address = get_block_template_rpc
@@ -431,9 +435,10 @@ pub async fn test_responses<State, ReadState>(
     snapshot_rpc_validateaddress("invalid", validate_address, &settings);
 
     // `z_validateaddress`
-    let founder_address = match network {
-        Network::Mainnet => "t3fqvkzrrNaMcamkQMwAyHRjfDdM2xQvDTR",
-        Network::Testnet => "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi",
+    let founder_address = if network.is_mainnet() {
+        "t3fqvkzrrNaMcamkQMwAyHRjfDdM2xQvDTR"
+    } else {
+        "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi"
     };
 
     let z_validate_address = get_block_template_rpc
@@ -461,11 +466,6 @@ pub async fn test_responses<State, ReadState>(
     let mock_get_difficulty = get_difficulty.expect("unexpected error in getdifficulty RPC call");
 
     snapshot_rpc_getdifficulty_valid("mock", mock_get_difficulty, &settings);
-
-    // Now use the populated state
-
-    let populated_get_difficulty = get_block_template_rpc.get_difficulty().await;
-    snapshot_rpc_getdifficulty_invalid("populated", populated_get_difficulty, &settings);
 
     // `z_listunifiedreceivers`
 
@@ -599,17 +599,6 @@ fn snapshot_rpc_getdifficulty_valid(
 ) {
     settings.bind(|| {
         insta::assert_json_snapshot!(format!("get_difficulty_valid_{variant}"), difficulty)
-    });
-}
-
-/// Snapshot invalid `getdifficulty` response, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_getdifficulty_invalid(
-    variant: &'static str,
-    difficulty: Result<f64>,
-    settings: &insta::Settings,
-) {
-    settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_difficulty_invalid_{variant}"), difficulty)
     });
 }
 

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use zebra_chain::{
     block::{Block, Height},
-    parameters::Network::{self, *},
+    parameters::Network::{self},
     serialization::ZcashDeserializeInto,
     transaction,
 };
@@ -23,7 +23,7 @@ mod snapshot;
 mod vectors;
 
 /// Returns an empty `Storage` suitable for testing.
-pub fn new_test_storage(network: Network) -> Storage {
+pub fn new_test_storage(network: &Network) -> Storage {
     Storage::new(&Config::ephemeral(), network, false)
 }
 
@@ -41,14 +41,11 @@ pub fn add_fake_keys(storage: &mut Storage) {
 /// If it is `false`, adds the transaction hashes from `height`.
 pub fn add_fake_results(
     storage: &mut Storage,
-    network: Network,
+    network: &Network,
     height: Height,
     add_progress_marker: bool,
 ) {
-    let blocks = match network {
-        Mainnet => &*zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS,
-        Testnet => &*zebra_test::vectors::CONTINUOUS_TESTNET_BLOCKS,
-    };
+    let blocks = network.blockchain_map();
 
     let block: Arc<Block> = blocks
         .get(&height.0)

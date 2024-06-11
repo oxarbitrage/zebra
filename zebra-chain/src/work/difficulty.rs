@@ -100,7 +100,7 @@ pub const INVALID_COMPACT_DIFFICULTY: CompactDifficulty = CompactDifficulty(u32:
 /// [section 7.7.2]: https://zips.z.cash/protocol/protocol.pdf#difficulty
 //
 // TODO: Use NonZeroU256, when available
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ExpandedDifficulty(U256);
 
 /// A 128-bit unsigned "Work" value.
@@ -384,32 +384,6 @@ impl ExpandedDifficulty {
         U256::from_little_endian(&hash.0).into()
     }
 
-    /// Returns the easiest target difficulty allowed on `network`.
-    ///
-    /// # Consensus
-    ///
-    /// See `PoWLimit` in the Zcash specification:
-    /// <https://zips.z.cash/protocol/protocol.pdf#constants>
-    pub fn target_difficulty_limit(network: Network) -> ExpandedDifficulty {
-        let limit: U256 = match network {
-            /* 2^243 - 1 */
-            Network::Mainnet => (U256::one() << 243) - 1,
-            /* 2^251 - 1 */
-            Network::Testnet => (U256::one() << 251) - 1,
-        };
-
-        // `zcashd` converts the PoWLimit into a compact representation before
-        // using it to perform difficulty filter checks.
-        //
-        // The Zcash specification converts to compact for the default difficulty
-        // filter, but not for testnet minimum difficulty blocks. (ZIP 205 and
-        // ZIP 208 don't specify this conversion either.) See #1277 for details.
-        ExpandedDifficulty(limit)
-            .to_compact()
-            .to_expanded()
-            .expect("difficulty limits are valid expanded values")
-    }
-
     /// Calculate the CompactDifficulty for an expanded difficulty.
     ///
     /// # Consensus
@@ -681,7 +655,8 @@ impl PartialCumulativeWork {
     pub fn difficulty_multiplier_for_display(&self, network: Network) -> f64 {
         // This calculation is similar to the `getdifficulty` RPC, see that code for details.
 
-        let pow_limit = ExpandedDifficulty::target_difficulty_limit(network)
+        let pow_limit = network
+            .target_difficulty_limit()
             .to_compact()
             .to_work()
             .expect("target difficult limit is valid work");
@@ -702,6 +677,42 @@ impl PartialCumulativeWork {
         let work = self.as_u128() as f64;
 
         work.log2()
+    }
+}
+
+/// Network methods related to Difficulty
+pub trait ParameterDifficulty {
+    /// Returns the easiest target difficulty allowed on `network`.
+    ///
+    /// # Consensus
+    ///
+    /// See `PoWLimit` in the Zcash specification:
+    /// <https://zips.z.cash/protocol/protocol.pdf#constants>
+    fn target_difficulty_limit(&self) -> ExpandedDifficulty;
+}
+
+impl ParameterDifficulty for Network {
+    /// Returns the easiest target difficulty allowed on `network`.
+    /// See [`ParameterDifficulty::target_difficulty_limit`]
+    fn target_difficulty_limit(&self) -> ExpandedDifficulty {
+        let limit: U256 = match self {
+            // Mainnet PoWLimit is defined as `2^243 - 1` on page 73 of the protocol specification:
+            // <https://zips.z.cash/protocol/protocol.pdf>
+            Network::Mainnet => (U256::one() << 243) - 1,
+            // 2^251 - 1 for the default testnet, see `testnet::ParametersBuilder::default`()
+            Network::Testnet(params) => return params.target_difficulty_limit(),
+        };
+
+        // `zcashd` converts the PoWLimit into a compact representation before
+        // using it to perform difficulty filter checks.
+        //
+        // The Zcash specification converts to compact for the default difficulty
+        // filter, but not for testnet minimum difficulty blocks. (ZIP 205 and
+        // ZIP 208 don't specify this conversion either.) See #1277 for details.
+        ExpandedDifficulty(limit)
+            .to_compact()
+            .to_expanded()
+            .expect("difficulty limits are valid expanded values")
     }
 }
 

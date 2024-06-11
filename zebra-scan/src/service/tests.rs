@@ -1,7 +1,10 @@
 //! Tests for ScanService.
 
+use std::time::Duration;
+
+use futures::{stream::FuturesOrdered, StreamExt};
 use tokio::sync::mpsc::error::TryRecvError;
-use tower::{Service, ServiceBuilder, ServiceExt};
+use tower::{timeout::error::Elapsed, Service, ServiceBuilder, ServiceExt};
 
 use color_eyre::{eyre::eyre, Result};
 
@@ -10,6 +13,7 @@ use zebra_node_services::scan_service::{request::Request, response::Response};
 use zebra_state::TransactionIndex;
 
 use crate::{
+    init::SCAN_SERVICE_TIMEOUT,
     service::{scan_task::ScanTaskCommand, ScanService},
     storage::db::tests::{fake_sapling_results, new_test_storage},
     tests::{mock_sapling_scanning_keys, ZECPAGES_SAPLING_VIEWING_KEY},
@@ -19,7 +23,7 @@ use crate::{
 /// Tests that keys are deleted correctly
 #[tokio::test]
 pub async fn scan_service_deletes_keys_correctly() -> Result<()> {
-    let mut db = new_test_storage(Network::Mainnet);
+    let mut db = new_test_storage(&Network::Mainnet);
 
     let zec_pages_sapling_efvk = ZECPAGES_SAPLING_VIEWING_KEY.to_string();
 
@@ -82,7 +86,7 @@ pub async fn scan_service_deletes_keys_correctly() -> Result<()> {
 /// Tests that keys are deleted correctly
 #[tokio::test]
 pub async fn scan_service_subscribes_to_results_correctly() -> Result<()> {
-    let db = new_test_storage(Network::Mainnet);
+    let db = new_test_storage(&Network::Mainnet);
 
     let (mut scan_service, mut cmd_receiver) = ScanService::new_with_mock_scanner(db);
 
@@ -129,7 +133,7 @@ pub async fn scan_service_subscribes_to_results_correctly() -> Result<()> {
 /// Tests that results are cleared are deleted correctly
 #[tokio::test]
 pub async fn scan_service_clears_results_correctly() -> Result<()> {
-    let mut db = new_test_storage(Network::Mainnet);
+    let mut db = new_test_storage(&Network::Mainnet);
 
     let zec_pages_sapling_efvk = ZECPAGES_SAPLING_VIEWING_KEY.to_string();
 
@@ -184,7 +188,7 @@ pub async fn scan_service_clears_results_correctly() -> Result<()> {
 /// Tests that results for key are returned correctly
 #[tokio::test]
 pub async fn scan_service_get_results_for_key_correctly() -> Result<()> {
-    let mut db = new_test_storage(Network::Mainnet);
+    let mut db = new_test_storage(&Network::Mainnet);
 
     let zec_pages_sapling_efvk = ZECPAGES_SAPLING_VIEWING_KEY.to_string();
 
@@ -261,13 +265,13 @@ pub async fn scan_service_get_results_for_key_correctly() -> Result<()> {
 #[tokio::test]
 pub async fn scan_service_registers_keys_correctly() -> Result<()> {
     for network in Network::iter() {
-        scan_service_registers_keys_correctly_for(network).await?;
+        scan_service_registers_keys_correctly_for(&network).await?;
     }
 
     Ok(())
 }
 
-async fn scan_service_registers_keys_correctly_for(network: Network) -> Result<()> {
+async fn scan_service_registers_keys_correctly_for(network: &Network) -> Result<()> {
     // Mock the state.
     let (state, _, _, chain_tip_change) = zebra_state::populated_state(vec![], network).await;
 
@@ -328,6 +332,83 @@ async fn scan_service_registers_keys_correctly_for(network: Network) -> Result<(
 
         _ => panic!("scan service should have responded with the `RegisteredKeys` response"),
     }
+
+    // Try registering invalid keys.
+    let register_keys_error_message = scan_service
+        .ready()
+        .await
+        .map_err(|err| eyre!(err))?
+        .call(Request::RegisterKeys(vec![(
+            "invalid key".to_string(),
+            None,
+        )]))
+        .await
+        .expect_err("response should be an error when there are no valid keys to be added")
+        .to_string();
+
+    assert!(
+        register_keys_error_message.starts_with("no keys were registered"),
+        "error message should say that no keys were registered"
+    );
+
+    Ok(())
+}
+
+/// Test that the scan service with a timeout layer returns timeout errors after expected timeout
+#[tokio::test]
+async fn scan_service_timeout() -> Result<()> {
+    let db = new_test_storage(&Network::Mainnet);
+
+    let (scan_service, _cmd_receiver) = ScanService::new_with_mock_scanner(db);
+    let mut scan_service = ServiceBuilder::new()
+        .buffer(10)
+        .timeout(SCAN_SERVICE_TIMEOUT)
+        .service(scan_service);
+
+    let keys = vec![String::from("fake key")];
+    let mut response_futs = FuturesOrdered::new();
+
+    for request in [
+        Request::RegisterKeys(keys.iter().cloned().map(|key| (key, None)).collect()),
+        Request::SubscribeResults(keys.iter().cloned().collect()),
+        Request::DeleteKeys(keys),
+    ] {
+        let response_fut = scan_service
+            .ready()
+            .await
+            .expect("service should be ready")
+            .call(request);
+
+        response_futs.push_back(tokio::time::timeout(
+            SCAN_SERVICE_TIMEOUT
+                .checked_add(Duration::from_secs(1))
+                .expect("should not overflow"),
+            response_fut,
+        ));
+    }
+
+    let expect_timeout_err = |response: Option<Result<Result<_, _>, _>>| {
+        response
+            .expect("response_futs should not be empty")
+            .expect("service should respond with timeout error before outer timeout")
+            .expect_err("service response should be a timeout error")
+    };
+
+    // RegisterKeys and SubscribeResults should return `Elapsed` errors from `Timeout` layer
+    for _ in 0..2 {
+        let response = response_futs.next().await;
+        expect_timeout_err(response)
+            .downcast::<Elapsed>()
+            .expect("service should return Elapsed error from Timeout layer");
+    }
+
+    let response = response_futs.next().await;
+    let response_error_msg = expect_timeout_err(response).to_string();
+
+    assert!(
+        response_error_msg.starts_with("request timed out"),
+        "error message should say the request timed out"
+    );
 
     Ok(())
 }

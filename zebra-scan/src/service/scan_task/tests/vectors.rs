@@ -17,7 +17,7 @@ use crate::{service::ScanTask, tests::mock_sapling_scanning_keys};
 async fn scan_task_processes_messages_correctly() -> Result<(), Report> {
     let (mut mock_scan_task, mut cmd_receiver) = ScanTask::mock();
     let mut parsed_keys = HashMap::new();
-    let network = Default::default();
+    let network = &Default::default();
 
     // Send some keys to be registered
     let num_keys = 10;
@@ -92,7 +92,7 @@ async fn scan_task_processes_messages_correctly() -> Result<(), Report> {
     // Check that it removes keys correctly
 
     let sapling_keys = mock_sapling_scanning_keys(30, network);
-    let done_rx = mock_scan_task.remove_keys(&sapling_keys)?;
+    let done_rx = mock_scan_task.remove_keys(sapling_keys.clone())?;
 
     let (new_keys, _new_results_senders, _new_results_receivers) =
         ScanTask::process_messages(&mut cmd_receiver, &mut parsed_keys, network)?;
@@ -111,7 +111,7 @@ async fn scan_task_processes_messages_correctly() -> Result<(), Report> {
 
     mock_scan_task.register_keys(sapling_keys_with_birth_heights.clone())?;
 
-    mock_scan_task.remove_keys(&sapling_keys)?;
+    mock_scan_task.remove_keys(sapling_keys.clone())?;
 
     let (new_keys, _new_results_senders, _new_results_receivers) =
         ScanTask::process_messages(&mut cmd_receiver, &mut parsed_keys, network)?;
@@ -125,7 +125,7 @@ async fn scan_task_processes_messages_correctly() -> Result<(), Report> {
 
     mock_scan_task.register_keys(sapling_keys_with_birth_heights.clone())?;
 
-    mock_scan_task.remove_keys(&sapling_keys)?;
+    mock_scan_task.remove_keys(sapling_keys.clone())?;
 
     mock_scan_task.register_keys(sapling_keys_with_birth_heights[..2].to_vec())?;
 
@@ -147,7 +147,12 @@ async fn scan_task_processes_messages_correctly() -> Result<(), Report> {
     let subscribe_keys: HashSet<String> = sapling_keys[..5].iter().cloned().collect();
     let result_receiver_fut = {
         let mut mock_scan_task = mock_scan_task.clone();
-        tokio::spawn(async move { mock_scan_task.subscribe(subscribe_keys.clone()).await })
+        tokio::spawn(async move {
+            mock_scan_task
+                .subscribe(subscribe_keys.clone())
+                .expect("should send subscribe msg successfully")
+                .await
+        })
     };
 
     // Wait for spawned task to send subscribe message

@@ -2,21 +2,19 @@
 
 use std::{env, io::ErrorKind};
 
-use proptest::{arbitrary::any, prelude::*, test_runner::Config};
+use proptest::{prelude::*, test_runner::Config};
 
 use hex::{FromHex, ToHex};
 
 use zebra_test::prelude::*;
 
 use crate::{
-    parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
+    parameters::GENESIS_PREVIOUS_BLOCK_HASH,
     serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
-    LedgerState,
 };
 
 use super::super::{
     arbitrary::{allow_all_transparent_coinbase_spends, PREVOUTS_CHAIN_HEIGHT},
-    serialize::MAX_BLOCK_BYTES,
     *,
 };
 
@@ -81,7 +79,7 @@ proptest! {
 
         // just skip the test if the bytes don't parse, because there's nothing
         // to compare with
-        if let Ok(commitment) = Commitment::from_bytes(bytes, network, block_height) {
+        if let Ok(commitment) = Commitment::from_bytes(bytes, &network, block_height) {
             let other_bytes = commitment.to_bytes();
 
             prop_assert_eq![bytes, other_bytes];
@@ -104,7 +102,7 @@ proptest! {
         let bytes = block.zcash_serialize_to_vec()?;
 
         // Check the block commitment
-        let commitment = block.commitment(network);
+        let commitment = block.commitment(&network);
         if let Ok(commitment) = commitment {
             let commitment_bytes = commitment.to_bytes();
             prop_assert_eq![block.header.commitment_bytes.0, commitment_bytes];

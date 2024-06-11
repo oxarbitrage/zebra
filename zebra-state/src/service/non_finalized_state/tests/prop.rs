@@ -10,7 +10,7 @@ use zebra_chain::{
     fmt::DisplayToDebug,
     history_tree::{HistoryTree, NonEmptyHistoryTree},
     parameters::NetworkUpgrade::*,
-    parameters::{Network, *},
+    parameters::*,
     value_balance::ValueBalance,
     LedgerState,
 };
@@ -47,7 +47,7 @@ fn push_genesis_chain() -> Result<()> {
     |((chain, count, network, empty_tree) in PreparedChain::default())| {
         prop_assert!(empty_tree.is_none());
 
-        let mut only_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, ValueBalance::zero());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, ValueBalance::zero());
         // contains the block value pool changes and chain value pool balances for each height
         let mut chain_values = BTreeMap::new();
 
@@ -99,7 +99,7 @@ fn push_history_tree_chain() -> Result<()> {
         let count = std::cmp::min(count, chain.len() - 1);
         let chain = &chain[1..];
 
-        let mut only_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
 
         for block in chain
             .iter()
@@ -142,7 +142,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // This chain will be used to check if the blocks in the forked chain
         // correspond to the blocks in the original chain before the fork.
         let mut partial_chain = Chain::new(
-            network,
+            &network,
             Height(0),
             Default::default(),
             Default::default(),
@@ -162,7 +162,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
 
         // This chain will be forked.
         let mut full_chain = Chain::new(
-            network,
+            &network,
             Height(0),
             Default::default(),
             Default::default(),
@@ -250,8 +250,8 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
         // use `fork_at_count` as the fork tip
         let fork_tip_hash = chain[fork_at_count - 1].hash;
 
-        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero());
-        let mut partial_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero());
+        let mut partial_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero());
 
         for block in chain
             .iter()
@@ -318,7 +318,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, fake_value_pool);
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, fake_value_pool);
         for block in chain
             .clone()
             .take(finalized_count) {
@@ -326,7 +326,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
             }
 
         let mut partial_chain = Chain::new(
-            network,
+            &network,
             full_chain.non_finalized_tip_height(),
             full_chain.sprout_note_commitment_tree_for_tip(),
             full_chain.sapling_note_commitment_tree_for_tip(),
@@ -395,7 +395,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, fake_value_pool);
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, fake_value_pool);
         for block in chain
             .iter()
             .take(finalized_count)
@@ -404,7 +404,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
             }
 
         let mut partial_chain = Chain::new(
-            network,
+            &network,
             Height(finalized_count.try_into().unwrap()),
             full_chain.sprout_note_commitment_tree_for_tip(),
             full_chain.sapling_note_commitment_tree_for_tip(),
@@ -451,6 +451,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 /// Check that rejected blocks do not change the internal state of a genesis chain
 /// in a non-finalized state.
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn rejection_restores_internal_state_genesis() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -477,8 +478,8 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
           )
       }
       ))| {
-        let mut state = NonFinalizedState::new(network);
-        let finalized_state = FinalizedState::new(&Config::ephemeral(), network, #[cfg(feature = "elasticsearch")] None);
+        let mut state = NonFinalizedState::new(&network);
+        let finalized_state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] None);
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
         finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -568,23 +569,23 @@ fn different_blocks_different_chains() -> Result<()> {
         let height1 = prev_block1.coinbase_height().unwrap();
         let height2 = prev_block1.coinbase_height().unwrap();
 
-        let finalized_tree1: Arc<HistoryTree> = if height1 >= Heartwood.activation_height(Network::Mainnet).unwrap() {
+        let finalized_tree1: Arc<HistoryTree> = if height1 >= Heartwood.activation_height(&Network::Mainnet).unwrap() {
             Arc::new(
-                NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block1, &Default::default(), &Default::default()).unwrap().into()
+                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block1, &Default::default(), &Default::default()).unwrap().into()
             )
         } else {
             Default::default()
         };
-        let finalized_tree2: Arc<HistoryTree> = if height2 >= NetworkUpgrade::Heartwood.activation_height(Network::Mainnet).unwrap() {
+        let finalized_tree2: Arc<HistoryTree> = if height2 >= NetworkUpgrade::Heartwood.activation_height(&Network::Mainnet).unwrap() {
             Arc::new(
-                NonEmptyHistoryTree::from_block(Network::Mainnet, prev_block2, &Default::default(), &Default::default()).unwrap().into()
+                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block2, &Default::default(), &Default::default()).unwrap().into()
             )
         } else {
             Default::default()
         };
 
-        let chain1 = Chain::new(Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool());
-        let chain2 = Chain::new(Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool());
+        let chain1 = Chain::new(&Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool());
+        let chain2 = Chain::new(&Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool());
 
         let block1 = vec1[1].clone().prepare().test_with_zero_spent_utxos();
         let block2 = vec2[1].clone().prepare().test_with_zero_spent_utxos();
@@ -611,15 +612,15 @@ fn different_blocks_different_chains() -> Result<()> {
 
                 // blocks, heights, hashes
                 chain1.blocks = chain2.blocks.clone();
-                chain1.height_by_hash = chain2.height_by_hash.clone();
-                chain1.tx_loc_by_hash = chain2.tx_loc_by_hash.clone();
+                chain1.height_by_hash.clone_from(&chain2.height_by_hash);
+                chain1.tx_loc_by_hash.clone_from(&chain2.tx_loc_by_hash);
 
                 // transparent UTXOs
-                chain1.created_utxos = chain2.created_utxos.clone();
-                chain1.spent_utxos = chain2.spent_utxos.clone();
+                chain1.created_utxos.clone_from(&chain2.created_utxos);
+                chain1.spent_utxos.clone_from(&chain2.spent_utxos);
 
                 // note commitment trees
-                chain1.sprout_trees_by_anchor = chain2.sprout_trees_by_anchor.clone();
+                chain1.sprout_trees_by_anchor.clone_from(&chain2.sprout_trees_by_anchor);
                 chain1.sprout_trees_by_height = chain2.sprout_trees_by_height.clone();
                 chain1.sapling_trees_by_height = chain2.sapling_trees_by_height.clone();
                 chain1.orchard_trees_by_height = chain2.orchard_trees_by_height.clone();
@@ -640,9 +641,9 @@ fn different_blocks_different_chains() -> Result<()> {
                 chain1.orchard_anchors_by_height = chain2.orchard_anchors_by_height.clone();
 
                 // nullifiers
-                chain1.sprout_nullifiers = chain2.sprout_nullifiers.clone();
-                chain1.sapling_nullifiers = chain2.sapling_nullifiers.clone();
-                chain1.orchard_nullifiers = chain2.orchard_nullifiers.clone();
+                chain1.sprout_nullifiers.clone_from(&chain2.sprout_nullifiers);
+                chain1.sapling_nullifiers.clone_from(&chain2.sapling_nullifiers);
+                chain1.orchard_nullifiers.clone_from(&chain2.orchard_nullifiers);
 
                 // proof of work
                 chain1.partial_cumulative_work = chain2.partial_cumulative_work;

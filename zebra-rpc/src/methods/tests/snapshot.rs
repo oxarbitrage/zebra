@@ -2,10 +2,10 @@
 //!
 //! To update these snapshots, run:
 //! ```sh
-//! cargo insta test --review
+//! cargo insta test --review -p zebra-rpc --lib -- test_rpc_response_data
 //! ```
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use insta::dynamic_redaction;
 use tower::buffer::Buffer;
@@ -13,10 +13,16 @@ use tower::buffer::Buffer;
 use zebra_chain::{
     block::Block,
     chain_tip::mock::MockChainTip,
-    parameters::Network::{Mainnet, Testnet},
+    orchard,
+    parameters::{
+        testnet::{ConfiguredActivationHeights, Parameters},
+        Network::Mainnet,
+    },
+    sapling,
     serialization::ZcashDeserializeInto,
     subtree::NoteCommitmentSubtreeData,
 };
+use zebra_node_services::BoxError;
 use zebra_state::{ReadRequest, ReadResponse, MAX_ON_DISK_HEIGHT};
 use zebra_test::mock_service::MockService;
 
@@ -33,21 +39,123 @@ pub const EXCESSIVE_BLOCK_HEIGHT: u32 = MAX_ON_DISK_HEIGHT.0 + 1;
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rpc_response_data() {
     let _init_guard = zebra_test::init();
+    let default_testnet = Network::new_default_testnet();
 
     tokio::join!(
-        test_rpc_response_data_for_network(Mainnet),
-        test_rpc_response_data_for_network(Testnet),
-        test_mocked_rpc_response_data_for_network(Mainnet),
-        test_mocked_rpc_response_data_for_network(Testnet),
+        test_rpc_response_data_for_network(&Mainnet),
+        test_rpc_response_data_for_network(&default_testnet),
+        test_mocked_rpc_response_data_for_network(&Mainnet),
+        test_mocked_rpc_response_data_for_network(&default_testnet),
     );
 }
 
-async fn test_rpc_response_data_for_network(network: Network) {
+/// Checks the output of the [`z_get_treestate`] RPC.
+///
+/// TODO:
+/// 1. Check a non-empty Sapling treestate.
+/// 2. Check an empty Orchard treestate at NU5 activation height.
+/// 3. Check a non-empty Orchard treestate.
+///
+/// To implement the todos above, we need to:
+///
+/// 1. Have a block containing Sapling note commitmnets in the state.
+/// 2. Activate NU5 at a height for which we have a block in the state.
+/// 3. Have a block containing Orchard note commitments in the state.
+#[tokio::test]
+async fn test_z_get_treestate() {
+    let _init_guard = zebra_test::init();
+    const SAPLING_ACTIVATION_HEIGHT: u32 = 2;
+
+    let testnet = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            sapling: Some(SAPLING_ACTIVATION_HEIGHT),
+            // We need to set the NU5 activation height higher than the height of the last block for
+            // this test because we currently have only the first 10 blocks from the public Testnet,
+            // none of which are compatible with NU5 due to the following consensus rule:
+            //
+            // > [NU5 onward] hashBlockCommitments MUST be set to the value of
+            // > hashBlockCommitments for this block, as specified in [ZIP-244].
+            //
+            // Activating NU5 at a lower height and using the 10 blocks causes a failure in
+            // [`zebra_state::populated_state`].
+            nu5: Some(10),
+            ..Default::default()
+        })
+        .with_network_name("custom_testnet")
+        .to_network();
+
+    // Initiate the snapshots of the RPC responses.
+    let mut settings = insta::Settings::clone_current();
+    settings.set_snapshot_suffix(network_string(&testnet).to_string());
+
+    let blocks: Vec<_> = testnet
+        .blockchain_iter()
+        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+
+    let (_, state, tip, _) = zebra_state::populated_state(blocks.clone(), &testnet).await;
+
+    let (rpc, _) = RpcImpl::new(
+        "",
+        "",
+        testnet,
+        false,
+        true,
+        Buffer::new(MockService::build().for_unit_tests::<_, _, BoxError>(), 1),
+        state,
+        tip,
+    );
+
+    // Request the treestate by a hash.
+    let treestate = rpc
+        .z_get_treestate(blocks[0].hash().to_string())
+        .await
+        .expect("genesis treestate = no treestate");
+    settings.bind(|| insta::assert_json_snapshot!("z_get_treestate_by_hash", treestate));
+
+    // Request the treestate by a hash for a block which is not in the state.
+    let treestate = rpc.z_get_treestate(block::Hash([0; 32]).to_string()).await;
+    settings
+        .bind(|| insta::assert_json_snapshot!("z_get_treestate_by_non_existent_hash", treestate));
+
+    // Request the treestate before Sapling activation.
+    let treestate = rpc
+        .z_get_treestate((SAPLING_ACTIVATION_HEIGHT - 1).to_string())
+        .await
+        .expect("no Sapling treestate and no Orchard treestate");
+    settings.bind(|| insta::assert_json_snapshot!("z_get_treestate_no_treestate", treestate));
+
+    // Request the treestate at Sapling activation.
+    let treestate = rpc
+        .z_get_treestate(SAPLING_ACTIVATION_HEIGHT.to_string())
+        .await
+        .expect("empty Sapling treestate and no Orchard treestate");
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_empty_Sapling_treestate", treestate)
+    });
+
+    // Request the treestate for an invalid height.
+    let treestate = rpc
+        .z_get_treestate(EXCESSIVE_BLOCK_HEIGHT.to_string())
+        .await;
+    settings
+        .bind(|| insta::assert_json_snapshot!("z_get_treestate_excessive_block_height", treestate));
+
+    // Request the treestate for an unparsable hash or height.
+    let treestate = rpc.z_get_treestate("Do you even shield?".to_string()).await;
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_unparsable_hash_or_height", treestate)
+    });
+
+    // TODO:
+    // 1. Request a non-empty Sapling treestate.
+    // 2. Request an empty Orchard treestate at an NU5 activation height.
+    // 3. Request a non-empty Orchard treestate.
+}
+
+async fn test_rpc_response_data_for_network(network: &Network) {
     // Create a continuous chain of mainnet and testnet blocks from genesis
-    let block_data = match network {
-        Mainnet => &*zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS,
-        Testnet => &*zebra_test::vectors::CONTINUOUS_TESTNET_BLOCKS,
-    };
+    let block_data = network.blockchain_map();
 
     let blocks: Vec<Arc<Block>> = block_data
         .iter()
@@ -80,7 +188,7 @@ async fn test_rpc_response_data_for_network(network: Network) {
     let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
         "RPC test",
         "/Zebra:RPC test/",
-        network,
+        network.clone(),
         false,
         true,
         Buffer::new(mempool.clone(), 1),
@@ -170,6 +278,25 @@ async fn test_rpc_response_data_for_network(network: Network) {
         .expect("We should have a GetBlock struct");
     snapshot_rpc_getblock_verbose("hash_verbosity_1", get_block, &settings);
 
+    // `getblock`, verbosity=2, height
+    let get_block = rpc
+        .get_block(BLOCK_HEIGHT.to_string(), Some(2u8))
+        .await
+        .expect("We should have a GetBlock struct");
+    snapshot_rpc_getblock_verbose("height_verbosity_2", get_block, &settings);
+
+    let get_block = rpc
+        .get_block(EXCESSIVE_BLOCK_HEIGHT.to_string(), Some(2u8))
+        .await;
+    snapshot_rpc_getblock_invalid("excessive_height_verbosity_2", get_block, &settings);
+
+    // `getblock`, verbosity=2, hash
+    let get_block = rpc
+        .get_block(block_hash.to_string(), Some(2u8))
+        .await
+        .expect("We should have a GetBlock struct");
+    snapshot_rpc_getblock_verbose("hash_verbosity_2", get_block, &settings);
+
     // `getblock`, no verbosity - defaults to 1, height
     let get_block = rpc
         .get_block(BLOCK_HEIGHT.to_string(), None)
@@ -226,18 +353,6 @@ async fn test_rpc_response_data_for_network(network: Network) {
     let get_raw_mempool = response.expect("We should have a GetRawTransaction struct");
 
     snapshot_rpc_getrawmempool(get_raw_mempool, &settings);
-
-    // `z_gettreestate`
-    let tree_state = rpc
-        .z_get_treestate(BLOCK_HEIGHT.to_string())
-        .await
-        .expect("We should have a GetTreestate struct");
-    snapshot_rpc_z_gettreestate_valid(tree_state, &settings);
-
-    let tree_state = rpc
-        .z_get_treestate(EXCESSIVE_BLOCK_HEIGHT.to_string())
-        .await;
-    snapshot_rpc_z_gettreestate_invalid("excessive_height", tree_state, &settings);
 
     // `getrawtransaction` verbosity=0
     //
@@ -323,7 +438,7 @@ async fn test_rpc_response_data_for_network(network: Network) {
     snapshot_rpc_getaddressutxos(get_address_utxos, &settings);
 }
 
-async fn test_mocked_rpc_response_data_for_network(network: Network) {
+async fn test_mocked_rpc_response_data_for_network(network: &Network) {
     // Prepare the test harness.
 
     let mut settings = insta::Settings::clone_current();
@@ -336,7 +451,7 @@ async fn test_mocked_rpc_response_data_for_network(network: Network) {
     let (rpc, _) = RpcImpl::new(
         "RPC test",
         "/Zebra:RPC test/",
-        network,
+        network.clone(),
         false,
         true,
         mempool,
@@ -487,22 +602,6 @@ fn snapshot_rpc_getrawmempool(raw_mempool: Vec<String>, settings: &insta::Settin
     settings.bind(|| insta::assert_json_snapshot!("get_raw_mempool", raw_mempool));
 }
 
-/// Snapshot a valid `z_gettreestate` response, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_z_gettreestate_valid(tree_state: GetTreestate, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!(format!("z_get_treestate_valid"), tree_state));
-}
-
-/// Snapshot an invalid `z_gettreestate` response, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_z_gettreestate_invalid(
-    variant: &'static str,
-    tree_state: Result<GetTreestate>,
-    settings: &insta::Settings,
-) {
-    settings.bind(|| {
-        insta::assert_json_snapshot!(format!("z_get_treestate_invalid_{variant}"), tree_state)
-    });
-}
-
 /// Snapshot `getrawtransaction` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getrawtransaction(
     variant: &'static str,
@@ -545,7 +644,7 @@ fn snapshot_rpc_getaddressutxos(utxos: Vec<GetAddressUtxos>, settings: &insta::S
 }
 
 /// Utility function to convert a `Network` to a lowercase string.
-fn network_string(network: Network) -> String {
+fn network_string(network: &Network) -> String {
     let mut net_suffix = network.to_string();
     net_suffix.make_ascii_lowercase();
     net_suffix

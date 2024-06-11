@@ -36,7 +36,7 @@ use crate::{
     block::{Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointList, CheckpointVerifier, VerifyCheckpointError},
     error::TransactionError,
-    transaction, BoxError, Config,
+    transaction, BoxError, Config, ParameterCheckpoint as _,
 };
 
 #[cfg(test)]
@@ -220,7 +220,7 @@ where
 #[instrument(skip(state_service))]
 pub async fn init<S>(
     config: Config,
-    network: Network,
+    network: &Network,
     mut state_service: S,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
@@ -242,6 +242,8 @@ where
 
     let checkpoint_state_service = state_service.clone();
     let checkpoint_sync = config.checkpoint_sync;
+    let checkpoint_network = network.clone();
+
     let state_checkpoint_verify_handle = tokio::task::spawn(
         // TODO: move this into an async function?
         async move {
@@ -263,7 +265,7 @@ where
             // > activation block hashes given in § 3.12 ‘Mainnet and Testnet’ on p. 20.
             //
             // <https://zips.z.cash/protocol/protocol.pdf#blockchain>
-            let full_checkpoints = CheckpointList::new(network);
+            let full_checkpoints = checkpoint_network.checkpoint_list();
             let mut already_warned = false;
 
             for (height, checkpoint_hash) in full_checkpoints.iter() {
@@ -360,10 +362,10 @@ where
 
 /// Parses the checkpoint list for `network` and `config`.
 /// Returns the checkpoint list and maximum checkpoint height.
-pub fn init_checkpoint_list(config: Config, network: Network) -> (CheckpointList, Height) {
+pub fn init_checkpoint_list(config: Config, network: &Network) -> (CheckpointList, Height) {
     // TODO: Zebra parses the checkpoint list three times at startup.
     //       Instead, cache the checkpoint list for each `network`.
-    let list = CheckpointList::new(network);
+    let list = network.checkpoint_list();
 
     let max_checkpoint_height = if config.checkpoint_sync {
         list.max_height()

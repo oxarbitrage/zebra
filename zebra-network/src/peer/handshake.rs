@@ -515,8 +515,8 @@ where
         let user_agent = self.user_agent.unwrap_or_default();
         let our_services = self.our_services.unwrap_or_else(PeerServices::empty);
         let relay = self.relay.unwrap_or(false);
-        let network = config.network;
-        let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, network);
+        let network = config.network.clone();
+        let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
 
         Ok(Handshake {
             config,
@@ -654,7 +654,17 @@ where
             let their_addr = connected_addr
                 .get_transient_addr()
                 .expect("non-Isolated connections have a remote addr");
-            (their_addr, our_services, config.listen_addr)
+
+            // Include the configured external address in our version message, if any, otherwise, include our listen address.
+            let advertise_addr = match config.external_addr {
+                Some(external_addr) => {
+                    info!(?their_addr, ?config.listen_addr, "using external address for Version messages");
+                    external_addr
+                }
+                None => config.listen_addr,
+            };
+
+            (their_addr, our_services, advertise_addr)
         }
     };
 
@@ -898,7 +908,7 @@ where
             let mut peer_conn = Framed::new(
                 data_stream,
                 Codec::builder()
-                    .for_network(config.network)
+                    .for_network(&config.network)
                     .with_metrics_addr_label(connected_addr.get_transient_addr_label())
                     .finish(),
             );

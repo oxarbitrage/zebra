@@ -51,7 +51,7 @@ impl ValueTree for PreparedChainTree {
         (
             self.chain.clone(),
             self.count.current(),
-            self.network,
+            self.network.clone(),
             self.history_tree.clone(),
         )
     }
@@ -89,13 +89,14 @@ impl PreparedChain {
         // The history tree only works with Heartwood onward.
         // Since the network will be chosen later, we pick the larger
         // between the mainnet and testnet Heartwood activation heights.
-        let main_height = NetworkUpgrade::Heartwood
-            .activation_height(Network::Mainnet)
-            .expect("must have height");
-        let test_height = NetworkUpgrade::Heartwood
-            .activation_height(Network::Testnet)
-            .expect("must have height");
-        let height = std::cmp::max(main_height, test_height);
+        let height = Network::iter()
+            .map(|network| {
+                NetworkUpgrade::Heartwood
+                    .activation_height(&network)
+                    .expect("must have height")
+            })
+            .max()
+            .expect("Network::iter() must return non-empty iterator");
 
         PreparedChain {
             ledger_strategy: Some(LedgerState::height_strategy(
@@ -137,7 +138,7 @@ impl Strategy for PreparedChain {
             let (network, blocks) = ledger_strategy
                 .prop_flat_map(|ledger| {
                     (
-                        Just(ledger.network),
+                        Just(ledger.network.clone()),
                         Block::partial_chain_strategy(
                             ledger,
                             MAX_PARTIAL_CHAIN_BLOCKS,
@@ -158,7 +159,7 @@ impl Strategy for PreparedChain {
                 .current();
             // Generate a history tree from the first block
             let history_tree = HistoryTree::from_block(
-                network,
+                &network,
                 blocks[0].block.clone(),
                 // Dummy roots since this is only used for tests
                 &Default::default(),
@@ -193,7 +194,7 @@ impl Strategy for PreparedChain {
 /// - a [`ChainTipChange`] tracker
 pub async fn populated_state(
     blocks: impl IntoIterator<Item = Arc<Block>>,
-    network: Network,
+    network: &Network,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
     ReadStateService,

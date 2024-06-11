@@ -1,22 +1,13 @@
 //! Randomised property testing for [`Block`]s.
 
-use std::{collections::HashMap, sync::Arc};
-
-use proptest::{
-    arbitrary::{any, Arbitrary},
-    prelude::*,
-};
+use proptest::prelude::*;
 
 use crate::{
     amount::NonNegative,
     block,
     fmt::{HexDebug, SummaryDebug},
     history_tree::HistoryTree,
-    parameters::{
-        Network,
-        NetworkUpgrade::{self, *},
-        GENESIS_PREVIOUS_BLOCK_HASH,
-    },
+    parameters::{NetworkUpgrade::*, GENESIS_PREVIOUS_BLOCK_HASH},
     serialization,
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
     transparent::{
@@ -69,7 +60,7 @@ impl Arbitrary for Height {
     type Strategy = BoxedStrategy<Self>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 /// The configuration data for proptest when generating arbitrary chains
 pub struct LedgerState {
@@ -245,7 +236,7 @@ impl LedgerState {
         if let Some(network_upgrade_override) = self.network_upgrade_override {
             network_upgrade_override
         } else {
-            NetworkUpgrade::current(self.network, self.height)
+            NetworkUpgrade::current(&self.network, self.height)
         }
     }
 
@@ -268,9 +259,9 @@ impl Default for LedgerState {
         let default_network = Network::default();
         let default_override = LedgerStateOverride::default();
 
-        let most_recent_nu = NetworkUpgrade::current(default_network, Height::MAX);
+        let most_recent_nu = NetworkUpgrade::current(&default_network, Height::MAX);
         let most_recent_activation_height =
-            most_recent_nu.activation_height(default_network).unwrap();
+            most_recent_nu.activation_height(&default_network).unwrap();
 
         LedgerState {
             height: most_recent_activation_height,
@@ -290,7 +281,7 @@ impl Default for LedgerStateOverride {
         let default_network = Network::default();
 
         // TODO: dynamically select any future network upgrade (#1974)
-        let nu5_activation_height = Nu5.activation_height(default_network);
+        let nu5_activation_height = Nu5.activation_height(&default_network);
         let nu5_override = if nu5_activation_height.is_some() {
             None
         } else {
@@ -348,12 +339,14 @@ impl Arbitrary for Block {
     type Parameters = LedgerState;
 
     fn arbitrary_with(ledger_state: Self::Parameters) -> Self::Strategy {
-        let transactions_strategy =
+        let transactions_strategy = {
+            let ledger_state = ledger_state.clone();
             // Generate a random number transactions. A coinbase tx is always generated, so if
             // `transaction_count` is zero, the block will contain only the coinbase tx.
             (0..MAX_ARBITRARY_ITEMS).prop_flat_map(move |transaction_count| {
-                Transaction::vec_strategy(ledger_state, transaction_count)
-            });
+                Transaction::vec_strategy(ledger_state.clone(), transaction_count)
+            })
+        };
 
         // TODO: if needed, fixup:
         // - history and authorizing data commitments
@@ -411,7 +404,7 @@ impl Block {
 
         // generate block strategies with the correct heights
         for _ in 0..count {
-            vec.push((Just(current.height), Block::arbitrary_with(current)));
+            vec.push((Just(current.height), Block::arbitrary_with(current.clone())));
             current.height.0 += 1;
         }
 
@@ -473,9 +466,9 @@ impl Block {
                 if generate_valid_commitments {
                     let current_height = block.coinbase_height().unwrap();
                     let heartwood_height = NetworkUpgrade::Heartwood
-                        .activation_height(current.network)
+                        .activation_height(&current.network)
                         .unwrap();
-                    let nu5_height = NetworkUpgrade::Nu5.activation_height(current.network);
+                    let nu5_height = NetworkUpgrade::Nu5.activation_height(&current.network);
 
                     match current_height.cmp(&heartwood_height) {
                         std::cmp::Ordering::Less => {
@@ -520,16 +513,16 @@ impl Block {
                     if let Some(history_tree) = history_tree.as_mut() {
                         history_tree
                             .push(
-                                current.network,
+                                &current.network,
                                 Arc::new(block.clone()),
-                                sapling_tree.root(),
-                                orchard_tree.root(),
+                                &sapling_tree.root(),
+                                &orchard_tree.root(),
                             )
                             .unwrap();
                     } else {
                         history_tree = Some(
                             HistoryTree::from_block(
-                                current.network,
+                                &current.network,
                                 Arc::new(block.clone()),
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
@@ -703,10 +696,10 @@ impl Arbitrary for Commitment {
     fn arbitrary_with(_args: ()) -> Self::Strategy {
         (any::<[u8; 32]>(), any::<Network>(), any::<Height>())
             .prop_map(|(commitment_bytes, network, block_height)| {
-                if block_height == Heartwood.activation_height(network).unwrap() {
+                if block_height == Heartwood.activation_height(&network).unwrap() {
                     Commitment::ChainHistoryActivationReserved
                 } else {
-                    Commitment::from_bytes(commitment_bytes, network, block_height)
+                    Commitment::from_bytes(commitment_bytes, &network, block_height)
                         .expect("unexpected failure in from_bytes parsing")
                 }
             })

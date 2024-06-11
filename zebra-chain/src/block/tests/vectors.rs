@@ -202,22 +202,13 @@ fn block_test_vectors_height_mainnet() {
 fn block_test_vectors_height_testnet() {
     let _init_guard = zebra_test::init();
 
-    block_test_vectors_height(Testnet);
+    block_test_vectors_height(Network::new_default_testnet());
 }
 
 /// Test that the block test vector indexes match the heights in the block data,
 /// and that each post-sapling block has a corresponding final sapling root.
 fn block_test_vectors_height(network: Network) {
-    let (block_iter, sapling_roots) = match network {
-        Mainnet => (
-            zebra_test::vectors::MAINNET_BLOCKS.iter(),
-            zebra_test::vectors::MAINNET_FINAL_SAPLING_ROOTS.clone(),
-        ),
-        Testnet => (
-            zebra_test::vectors::TESTNET_BLOCKS.iter(),
-            zebra_test::vectors::TESTNET_FINAL_SAPLING_ROOTS.clone(),
-        ),
-    };
+    let (block_iter, sapling_roots) = network.block_sapling_roots_iter();
 
     for (&height, block) in block_iter {
         let block = block
@@ -231,7 +222,7 @@ fn block_test_vectors_height(network: Network) {
 
         if height
             >= Sapling
-                .activation_height(network)
+                .activation_height(&network)
                 .expect("sapling activation height is set")
                 .0
         {
@@ -254,7 +245,7 @@ fn block_commitment_mainnet() {
 fn block_commitment_testnet() {
     let _init_guard = zebra_test::init();
 
-    block_commitment(Testnet);
+    block_commitment(Network::new_default_testnet());
 }
 
 /// Check that the block commitment field parses without errors.
@@ -262,23 +253,14 @@ fn block_commitment_testnet() {
 ///
 /// TODO: add chain history test vectors?
 fn block_commitment(network: Network) {
-    let (block_iter, sapling_roots) = match network {
-        Mainnet => (
-            zebra_test::vectors::MAINNET_BLOCKS.iter(),
-            zebra_test::vectors::MAINNET_FINAL_SAPLING_ROOTS.clone(),
-        ),
-        Testnet => (
-            zebra_test::vectors::TESTNET_BLOCKS.iter(),
-            zebra_test::vectors::TESTNET_FINAL_SAPLING_ROOTS.clone(),
-        ),
-    };
+    let (block_iter, sapling_roots) = network.block_sapling_roots_iter();
 
     for (height, block) in block_iter {
         let block = block
             .zcash_deserialize_into::<Block>()
             .expect("block is structurally valid");
 
-        let commitment = block.commitment(network).unwrap_or_else(|_| {
+        let commitment = block.commitment(&network).unwrap_or_else(|_| {
             panic!("unexpected structurally invalid block commitment at {network} {height}")
         });
 

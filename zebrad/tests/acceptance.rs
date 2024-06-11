@@ -122,16 +122,10 @@
 //!
 //! ## Shielded scanning tests
 //!
-//! Example of how to run the scans_for_new_key test:
+//! Example of how to run the scan_task_commands test:
 //!
 //! ```console
-//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test scans_for_new_key --features shielded-scan --release -- --ignored --nocapture
-//! ```
-//!
-//! Example of how to run the scan_subscribe_results test:
-//!
-//! ```console
-//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test scan_subscribe_results --features shielded-scan -- --ignored --nocapture
+//! ZEBRA_CACHED_STATE_DIR=/path/to/zebra/state cargo test scan_task_commands --features shielded-scan --release -- --ignored --nocapture
 //! ```
 //!
 //! ## Checkpoint Generation Tests
@@ -161,16 +155,18 @@ use std::{
 };
 
 use color_eyre::{
-    eyre::{eyre, Result, WrapErr},
+    eyre::{eyre, WrapErr},
     Help,
 };
 use semver::Version;
 use serde_json::Value;
 
+use tower::ServiceExt;
 use zebra_chain::{
-    block::{self, Height},
+    block::{self, genesis::regtest_genesis_block, Height},
     parameters::Network::{self, *},
 };
+use zebra_consensus::ParameterCheckpoint;
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_node_services::rpc_client::RpcRequestClient;
 use zebra_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
@@ -188,7 +184,8 @@ use common::{
     check::{is_zebrad_version, EphemeralCheck, EphemeralConfig},
     config::random_known_rpc_port_config,
     config::{
-        config_file_full_path, configs_dir, default_test_config, persistent_test_config, testdir,
+        config_file_full_path, configs_dir, default_test_config, external_address_test_config,
+        persistent_test_config, testdir,
     },
     launch::{
         spawn_zebrad_for_rpc, spawn_zebrad_without_rpc, ZebradTestDirExt, BETWEEN_NODES_DELAY,
@@ -226,7 +223,7 @@ fn generate_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     let child = testdir()?
-        .with_config(&mut default_test_config(Mainnet)?)?
+        .with_config(&mut default_test_config(&Mainnet)?)?
         .spawn_child(args!["generate"])?;
 
     let output = child.wait_with_output()?;
@@ -288,7 +285,7 @@ fn generate_args() -> Result<()> {
 fn help_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut default_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet)?)?;
 
     let child = testdir.spawn_child(args!["help"])?;
     let output = child.wait_with_output()?;
@@ -333,7 +330,7 @@ fn start_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     // start caches state, so run one of the start tests with persistent state
-    let testdir = testdir()?.with_config(&mut persistent_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
 
     let mut child = testdir.spawn_child(args!["-v", "start"])?;
 
@@ -360,7 +357,7 @@ fn start_no_args() -> Result<()> {
 fn start_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut default_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet)?)?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(args!["start"])?;
@@ -385,13 +382,17 @@ fn start_args() -> Result<()> {
 #[tokio::test]
 async fn db_init_outside_future_executor() -> Result<()> {
     let _init_guard = zebra_test::init();
-    let config = default_test_config(Mainnet)?;
+    let config = default_test_config(&Mainnet)?;
 
     let start = Instant::now();
 
     // This test doesn't need UTXOs to be verified efficiently, because it uses an empty state.
-    let db_init_handle =
-        zebra_state::spawn_init(config.state.clone(), config.network.network, Height::MAX, 0);
+    let db_init_handle = zebra_state::spawn_init(
+        config.state.clone(),
+        &config.network.network,
+        Height::MAX,
+        0,
+    );
 
     // it's faster to panic if it takes longer than expected, since the executor
     // will wait indefinitely for blocking operation to finish once started
@@ -411,7 +412,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
 fn persistent_mode() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut persistent_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(args!["-v", "start"])?;
@@ -476,13 +477,13 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
 
     let _init_guard = zebra_test::init();
 
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     let run_dir = testdir()?;
 
     let ignored_cache_dir = run_dir.path().join("state");
     if cache_dir_config == EphemeralConfig::MisconfiguredCacheDir {
         // Write a configuration that sets both the cache_dir and ephemeral options
-        config.state.cache_dir = ignored_cache_dir.clone();
+        config.state.cache_dir.clone_from(&ignored_cache_dir);
     }
     if cache_dir_check == EphemeralCheck::ExistingDirectory {
         // We set the cache_dir config to a newly created empty temp directory,
@@ -566,7 +567,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
 fn version_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut default_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet)?)?;
 
     let child = testdir.spawn_child(args!["--version"])?;
     let output = child.wait_with_output()?;
@@ -587,7 +588,7 @@ fn version_no_args() -> Result<()> {
 fn version_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut default_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet)?)?;
     let testdir = &testdir;
 
     // unrecognized option `-f`
@@ -624,6 +625,7 @@ fn config_tests() -> Result<()> {
     invalid_generated_config()?;
 
     // Check that we have a current version of the config stored
+    #[cfg(not(target_os = "windows"))]
     last_config_is_stored()?;
 
     // Check that Zebra's previous configurations still work
@@ -641,7 +643,7 @@ fn app_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     // start caches state, so run one of the start tests with persistent state
-    let testdir = testdir()?.with_config(&mut persistent_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
 
     tracing::info!(?testdir, "running zebrad with no config (default settings)");
 
@@ -926,6 +928,69 @@ fn invalid_generated_config() -> Result<()> {
 
 /// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
 #[tracing::instrument]
+#[test]
+fn stored_configs_parsed_correctly() -> Result<()> {
+    let old_configs_dir = configs_dir();
+    use abscissa_core::Application;
+    use zebrad::application::ZebradApp;
+
+    tracing::info!(?old_configs_dir, "testing older config parsing");
+
+    for config_file in old_configs_dir
+        .read_dir()
+        .expect("read_dir call failed")
+        .flatten()
+    {
+        let config_file_path = config_file.path();
+        let config_file_name = config_file_path
+            .file_name()
+            .expect("config files must have a file name")
+            .to_str()
+            .expect("config file names are valid unicode");
+
+        if config_file_name.starts_with('.') || config_file_name.starts_with('#') {
+            // Skip editor files and other invalid config paths
+            tracing::info!(
+                ?config_file_path,
+                "skipping hidden/temporary config file path"
+            );
+            continue;
+        }
+
+        // ignore files starting with getblocktemplate prefix
+        // if we were not built with the getblocktemplate-rpcs feature.
+        #[cfg(not(feature = "getblocktemplate-rpcs"))]
+        if config_file_name.starts_with(GET_BLOCK_TEMPLATE_CONFIG_PREFIX) {
+            tracing::info!(
+                ?config_file_path,
+                "skipping getblocktemplate-rpcs config file path"
+            );
+            continue;
+        }
+
+        // ignore files starting with shieldedscan prefix
+        // if we were not built with the shielded-scan feature.
+        #[cfg(not(feature = "shielded-scan"))]
+        if config_file_name.starts_with(SHIELDED_SCAN_CONFIG_PREFIX) {
+            tracing::info!(?config_file_path, "skipping shielded-scan config file path");
+            continue;
+        }
+
+        tracing::info!(
+            ?config_file_path,
+            "testing old config can be parsed by current zebrad"
+        );
+
+        ZebradApp::default()
+            .load_config(&config_file_path)
+            .expect("config should parse");
+    }
+
+    Ok(())
+}
+
+/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+#[tracing::instrument]
 fn stored_configs_work() -> Result<()> {
     let old_configs_dir = configs_dir();
 
@@ -1032,7 +1097,7 @@ fn stored_configs_work() -> Result<()> {
 fn sync_one_checkpoint_mainnet() -> Result<()> {
     sync_until(
         TINY_CHECKPOINT_TEST_HEIGHT,
-        Mainnet,
+        &Mainnet,
         STOP_AT_HEIGHT_REGEX,
         TINY_CHECKPOINT_TIMEOUT,
         None,
@@ -1053,7 +1118,7 @@ fn sync_one_checkpoint_mainnet() -> Result<()> {
 fn sync_one_checkpoint_testnet() -> Result<()> {
     sync_until(
         TINY_CHECKPOINT_TEST_HEIGHT,
-        Testnet,
+        &Network::new_default_testnet(),
         STOP_AT_HEIGHT_REGEX,
         TINY_CHECKPOINT_TIMEOUT,
         None,
@@ -1080,7 +1145,7 @@ fn restart_stop_at_height() -> Result<()> {
 fn restart_stop_at_height_for_network(network: Network, height: block::Height) -> Result<()> {
     let reuse_tempdir = sync_until(
         height,
-        network,
+        &network,
         STOP_AT_HEIGHT_REGEX,
         TINY_CHECKPOINT_TIMEOUT,
         None,
@@ -1094,7 +1159,7 @@ fn restart_stop_at_height_for_network(network: Network, height: block::Height) -
     // sync, rather than stopping immediately at the configured height
     sync_until(
         height,
-        network,
+        &network,
         "state is already at the configured height",
         STOP_ON_LOAD_TIMEOUT,
         reuse_tempdir,
@@ -1113,7 +1178,7 @@ fn restart_stop_at_height_for_network(network: Network, height: block::Height) -
 fn activate_mempool_mainnet() -> Result<()> {
     sync_until(
         block::Height(TINY_CHECKPOINT_TEST_HEIGHT.0 + 1),
-        Mainnet,
+        &Mainnet,
         STOP_AT_HEIGHT_REGEX,
         TINY_CHECKPOINT_TIMEOUT,
         None,
@@ -1135,7 +1200,7 @@ fn activate_mempool_mainnet() -> Result<()> {
 fn sync_large_checkpoints_mainnet() -> Result<()> {
     let reuse_tempdir = sync_until(
         LARGE_CHECKPOINT_TEST_HEIGHT,
-        Mainnet,
+        &Mainnet,
         STOP_AT_HEIGHT_REGEX,
         LARGE_CHECKPOINT_TIMEOUT,
         None,
@@ -1147,7 +1212,7 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
     // if this sync fails, see the failure notes in `restart_stop_at_height`
     sync_until(
         (LARGE_CHECKPOINT_TEST_HEIGHT - 1).unwrap(),
-        Mainnet,
+        &Mainnet,
         "previous state height is greater than the stop height",
         STOP_ON_LOAD_TIMEOUT,
         reuse_tempdir,
@@ -1171,7 +1236,7 @@ fn sync_large_checkpoints_mainnet() -> Result<()> {
 fn sync_large_checkpoints_mempool_mainnet() -> Result<()> {
     sync_until(
         MEDIUM_CHECKPOINT_TEST_HEIGHT,
-        Mainnet,
+        &Mainnet,
         STOP_AT_HEIGHT_REGEX,
         LARGE_CHECKPOINT_TIMEOUT,
         None,
@@ -1190,7 +1255,7 @@ fn create_cached_database(network: Network) -> Result<()> {
         format!("{STOP_AT_HEIGHT_REGEX}.*commit checkpoint-verified request");
 
     create_cached_database_height(
-        network,
+        &network,
         height,
         // Use checkpoints to increase sync performance while caching the database
         true,
@@ -1206,7 +1271,7 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
         format!("{STOP_AT_HEIGHT_REGEX}.*commit contextually-verified request");
 
     create_cached_database_height(
-        network,
+        &network,
         height.unwrap(),
         // Test full validation by turning checkpoints off
         false,
@@ -1234,7 +1299,7 @@ fn full_sync_test(network: Network, timeout_argument_name: &str) -> Result<()> {
     // - the path from ZEBRA_CACHED_STATE_DIR
     if let Some(_timeout_minutes) = timeout_argument {
         create_cached_database_height(
-            network,
+            &network,
             // Just keep going until we reach the chain tip
             block::Height::MAX,
             // Use the checkpoints to sync quickly, then do full validation until the chain tip
@@ -1273,7 +1338,7 @@ fn sync_to_mandatory_checkpoint_mainnet() -> Result<()> {
 #[cfg_attr(feature = "test_sync_to_mandatory_checkpoint_testnet", test)]
 fn sync_to_mandatory_checkpoint_testnet() -> Result<()> {
     let _init_guard = zebra_test::init();
-    let network = Testnet;
+    let network = Network::new_default_testnet();
     create_cached_database(network)
 }
 
@@ -1299,7 +1364,7 @@ fn sync_past_mandatory_checkpoint_mainnet() -> Result<()> {
 #[cfg_attr(feature = "test_sync_past_mandatory_checkpoint_testnet", test)]
 fn sync_past_mandatory_checkpoint_testnet() -> Result<()> {
     let _init_guard = zebra_test::init();
-    let network = Testnet;
+    let network = Network::new_default_testnet();
     sync_past_mandatory_checkpoint(network)
 }
 
@@ -1324,10 +1389,13 @@ fn full_sync_mainnet() -> Result<()> {
 #[ignore]
 fn full_sync_testnet() -> Result<()> {
     // TODO: add "ZEBRA" at the start of this env var, to avoid clashes
-    full_sync_test(Testnet, "FULL_SYNC_TESTNET_TIMEOUT_MINUTES")
+    full_sync_test(
+        Network::new_default_testnet(),
+        "FULL_SYNC_TESTNET_TIMEOUT_MINUTES",
+    )
 }
 
-#[cfg(feature = "prometheus")]
+#[cfg(all(feature = "prometheus", not(target_os = "windows")))]
 #[tokio::test]
 async fn metrics_endpoint() -> Result<()> {
     use hyper::Client;
@@ -1340,7 +1408,7 @@ async fn metrics_endpoint() -> Result<()> {
     let url = format!("http://{endpoint}");
 
     // Write a configuration that has metrics endpoint_addr set
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.metrics.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = testdir()?.with_config(&mut config)?;
@@ -1383,7 +1451,7 @@ async fn metrics_endpoint() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "filter-reload")]
+#[cfg(all(feature = "filter-reload", not(target_os = "windows")))]
 #[tokio::test]
 async fn tracing_endpoint() -> Result<()> {
     use hyper::{Body, Client, Request};
@@ -1397,7 +1465,7 @@ async fn tracing_endpoint() -> Result<()> {
     let url_filter = format!("{url_default}/filter");
 
     // Write a configuration that has tracing endpoint_addr option set
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = testdir()?.with_config(&mut config)?;
@@ -1481,6 +1549,7 @@ async fn tracing_endpoint() -> Result<()> {
 /// Test that the JSON-RPC endpoint responds to a request,
 /// when configured with a single thread.
 #[tokio::test]
+#[cfg(not(target_os = "windows"))]
 async fn rpc_endpoint_single_thread() -> Result<()> {
     rpc_endpoint(false).await
 }
@@ -1488,6 +1557,7 @@ async fn rpc_endpoint_single_thread() -> Result<()> {
 /// Test that the JSON-RPC endpoint responds to a request,
 /// when configured with multiple threads.
 #[tokio::test]
+#[cfg(not(target_os = "windows"))]
 async fn rpc_endpoint_parallel_threads() -> Result<()> {
     rpc_endpoint(true).await
 }
@@ -1504,7 +1574,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
 
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
-    let mut config = random_known_rpc_port_config(parallel_cpu_threads, Mainnet)?;
+    let mut config = random_known_rpc_port_config(parallel_cpu_threads, &Mainnet)?;
 
     let dir = testdir()?.with_config(&mut config)?;
     let mut child = dir.spawn_child(args!["start"])?;
@@ -1555,6 +1625,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
 ///
 /// https://zcash.github.io/rpc/getblockchaininfo.html
 #[tokio::test]
+#[cfg(not(target_os = "windows"))]
 async fn rpc_endpoint_client_content_type() -> Result<()> {
     let _init_guard = zebra_test::init();
     if zebra_test::net::zebra_skip_network_tests() {
@@ -1563,7 +1634,7 @@ async fn rpc_endpoint_client_content_type() -> Result<()> {
 
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
-    let mut config = random_known_rpc_port_config(true, Mainnet)?;
+    let mut config = random_known_rpc_port_config(true, &Mainnet)?;
 
     let dir = testdir()?.with_config(&mut config)?;
     let mut child = dir.spawn_child(args!["start"])?;
@@ -1649,7 +1720,7 @@ fn non_blocking_logger() -> Result<()> {
 
         // Write a configuration that has RPC listen_addr set
         // [Note on port conflict](#Note on port conflict)
-        let mut config = random_known_rpc_port_config(false, Mainnet)?;
+        let mut config = random_known_rpc_port_config(false, &Mainnet)?;
         config.tracing.filter = Some("trace".to_string());
         config.tracing.buffer_limit = 100;
         let zebra_rpc_address = config.rpc.listen_addr.unwrap();
@@ -1692,7 +1763,7 @@ fn non_blocking_logger() -> Result<()> {
     });
 
     // Wait until the spawned task finishes up to 45 seconds before shutting down tokio runtime
-    if done_rx.recv_timeout(Duration::from_secs(45)).is_ok() {
+    if done_rx.recv_timeout(Duration::from_secs(90)).is_ok() {
         rt.shutdown_timeout(Duration::from_secs(3));
     }
 
@@ -1841,9 +1912,12 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
     }
 
     // Launch zebra with peers and using a predefined zebrad state path.
-    let (mut zebrad, zebra_rpc_address) = if let Some(zebrad_and_address) =
-        spawn_zebrad_for_rpc(network, test_name, test_type, use_internet_connection)?
-    {
+    let (mut zebrad, zebra_rpc_address) = if let Some(zebrad_and_address) = spawn_zebrad_for_rpc(
+        network.clone(),
+        test_name,
+        test_type,
+        use_internet_connection,
+    )? {
         tracing::info!(
             ?test_type,
             "running lightwalletd & zebrad integration test, launching zebrad...",
@@ -2077,6 +2151,7 @@ fn lightwalletd_integration_test(test_type: TestType) -> Result<()> {
 /// It is expected that the first node spawned will get exclusive use of the port.
 /// The second node will panic with the Zcash listener conflict hint added in #1535.
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn zebra_zcash_listener_conflict() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -2085,7 +2160,7 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
     let listen_addr = format!("127.0.0.1:{port}");
 
     // Write a configuration that has our created network listen_addr
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.network.listen_addr = listen_addr.parse().unwrap();
     let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!("Opened Zcash protocol endpoint at {listen_addr}"));
@@ -2105,7 +2180,7 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
 /// exclusive use of the port. The second node will panic with the Zcash metrics
 /// conflict hint added in #1535.
 #[test]
-#[cfg(feature = "prometheus")]
+#[cfg(all(feature = "prometheus", not(target_os = "windows")))]
 fn zebra_metrics_conflict() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -2114,7 +2189,7 @@ fn zebra_metrics_conflict() -> Result<()> {
     let listen_addr = format!("127.0.0.1:{port}");
 
     // Write a configuration that has our created metrics endpoint_addr
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.metrics.endpoint_addr = Some(listen_addr.parse().unwrap());
     let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(r"Opened metrics endpoint at {listen_addr}"));
@@ -2134,7 +2209,7 @@ fn zebra_metrics_conflict() -> Result<()> {
 /// exclusive use of the port. The second node will panic with the Zcash tracing
 /// conflict hint added in #1535.
 #[test]
-#[cfg(feature = "filter-reload")]
+#[cfg(all(feature = "filter-reload", not(target_os = "windows")))]
 fn zebra_tracing_conflict() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -2143,7 +2218,7 @@ fn zebra_tracing_conflict() -> Result<()> {
     let listen_addr = format!("127.0.0.1:{port}");
 
     // Write a configuration that has our created tracing endpoint_addr
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.tracing.endpoint_addr = Some(listen_addr.parse().unwrap());
     let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(r"Opened tracing endpoint at {listen_addr}"));
@@ -2177,7 +2252,7 @@ fn zebra_rpc_conflict() -> Result<()> {
     // [Note on port conflict](#Note on port conflict)
     //
     // This is the required setting to detect port conflicts.
-    let mut config = random_known_rpc_port_config(false, Mainnet)?;
+    let mut config = random_known_rpc_port_config(false, &Mainnet)?;
 
     let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(
@@ -2204,7 +2279,7 @@ fn zebra_state_conflict() -> Result<()> {
 
     // A persistent config has a fixed temp state directory, but asks the OS to
     // automatically choose an unused port
-    let mut config = persistent_test_config(Mainnet)?;
+    let mut config = persistent_test_config(&Mainnet)?;
     let dir_conflict = testdir()?.with_config(&mut config)?;
 
     // Windows problems with this match will be worked on at #1654
@@ -2369,7 +2444,7 @@ fn delete_old_databases() -> Result<()> {
         return Ok(());
     }
 
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     let run_dir = testdir()?;
     let cache_dir = run_dir.path().join("state");
 
@@ -2485,7 +2560,7 @@ async fn submit_block() -> Result<()> {
 #[test]
 fn end_of_support_is_checked_at_start() -> Result<()> {
     let _init_guard = zebra_test::init();
-    let testdir = testdir()?.with_config(&mut default_test_config(Mainnet)?)?;
+    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet)?)?;
     let mut child = testdir.spawn_child(args!["start"])?;
 
     // Give enough time to start up the eos task.
@@ -2528,15 +2603,15 @@ async fn generate_checkpoints_mainnet() -> Result<()> {
 #[ignore]
 #[cfg(feature = "zebra-checkpoints")]
 async fn generate_checkpoints_testnet() -> Result<()> {
-    common::checkpoints::run(Testnet).await
+    common::checkpoints::run(Network::new_default_testnet()).await
 }
 
 /// Check that new states are created with the current state format version,
 /// and that restarting `zebrad` doesn't change the format version.
 #[tokio::test]
 async fn new_state_format() -> Result<()> {
-    for network in [Mainnet, Testnet] {
-        state_format_test("new_state_format_test", network, 2, None).await?;
+    for network in Network::iter() {
+        state_format_test("new_state_format_test", &network, 2, None).await?;
     }
 
     Ok(())
@@ -2553,8 +2628,8 @@ async fn update_state_format() -> Result<()> {
     fake_version.minor = 0;
     fake_version.patch = 0;
 
-    for network in [Mainnet, Testnet] {
-        state_format_test("update_state_format_test", network, 3, Some(&fake_version)).await?;
+    for network in Network::iter() {
+        state_format_test("update_state_format_test", &network, 3, Some(&fake_version)).await?;
     }
 
     Ok(())
@@ -2570,10 +2645,10 @@ async fn downgrade_state_format() -> Result<()> {
     fake_version.minor = u16::MAX.into();
     fake_version.patch = 0;
 
-    for network in [Mainnet, Testnet] {
+    for network in Network::iter() {
         state_format_test(
             "downgrade_state_format_test",
-            network,
+            &network,
             3,
             Some(&fake_version),
         )
@@ -2586,7 +2661,7 @@ async fn downgrade_state_format() -> Result<()> {
 /// Test state format changes, see calling tests for details.
 async fn state_format_test(
     base_test_name: &str,
-    network: Network,
+    network: &Network,
     reopen_count: usize,
     fake_version: Option<&Version>,
 ) -> Result<()> {
@@ -2596,7 +2671,7 @@ async fn state_format_test(
 
     // # Create a new state and check it has the current version
 
-    let zebrad = spawn_zebrad_without_rpc(network, test_name, false, false, None, false)?;
+    let zebrad = spawn_zebrad_without_rpc(network.clone(), test_name, false, false, None, false)?;
 
     // Skip the test unless it has the required state and environmental variables.
     let Some(mut zebrad) = zebrad else {
@@ -2677,8 +2752,9 @@ async fn state_format_test(
             expect_newer_version = false;
         }
 
-        let mut zebrad = spawn_zebrad_without_rpc(network, test_name, false, false, dir, false)?
-            .expect("unexpectedly missing required state or env vars");
+        let mut zebrad =
+            spawn_zebrad_without_rpc(network.clone(), test_name, false, false, dir, false)?
+                .expect("unexpectedly missing required state or env vars");
 
         tracing::info!(?network, "running {test_name} using zebrad");
 
@@ -2839,7 +2915,7 @@ fn scan_task_starts() -> Result<()> {
     let test_type = TestType::LaunchWithEmptyState {
         launches_lightwalletd: false,
     };
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     let mut keys = IndexMap::new();
     keys.insert(ZECPAGES_SAPLING_VIEWING_KEY.to_string(), 1);
     config.shielded_scan.sapling_keys_to_scan = keys;
@@ -2872,7 +2948,7 @@ fn scan_task_starts() -> Result<()> {
 
 /// Test that the scanner gRPC server starts when the node starts.
 #[tokio::test]
-#[cfg(feature = "shielded-scan")]
+#[cfg(all(feature = "shielded-scan", not(target_os = "windows")))]
 async fn scan_rpc_server_starts() -> Result<()> {
     use zebra_grpc::scanner::{scanner_client::ScannerClient, Empty};
 
@@ -2884,7 +2960,7 @@ async fn scan_rpc_server_starts() -> Result<()> {
 
     let port = random_known_port();
     let listen_addr = format!("127.0.0.1:{port}");
-    let mut config = default_test_config(Mainnet)?;
+    let mut config = default_test_config(&Mainnet)?;
     config.shielded_scan.listen_addr = Some(listen_addr.parse()?);
 
     // Start zebra with the config.
@@ -2942,17 +3018,21 @@ fn scan_start_where_left() -> Result<()> {
     let test_type = TestType::UpdateZebraCachedStateNoRpc;
     if let Some(cache_dir) = test_type.zebrad_state_path("scan test") {
         // Add a key to the config
-        let mut config = default_test_config(Mainnet)?;
+        let mut config = default_test_config(&Mainnet)?;
         let mut keys = IndexMap::new();
         keys.insert(ZECPAGES_SAPLING_VIEWING_KEY.to_string(), 1);
         config.shielded_scan.sapling_keys_to_scan = keys;
 
         // Add the cache dir to shielded scan, make it the same as the zebrad cache state.
-        config.shielded_scan.db_config_mut().cache_dir = cache_dir.clone();
+        config
+            .shielded_scan
+            .db_config_mut()
+            .cache_dir
+            .clone_from(&cache_dir);
         config.shielded_scan.db_config_mut().ephemeral = false;
 
         // Add the cache dir to state.
-        config.state.cache_dir = cache_dir.clone();
+        config.state.cache_dir.clone_from(&cache_dir);
         config.state.ephemeral = false;
 
         // Remove the scan directory before starting.
@@ -3013,24 +3093,80 @@ fn scan_start_where_left() -> Result<()> {
     Ok(())
 }
 
-/// Test successful registration of a new key in the scan task.
-///
-/// See [`common::shielded_scan::scans_for_new_key`] for more information.
 // TODO: Add this test to CI (#8236)
+/// Tests successful:
+/// - Registration of a new key,
+/// - Subscription to scan results of new key, and
+/// - Deletion of keys
+/// in the scan task
+/// See [`common::shielded_scan::scan_task_commands`] for more information.
 #[tokio::test]
 #[ignore]
 #[cfg(feature = "shielded-scan")]
-async fn scans_for_new_key() -> Result<()> {
-    common::shielded_scan::scans_for_new_key::run().await
+async fn scan_task_commands() -> Result<()> {
+    common::shielded_scan::scan_task_commands::run().await
 }
 
-/// Tests SubscribeResults ScanService request.
-///
-/// See [`common::shielded_scan::subscribe_results`] for more information.
-// TODO: Add this test to CI (#8236)
+/// Checks that the Regtest genesis block can be validated.
 #[tokio::test]
-#[ignore]
-#[cfg(feature = "shielded-scan")]
-async fn scan_subscribe_results() -> Result<()> {
-    common::shielded_scan::subscribe_results::run().await
+async fn validate_regtest_genesis_block() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::new_regtest(None);
+    let state = zebra_state::init_test(&network);
+    let (
+        block_verifier_router,
+        _transaction_verifier,
+        _parameter_download_task_handle,
+        _max_checkpoint_height,
+    ) = zebra_consensus::router::init(zebra_consensus::Config::default(), &network, state).await;
+
+    let genesis_hash = block_verifier_router
+        .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+        .await
+        .expect("should validate Regtest genesis block");
+
+    assert_eq!(
+        genesis_hash,
+        network.genesis_hash(),
+        "validated block hash should match network genesis hash"
+    )
+}
+
+/// Test that Version messages are sent with the external address when configured to do so.
+#[test]
+fn external_address() -> Result<()> {
+    let _init_guard = zebra_test::init();
+    let testdir = testdir()?.with_config(&mut external_address_test_config(&Mainnet)?)?;
+    let mut child = testdir.spawn_child(args!["start"])?;
+
+    // Give enough time to start connecting to some peers.
+    std::thread::sleep(Duration::from_secs(10));
+
+    child.kill(false)?;
+
+    let output = child.wait_with_output()?;
+    let output = output.assert_failure()?;
+
+    // Zebra started
+    output.stdout_line_contains("Starting zebrad")?;
+
+    // Make sure we are using external address for Version messages.
+    output.stdout_line_contains("using external address for Version messages")?;
+
+    // Make sure the command was killed.
+    output.assert_was_killed()?;
+
+    Ok(())
+}
+
+/// Test successful `getblocktemplate` and `submitblock` RPC calls on Regtest on Canopy.
+///
+/// See [`common::regtest::submit_blocks`] for more information.
+// TODO: Test this with an NU5 activation height too once config can be serialized.
+#[tokio::test]
+#[cfg(feature = "getblocktemplate-rpcs")]
+async fn regtest_submit_blocks() -> Result<()> {
+    common::regtest::submit_blocks_test().await?;
+    Ok(())
 }

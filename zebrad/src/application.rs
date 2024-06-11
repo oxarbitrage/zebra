@@ -263,7 +263,7 @@ impl Application for ZebradApp {
 
         // reads state disk version file, doesn't open RocksDB database
         let disk_db_version =
-            match state_database_format_version_on_disk(&config.state, config.network.network) {
+            match state_database_format_version_on_disk(&config.state, &config.network.network) {
                 Ok(Some(version)) => version.to_string(),
                 // This "version" is specially formatted to match a relaxed version regex in CI
                 Ok(None) => "creating.new.database".to_string(),
@@ -274,7 +274,7 @@ impl Application for ZebradApp {
                 }
             };
 
-        let app_metadata = vec![
+        let app_metadata = [
             // build-time constant: cargo or git tag + short commit
             ("version", build_version().to_string()),
             // config
@@ -441,7 +441,7 @@ impl Application for ZebradApp {
             tracing_config.flamegraph = None;
         }
         components.push(Box::new(Tracing::new(
-            config.network.network,
+            &config.network.network,
             tracing_config,
             command.cmd().uses_intro(),
         )?));
@@ -455,7 +455,11 @@ impl Application for ZebradApp {
         // Activate the global span, so it's visible when we load the other
         // components. Space is at a premium here, so we use an empty message,
         // short commit hash, and the unique part of the network name.
-        let net = &config.network.network.to_string()[..4];
+        let net = config.network.network.to_string();
+        let net = match net.as_str() {
+            default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
+            other_net_name => other_net_name,
+        };
         let global_span = if let Some(git_commit) = ZebradApp::git_commit() {
             error_span!("", zebrad = git_commit, net)
         } else {

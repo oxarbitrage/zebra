@@ -5,6 +5,68 @@ All notable changes to Zebra are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## Zebra 1.X.X - XXXX-XX-XX
+
+### Changed
+
+- We realized that a longer than `zcashd` end of support could be problematic in some cases so we reverted back from 20 to 16 weeks ([#8530](https://github.com/ZcashFoundation/zebra/pull/8530))
+
+
+## [Zebra 1.7.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.7.0) - 2024-05-07
+
+In this release we introduce Regtest functionality to Zebra and restored Windows support. Also adjusted our Zebra release interval from 2 weeks to 6 weeks approximately.
+
+### Added
+
+- Preparing for upstream `zcash_client_backend` API changes ([#8425](https://github.com/ZcashFoundation/zebra/pull/8425))
+- Regtest support ([#8383](https://github.com/ZcashFoundation/zebra/pull/8383), [#8421](https://github.com/ZcashFoundation/zebra/pull/8421), [#8368](https://github.com/ZcashFoundation/zebra/pull/8368), [#8413](https://github.com/ZcashFoundation/zebra/pull/8413), [#8474](https://github.com/ZcashFoundation/zebra/pull/8474), [#8475](https://github.com/ZcashFoundation/zebra/pull/8475))
+- Allow Zebra users to contribute to the P2P network even if behind NAT or firewall ([#8488](https://github.com/ZcashFoundation/zebra/pull/8488))
+
+### Changed
+
+- Adjust estimated release interval to once every 6 weeks and the end of support from 16 to 20 weeks ([#8429](https://github.com/ZcashFoundation/zebra/pull/8429))
+
+### Fixed
+
+- Bump zcash script v0.1.15 and restore Windows support ([#8393](https://github.com/ZcashFoundation/zebra/pull/8393))
+- Avoid possibly returning data from different blocks in `z_get_treestate` RPC method ([#8460](https://github.com/ZcashFoundation/zebra/pull/8460))
+- Zebra panics with all features and no elasticsearch server available ([#8409](https://github.com/ZcashFoundation/zebra/pull/8409))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @oxarbitrage and @upbqdn
+
+
+## [Zebra 1.6.1](https://github.com/ZcashFoundation/zebra/releases/tag/v1.6.1) - 2024-04-15
+
+This release adds an OpenAPI specification for Zebra's RPC methods and startup logs about Zebra's storage usage and other database information. 
+
+It also includes:
+- Bug fixes and improved error messages for some zebra-scan gRPC methods
+- A performance improvement in Zebra's `getblock` RPC method  
+
+### Added
+
+- Log database information such as storage usage on startup and shutdown ([#8336](https://github.com/ZcashFoundation/zebra/pull/8336), [#8389](https://github.com/ZcashFoundation/zebra/pull/8389))
+- OpenAPI specification for Zebra's RPC methods ([#8342](https://github.com/ZcashFoundation/zebra/pull/8342))
+- Add block times to output of getblock RPC method when called with `verbosity = 2` ([#8384](https://github.com/ZcashFoundation/zebra/pull/8384))
+
+### Changed
+
+- Removed `Copy` trait impl for `Network` ([#8354](https://github.com/ZcashFoundation/zebra/pull/8354))
+- Refactored code for network consensus parameters to `Network` methods ([#8340](https://github.com/ZcashFoundation/zebra/pull/8340))
+
+### Fixed
+
+- Improve zebra-scan gRPC method errors and add timeout to scan service to avoid hanging ([#8318](https://github.com/ZcashFoundation/zebra/pull/8318))
+- Await state service requests in `getblock` method in parallel ([#8376](https://github.com/ZcashFoundation/zebra/pull/8376))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @elijahhampton, @gustavovalverde, @idky137, @mpguerra, @oxarbitrage, @upbqdn and @zancas
+
 ## [Zebra 1.6.0](https://github.com/ZcashFoundation/zebra/releases/tag/v1.6.0) - 2024-02-23
 
 This release exposes the shielded scanning functionality through an initial

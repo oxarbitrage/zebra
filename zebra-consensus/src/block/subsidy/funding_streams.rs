@@ -23,13 +23,13 @@ mod tests;
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn funding_stream_values(
     height: Height,
-    network: Network,
+    network: &Network,
 ) -> Result<HashMap<FundingStreamReceiver, Amount<NonNegative>>, Error> {
     let canopy_height = Canopy.activation_height(network).unwrap();
     let mut results = HashMap::new();
 
     if height >= canopy_height {
-        let range = FUNDING_STREAM_HEIGHT_RANGES.get(&network).unwrap();
+        let range = FUNDING_STREAM_HEIGHT_RANGES.get(&network.kind()).unwrap();
         if range.contains(&height) {
             let block_subsidy = block_subsidy(height, network)?;
             for (&receiver, &numerator) in FUNDING_STREAM_RECEIVER_NUMERATORS.iter() {
@@ -48,27 +48,11 @@ pub fn funding_stream_values(
     Ok(results)
 }
 
-/// Returns the minimum height after the first halving
-/// as described in [protocol specification §7.10][7.10]
-///
-/// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub fn height_for_first_halving(network: Network) -> Height {
-    // First halving on Mainnet is at Canopy
-    // while in Testnet is at block constant height of `1_116_000`
-    // https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
-    match network {
-        Network::Mainnet => Canopy
-            .activation_height(network)
-            .expect("canopy activation height should be available"),
-        Network::Testnet => FIRST_HALVING_TESTNET,
-    }
-}
-
 /// Returns the address change period
 /// as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-fn funding_stream_address_period(height: Height, network: Network) -> u32 {
+fn funding_stream_address_period(height: Height, network: &Network) -> u32 {
     // Spec equation: `address_period = floor((height - (height_for_halving(1) - post_blossom_halving_interval))/funding_stream_address_change_interval)`,
     // <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
     //
@@ -78,7 +62,7 @@ fn funding_stream_address_period(height: Height, network: Network) -> u32 {
     // <https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators>
     //   This is the same as `floor()`, because these numbers are all positive.
 
-    let height_after_first_halving = height - height_for_first_halving(network);
+    let height_after_first_halving = height - network.height_for_first_halving();
 
     let address_period = (height_after_first_halving + POST_BLOSSOM_HALVING_INTERVAL)
         / FUNDING_STREAM_ADDRESS_CHANGE_INTERVAL;
@@ -92,17 +76,17 @@ fn funding_stream_address_period(height: Height, network: Network) -> u32 {
 /// as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-fn funding_stream_address_index(height: Height, network: Network) -> usize {
-    let num_addresses = match network {
-        Network::Mainnet => FUNDING_STREAMS_NUM_ADDRESSES_MAINNET,
-        Network::Testnet => FUNDING_STREAMS_NUM_ADDRESSES_TESTNET,
-    };
+fn funding_stream_address_index(height: Height, network: &Network) -> usize {
+    let num_addresses = network.num_funding_streams();
 
     let index = 1u32
         .checked_add(funding_stream_address_period(height, network))
         .expect("no overflow should happen in this sum")
         .checked_sub(funding_stream_address_period(
-            FUNDING_STREAM_HEIGHT_RANGES.get(&network).unwrap().start,
+            FUNDING_STREAM_HEIGHT_RANGES
+                .get(&network.kind())
+                .unwrap()
+                .start,
             network,
         ))
         .expect("no overflow should happen in this sub") as usize;
@@ -119,12 +103,12 @@ fn funding_stream_address_index(height: Height, network: Network) -> usize {
 /// only use transparent addresses,
 pub fn funding_stream_address(
     height: Height,
-    network: Network,
+    network: &Network,
     receiver: FundingStreamReceiver,
 ) -> transparent::Address {
     let index = funding_stream_address_index(height, network);
     let address = &FUNDING_STREAM_ADDRESSES
-        .get(&network)
+        .get(&network.kind())
         .expect("there is always another hash map as value for a given valid network")
         .get(&receiver)
         .expect("in the inner hash map there is always a vector of strings with addresses")[index];
@@ -146,7 +130,7 @@ pub fn funding_stream_recipient_info(
 /// as the given lock_script as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub fn check_script_form(lock_script: &Script, address: transparent::Address) -> bool {
+pub fn check_script_form(lock_script: &Script, address: &transparent::Address) -> bool {
     assert!(
         address.is_script_hash(),
         "incorrect funding stream address constant: {address} \
@@ -160,7 +144,7 @@ pub fn check_script_form(lock_script: &Script, address: transparent::Address) ->
 }
 
 /// Returns a new funding stream coinbase output lock script, which pays to the P2SH `address`.
-pub fn new_coinbase_script(address: transparent::Address) -> Script {
+pub fn new_coinbase_script(address: &transparent::Address) -> Script {
     assert!(
         address.is_script_hash(),
         "incorrect coinbase script address: {address} \
@@ -177,7 +161,7 @@ pub fn new_coinbase_script(address: transparent::Address) -> Script {
 /// Returns a list of outputs in `transaction`, which have a script address equal to `address`.
 pub fn filter_outputs_by_address(
     transaction: &Transaction,
-    address: transparent::Address,
+    address: &transparent::Address,
 ) -> Vec<transparent::Output> {
     transaction
         .outputs()

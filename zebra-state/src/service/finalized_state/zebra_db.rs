@@ -93,7 +93,7 @@ impl ZebraDb {
         config: &Config,
         db_kind: impl AsRef<str>,
         format_version_in_code: &Version,
-        network: Network,
+        network: &Network,
         debug_skip_format_upgrades: bool,
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
@@ -194,7 +194,7 @@ impl ZebraDb {
             self.config(),
             self.db_kind(),
             self.major_version(),
-            self.network(),
+            &self.network(),
         )
     }
 
@@ -209,7 +209,7 @@ impl ZebraDb {
             self.config(),
             self.db_kind(),
             new_version,
-            self.network(),
+            &self.network(),
         )
     }
 
@@ -271,7 +271,7 @@ impl ZebraDb {
                 &self.config,
                 self.db_kind(),
                 self.major_version(),
-                self.network(),
+                &self.network(),
             )
             .expect("unexpected invalid or unreadable database version file");
 
@@ -321,6 +321,14 @@ impl ZebraDb {
         }
 
         Ok(())
+    }
+
+    /// Logs metrics related to the underlying RocksDB instance.
+    ///
+    /// This function prints various metrics and statistics about the RocksDB database,
+    /// such as disk usage, memory usage, and other performance-related metrics.
+    pub fn print_db_metrics(&self) {
+        self.db.print_db_metrics();
     }
 }
 

@@ -5,7 +5,6 @@ use std::{
     ffi::OsString,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
-    string::String,
     time::Duration,
 };
 
@@ -15,7 +14,13 @@ use tempfile::NamedTempFile;
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::Span;
 
-use zebra_chain::parameters::Network;
+use zebra_chain::{
+    parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        Magic, Network, NetworkKind,
+    },
+    work::difficulty::U256,
+};
 
 use crate::{
     constants::{
@@ -69,6 +74,14 @@ pub struct Config {
     /// listener addresses by adding the external IP addresses of peers to
     /// their address books.
     pub listen_addr: SocketAddr,
+
+    /// The external address of this node if any.
+    ///
+    /// Zebra bind to `listen_addr` but this can be an internal address if the node
+    /// is behind a firewall, load balancer or NAT. This field can be used to
+    /// advertise a different address to peers making it possible to receive inbound
+    /// connections and contribute to the P2P network from behind a firewall, load balancer, or NAT.
+    pub external_addr: Option<SocketAddr>,
 
     /// The network to connect to.
     pub network: Network,
@@ -222,10 +235,12 @@ impl Config {
     }
 
     /// Returns the initial seed peer hostnames for the configured network.
-    pub fn initial_peer_hostnames(&self) -> &IndexSet<String> {
-        match self.network {
-            Network::Mainnet => &self.initial_mainnet_peers,
-            Network::Testnet => &self.initial_testnet_peers,
+    pub fn initial_peer_hostnames(&self) -> IndexSet<String> {
+        match &self.network {
+            Network::Mainnet => self.initial_mainnet_peers.clone(),
+            Network::Testnet(params) if !params.is_regtest() => self.initial_testnet_peers.clone(),
+            // TODO: Add a `disable_peers` field to `Network` to check instead of `is_regtest()` (#8361)
+            Network::Testnet(_params) => IndexSet::new(),
         }
     }
 
@@ -236,6 +251,11 @@ impl Config {
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> HashSet<PeerSocketAddr> {
+        // Return early if network is regtest in case there are somehow any entries in the peer cache
+        if self.network.is_regtest() {
+            return HashSet::new();
+        }
+
         // TODO: do DNS and disk in parallel if startup speed becomes important
         let dns_peers =
             Config::resolve_peers(&self.initial_peer_hostnames().iter().cloned().collect()).await;
@@ -381,7 +401,7 @@ impl Config {
 
     /// Returns the addresses in the peer list cache file, if available.
     pub async fn load_peer_cache(&self) -> io::Result<HashSet<PeerSocketAddr>> {
-        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(self.network) else {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(HashSet::new());
         };
 
@@ -457,7 +477,7 @@ impl Config {
     /// Atomic writes avoid corrupting the cache if Zebra panics or crashes, or if multiple Zebra
     /// instances try to read and write the same cache file.
     pub async fn update_peer_cache(&self, peer_list: HashSet<PeerSocketAddr>) -> io::Result<()> {
-        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(self.network) else {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(());
         };
 
@@ -595,6 +615,7 @@ impl Default for Config {
             listen_addr: "0.0.0.0:8233"
                 .parse()
                 .expect("Hardcoded address should be parseable"),
+            external_addr: None,
             network: Network::Mainnet,
             initial_mainnet_peers: mainnet_peers,
             initial_testnet_peers: testnet_peers,
@@ -620,10 +641,22 @@ impl<'de> Deserialize<'de> for Config {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        struct DTestnetParameters {
+            network_name: Option<String>,
+            network_magic: Option<[u8; 4]>,
+            slow_start_interval: Option<u32>,
+            target_difficulty_limit: Option<String>,
+            disable_pow: Option<bool>,
+            activation_heights: Option<ConfiguredActivationHeights>,
+        }
+
+        #[derive(Deserialize)]
         #[serde(deny_unknown_fields, default)]
         struct DConfig {
             listen_addr: String,
-            network: Network,
+            external_addr: Option<String>,
+            network: NetworkKind,
+            testnet_parameters: Option<DTestnetParameters>,
             initial_mainnet_peers: IndexSet<String>,
             initial_testnet_peers: IndexSet<String>,
             cache_dir: CacheDir,
@@ -638,7 +671,9 @@ impl<'de> Deserialize<'de> for Config {
                 let config = Config::default();
                 Self {
                     listen_addr: "0.0.0.0".to_string(),
-                    network: config.network,
+                    external_addr: None,
+                    network: Default::default(),
+                    testnet_parameters: None,
                     initial_mainnet_peers: config.initial_mainnet_peers,
                     initial_testnet_peers: config.initial_testnet_peers,
                     cache_dir: config.cache_dir,
@@ -651,7 +686,9 @@ impl<'de> Deserialize<'de> for Config {
 
         let DConfig {
             listen_addr,
-            network,
+            external_addr,
+            network: network_kind,
+            testnet_parameters,
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
@@ -660,7 +697,98 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
         } = DConfig::deserialize(deserializer)?;
 
-        let listen_addr = match listen_addr.parse::<SocketAddr>() {
+        /// Accepts an [`IndexSet`] of initial peers,
+        ///
+        /// Returns true if any of them are the default Testnet or Mainnet initial peers.
+        fn contains_default_initial_peers(initial_peers: &IndexSet<String>) -> bool {
+            let Config {
+                initial_mainnet_peers: mut default_initial_peers,
+                initial_testnet_peers: default_initial_testnet_peers,
+                ..
+            } = Config::default();
+            default_initial_peers.extend(default_initial_testnet_peers);
+
+            initial_peers
+                .intersection(&default_initial_peers)
+                .next()
+                .is_some()
+        }
+
+        let network = match (network_kind, testnet_parameters) {
+            (NetworkKind::Mainnet, _) => Network::Mainnet,
+            (NetworkKind::Testnet, None) => Network::new_default_testnet(),
+            (NetworkKind::Regtest, testnet_parameters) => {
+                let nu5_activation_height = testnet_parameters
+                    .and_then(|params| params.activation_heights)
+                    .and_then(|activation_height| activation_height.nu5);
+
+                Network::new_regtest(nu5_activation_height)
+            }
+            (
+                NetworkKind::Testnet,
+                Some(DTestnetParameters {
+                    network_name,
+                    network_magic,
+                    slow_start_interval,
+                    target_difficulty_limit,
+                    disable_pow,
+                    activation_heights,
+                }),
+            ) => {
+                let mut params_builder = testnet::Parameters::build();
+                // TODO: allow default peers when fields match default testnet values?
+                let should_avoid_default_peers = network_magic.is_some()
+                    || slow_start_interval.is_some()
+                    || target_difficulty_limit.is_some()
+                    || disable_pow == Some(true)
+                    || activation_heights.is_some();
+
+                // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet
+                // peers while activation heights or a custom network magic is configured.
+                if should_avoid_default_peers
+                    && contains_default_initial_peers(&initial_testnet_peers)
+                {
+                    return Err(de::Error::custom(
+                        "cannot use default initials peers with incompatible testnet",
+                    ));
+                }
+
+                if let Some(network_name) = network_name {
+                    params_builder = params_builder.with_network_name(network_name)
+                }
+
+                if let Some(network_magic) = network_magic {
+                    params_builder = params_builder.with_network_magic(Magic(network_magic));
+                }
+
+                if let Some(slow_start_interval) = slow_start_interval {
+                    params_builder = params_builder.with_slow_start_interval(
+                        slow_start_interval.try_into().map_err(de::Error::custom)?,
+                    );
+                }
+
+                if let Some(target_difficulty_limit) = target_difficulty_limit {
+                    params_builder = params_builder.with_target_difficulty_limit(
+                        target_difficulty_limit
+                            .parse::<U256>()
+                            .map_err(de::Error::custom)?,
+                    );
+                }
+
+                if let Some(disable_pow) = disable_pow {
+                    params_builder = params_builder.with_disable_pow(disable_pow);
+                }
+
+                // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
+                if let Some(activation_heights) = activation_heights {
+                    params_builder = params_builder.with_activation_heights(activation_heights)
+                }
+
+                params_builder.to_network()
+            }
+        };
+
+        let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
             Ok(socket) => Ok(socket),
             Err(_) => match listen_addr.parse::<IpAddr>() {
                 Ok(ip) => Ok(SocketAddr::new(ip, network.default_port())),
@@ -669,6 +797,20 @@ impl<'de> Deserialize<'de> for Config {
                 ))),
             },
         }?;
+
+        let external_socket_addr = if let Some(address) = &external_addr {
+            match address.parse::<SocketAddr>().or_else(|_| format!("{address}:{}", network.default_port()).parse()) {
+                Ok(socket) => Ok(Some(socket)),
+                Err(_) => match address.parse::<IpAddr>() {
+                    Ok(ip) => Ok(Some(SocketAddr::new(ip, network.default_port()))),
+                    Err(err) => Err(de::Error::custom(format!(
+                        "{err}; Hint: addresses can be a IPv4, IPv6 (with brackets), or a DNS name, the port is optional"
+                    ))),
+                },
+            }?
+        } else {
+            None
+        };
 
         let [max_connections_per_ip, peerset_initial_target_size] = [
             ("max_connections_per_ip", max_connections_per_ip, DEFAULT_MAX_CONNS_PER_IP), 
@@ -689,6 +831,7 @@ impl<'de> Deserialize<'de> for Config {
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
+            external_addr: external_socket_addr,
             network,
             initial_mainnet_peers,
             initial_testnet_peers,

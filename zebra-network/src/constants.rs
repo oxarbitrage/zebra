@@ -16,6 +16,7 @@ use crate::protocol::external::types::*;
 use zebra_chain::{
     parameters::{
         Network::{self, *},
+        NetworkKind,
         NetworkUpgrade::*,
     },
     serialization::Duration32,
@@ -392,11 +393,13 @@ lazy_static! {
     ///
     /// The minimum network protocol version typically changes after Mainnet and
     /// Testnet network upgrades.
-    pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<Network, Version> = {
+    // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+    pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
         let mut hash_map = HashMap::new();
 
-        hash_map.insert(Mainnet, Version::min_specified_for_upgrade(Mainnet, Nu5));
-        hash_map.insert(Testnet, Version::min_specified_for_upgrade(Testnet, Nu5));
+        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu5));
+        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu5));
+        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(None), Nu5));
 
         hash_map
     };
@@ -418,15 +421,6 @@ lazy_static! {
 /// [RFC 1123: Requirements for Internet Hosts] <https://tools.ietf.org/rfcmarkup?doc=1123>
 /// [6.1.3.3  Efficient Resource Usage] <https://tools.ietf.org/rfcmarkup?doc=1123#page-77>
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Magic numbers used to identify different Zcash networks.
-pub mod magics {
-    use super::*;
-    /// The production mainnet.
-    pub const MAINNET: Magic = Magic([0x24, 0xe9, 0x27, 0x64]);
-    /// The testnet.
-    pub const TESTNET: Magic = Magic([0xfa, 0x1a, 0xf9, 0xbf]);
-}
 
 #[cfg(test)]
 mod tests {

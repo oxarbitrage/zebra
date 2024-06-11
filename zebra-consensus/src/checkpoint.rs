@@ -42,7 +42,7 @@ use crate::{
         TargetHeight::{self, *},
     },
     error::BlockError,
-    BoxError,
+    BoxError, ParameterCheckpoint as _,
 };
 
 pub(crate) mod list;
@@ -203,11 +203,11 @@ where
     /// `tower::Buffer` service.
     #[allow(dead_code)]
     pub fn new(
-        network: Network,
+        network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Self {
-        let checkpoint_list = CheckpointList::new(network);
+        let checkpoint_list = network.checkpoint_list();
         let max_height = checkpoint_list.max_height();
         tracing::info!(
             ?max_height,
@@ -232,7 +232,7 @@ where
     #[allow(dead_code)]
     pub(crate) fn from_list(
         list: impl IntoIterator<Item = (block::Height, block::Hash)>,
-        network: Network,
+        network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Result<Self, VerifyCheckpointError> {
@@ -253,7 +253,7 @@ where
     /// hard-coded checkpoint lists. See that function for more details.
     pub(crate) fn from_checkpoint_list(
         checkpoint_list: CheckpointList,
-        network: Network,
+        network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Self {
@@ -273,7 +273,7 @@ where
 
         let verifier = CheckpointVerifier {
             checkpoint_list,
-            network,
+            network: network.clone(),
             initial_tip_hash,
             state_service,
             queued: BTreeMap::new(),
@@ -595,14 +595,23 @@ where
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
-        crate::block::check::difficulty_is_valid(&block.header, self.network, &height, &hash)?;
-        crate::block::check::equihash_solution_is_valid(&block.header)?;
+        if self.network.disable_pow() {
+            crate::block::check::difficulty_threshold_is_valid(
+                &block.header,
+                &self.network,
+                &height,
+                &hash,
+            )?;
+        } else {
+            crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
+            crate::block::check::equihash_solution_is_valid(&block.header)?;
+        }
 
         // don't do precalculation until the block passes basic difficulty checks
         let block = CheckpointVerifiedBlock::with_hash(block, hash);
 
         crate::block::check::merkle_root_validity(
-            self.network,
+            &self.network,
             &block.block,
             &block.transaction_hashes,
         )?;

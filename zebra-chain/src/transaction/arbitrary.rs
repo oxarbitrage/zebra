@@ -1,17 +1,9 @@
 //! Arbitrary data generation for transaction proptests
 
-use std::{
-    cmp::max,
-    collections::HashMap,
-    convert::{TryFrom, TryInto},
-    ops::Neg,
-    sync::Arc,
-};
+use std::{cmp::max, collections::HashMap, ops::Neg, sync::Arc};
 
 use chrono::{TimeZone, Utc};
-use proptest::{
-    arbitrary::any, array, collection::vec, option, prelude::*, test_runner::TestRunner,
-};
+use proptest::{array, collection::vec, option, prelude::*, test_runner::TestRunner};
 use reddsa::{orchard::Binding, Signature};
 
 use crate::{
@@ -46,7 +38,7 @@ impl Transaction {
     /// Generate a proptest strategy for V1 Transactions
     pub fn v1_strategy(ledger_state: LedgerState) -> BoxedStrategy<Self> {
         (
-            transparent::Input::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS),
+            transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
             vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
             any::<LockTime>(),
         )
@@ -61,7 +53,7 @@ impl Transaction {
     /// Generate a proptest strategy for V2 Transactions
     pub fn v2_strategy(ledger_state: LedgerState) -> BoxedStrategy<Self> {
         (
-            transparent::Input::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS),
+            transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
             vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
             any::<LockTime>(),
             option::of(any::<JoinSplitData<Bctv14Proof>>()),
@@ -80,7 +72,7 @@ impl Transaction {
     /// Generate a proptest strategy for V3 Transactions
     pub fn v3_strategy(ledger_state: LedgerState) -> BoxedStrategy<Self> {
         (
-            transparent::Input::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS),
+            transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
             vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
             any::<LockTime>(),
             any::<block::Height>(),
@@ -101,7 +93,7 @@ impl Transaction {
     /// Generate a proptest strategy for V4 Transactions
     pub fn v4_strategy(ledger_state: LedgerState) -> BoxedStrategy<Self> {
         (
-            transparent::Input::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS),
+            transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
             vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
             any::<LockTime>(),
             any::<block::Height>(),
@@ -146,7 +138,7 @@ impl Transaction {
             NetworkUpgrade::branch_id_strategy(),
             any::<LockTime>(),
             any::<block::Height>(),
-            transparent::Input::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS),
+            transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
             vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
             option::of(any::<sapling::ShieldedData<sapling::SharedAnchor>>()),
             option::of(any::<orchard::ShieldedData>()),
@@ -196,7 +188,7 @@ impl Transaction {
         len: usize,
     ) -> BoxedStrategy<Vec<Arc<Self>>> {
         // TODO: fixup coinbase miner subsidy
-        let coinbase = Transaction::arbitrary_with(ledger_state).prop_map(Arc::new);
+        let coinbase = Transaction::arbitrary_with(ledger_state.clone()).prop_map(Arc::new);
         ledger_state.has_coinbase = false;
         let remainder = vec(
             Transaction::arbitrary_with(ledger_state).prop_map(Arc::new),
@@ -787,7 +779,7 @@ impl Arbitrary for Transaction {
                 Self::v4_strategy(ledger_state)
             }
             NetworkUpgrade::Nu5 => prop_oneof![
-                Self::v4_strategy(ledger_state),
+                Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state)
             ]
             .boxed(),
@@ -859,7 +851,7 @@ impl Arbitrary for VerifiedUnminedTx {
 /// converting sapling shielded data from v4 to v5 if possible.
 pub fn transaction_to_fake_v5(
     trans: &Transaction,
-    network: Network,
+    network: &Network,
     height: block::Height,
 ) -> Transaction {
     use Transaction::*;
@@ -993,12 +985,9 @@ fn sapling_spend_v4_to_fake_v5(
 
 /// Iterate over V4 transactions in the block test vectors for the specified `network`.
 pub fn test_transactions(
-    network: Network,
+    network: &Network,
 ) -> impl DoubleEndedIterator<Item = (block::Height, Arc<Transaction>)> {
-    let blocks = match network {
-        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
-        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
-    };
+    let blocks = network.block_iter();
 
     transactions_from_blocks(blocks)
 }
@@ -1008,7 +997,7 @@ pub fn test_transactions(
 /// These transactions are converted from non-V5 transactions that exist in the provided network
 /// blocks.
 pub fn fake_v5_transactions_for_network<'b>(
-    network: Network,
+    network: &'b Network,
     blocks: impl DoubleEndedIterator<Item = (&'b u32, &'b &'static [u8])> + 'b,
 ) -> impl DoubleEndedIterator<Item = Transaction> + 'b {
     transactions_from_blocks(blocks)

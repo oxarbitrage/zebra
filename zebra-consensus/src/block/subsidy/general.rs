@@ -2,7 +2,7 @@
 //!
 //! [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 
-use std::{collections::HashSet, convert::TryFrom};
+use std::collections::HashSet;
 
 use zebra_chain::{
     amount::{Amount, Error, NonNegative},
@@ -20,17 +20,18 @@ use crate::{funding_stream_values, parameters::subsidy::*};
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 ///
 /// Returns `None` if the divisor would overflow a `u64`.
-pub fn halving_divisor(height: Height, network: Network) -> Option<u64> {
+pub fn halving_divisor(height: Height, network: &Network) -> Option<u64> {
     let blossom_height = Blossom
         .activation_height(network)
         .expect("blossom activation height should be available");
 
-    if height < SLOW_START_SHIFT {
-        unreachable!(
-            "unsupported block height {height:?}: checkpoints should handle blocks below {SLOW_START_SHIFT:?}",
+    if height < network.slow_start_shift() {
+        panic!(
+            "unsupported block height {height:?}: checkpoints should handle blocks below {:?}",
+            network.slow_start_shift()
         )
     } else if height < blossom_height {
-        let pre_blossom_height = height - SLOW_START_SHIFT;
+        let pre_blossom_height = height - network.slow_start_shift();
         let halving_shift = pre_blossom_height / PRE_BLOSSOM_HALVING_INTERVAL;
 
         let halving_div = 1u64
@@ -43,7 +44,7 @@ pub fn halving_divisor(height: Height, network: Network) -> Option<u64> {
 
         Some(halving_div)
     } else {
-        let pre_blossom_height = blossom_height - SLOW_START_SHIFT;
+        let pre_blossom_height = blossom_height - network.slow_start_shift();
         let scaled_pre_blossom_height =
             pre_blossom_height * HeightDiff::from(BLOSSOM_POW_TARGET_SPACING_RATIO);
 
@@ -64,7 +65,7 @@ pub fn halving_divisor(height: Height, network: Network) -> Option<u64> {
 /// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
-pub fn block_subsidy(height: Height, network: Network) -> Result<Amount<NonNegative>, Error> {
+pub fn block_subsidy(height: Height, network: &Network) -> Result<Amount<NonNegative>, Error> {
     let blossom_height = Blossom
         .activation_height(network)
         .expect("blossom activation height should be available");
@@ -77,9 +78,12 @@ pub fn block_subsidy(height: Height, network: Network) -> Result<Amount<NonNegat
         return Ok(Amount::zero());
     };
 
-    if height < SLOW_START_INTERVAL {
+    // TODO: Add this as a field on `testnet::Parameters` instead of checking `disable_pow()`, this is 0 for Regtest in zcashd,
+    //       see <https://github.com/zcash/zcash/blob/master/src/chainparams.cpp#L640>
+    if height < network.slow_start_interval() && !network.disable_pow() {
         unreachable!(
-            "unsupported block height {height:?}: callers should handle blocks below {SLOW_START_INTERVAL:?}",
+            "unsupported block height {height:?}: callers should handle blocks below {:?}",
+            network.slow_start_interval()
         )
     } else if height < blossom_height {
         // this calculation is exact, because the halving divisor is 1 here
@@ -97,7 +101,7 @@ pub fn block_subsidy(height: Height, network: Network) -> Result<Amount<NonNegat
 /// `MinerSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
-pub fn miner_subsidy(height: Height, network: Network) -> Result<Amount<NonNegative>, Error> {
+pub fn miner_subsidy(height: Height, network: &Network) -> Result<Amount<NonNegative>, Error> {
     let total_funding_stream_amount: Result<Amount<NonNegative>, _> =
         funding_stream_values(height, network)?.values().sum();
 
@@ -122,24 +126,20 @@ mod test {
     #[test]
     fn halving_test() -> Result<(), Report> {
         let _init_guard = zebra_test::init();
-
-        halving_for_network(Network::Mainnet)?;
-        halving_for_network(Network::Testnet)?;
+        for network in Network::iter() {
+            halving_for_network(&network)?;
+        }
 
         Ok(())
     }
 
-    fn halving_for_network(network: Network) -> Result<(), Report> {
+    fn halving_for_network(network: &Network) -> Result<(), Report> {
         let blossom_height = Blossom.activation_height(network).unwrap();
-        let first_halving_height = match network {
-            Network::Mainnet => Canopy.activation_height(network).unwrap(),
-            // Based on "7.8 Calculation of Block Subsidy and Founders' Reward"
-            Network::Testnet => Height(1_116_000),
-        };
+        let first_halving_height = network.height_for_first_halving();
 
         assert_eq!(
             1,
-            halving_divisor((SLOW_START_INTERVAL + 1).unwrap(), network).unwrap()
+            halving_divisor((network.slow_start_interval() + 1).unwrap(), network).unwrap()
         );
         assert_eq!(
             1,
@@ -253,25 +253,22 @@ mod test {
     fn block_subsidy_test() -> Result<(), Report> {
         let _init_guard = zebra_test::init();
 
-        block_subsidy_for_network(Network::Mainnet)?;
-        block_subsidy_for_network(Network::Testnet)?;
+        for network in Network::iter() {
+            block_subsidy_for_network(&network)?;
+        }
 
         Ok(())
     }
 
-    fn block_subsidy_for_network(network: Network) -> Result<(), Report> {
+    fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         let blossom_height = Blossom.activation_height(network).unwrap();
-        let first_halving_height = match network {
-            Network::Mainnet => Canopy.activation_height(network).unwrap(),
-            // Based on "7.8 Calculation of Block Subsidy and Founders' Reward"
-            Network::Testnet => Height(1_116_000),
-        };
+        let first_halving_height = network.height_for_first_halving();
 
         // After slow-start mining and before Blossom the block subsidy is 12.5 ZEC
         // https://z.cash/support/faq/#what-is-slow-start-mining
         assert_eq!(
             Amount::try_from(1_250_000_000),
-            block_subsidy((SLOW_START_INTERVAL + 1).unwrap(), network)
+            block_subsidy((network.slow_start_interval() + 1).unwrap(), network)
         );
         assert_eq!(
             Amount::try_from(1_250_000_000),

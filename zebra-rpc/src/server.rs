@@ -13,7 +13,7 @@ use jsonrpc_core::{Compatibility, MetaIoHandler};
 use jsonrpc_http_server::{CloseHandle, ServerBuilder};
 use tokio::task::JoinHandle;
 use tower::Service;
-use tracing::{Instrument, *};
+use tracing::*;
 
 use zebra_chain::{
     block, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, parameters::Network,
@@ -154,7 +154,7 @@ impl RpcServer {
             {
                 // Initialize the getblocktemplate rpc method handler
                 let get_block_template_rpc_impl = GetBlockTemplateRpcImpl::new(
-                    network,
+                    &network,
                     mining_config.clone(),
                     mempool.clone(),
                     state.clone(),
@@ -171,7 +171,7 @@ impl RpcServer {
             let (rpc_impl, rpc_tx_queue_task_handle) = RpcImpl::new(
                 build_version.clone(),
                 user_agent,
-                network,
+                network.clone(),
                 config.debug_force_finished_sync,
                 #[cfg(feature = "getblocktemplate-rpcs")]
                 mining_config.debug_like_zcashd,

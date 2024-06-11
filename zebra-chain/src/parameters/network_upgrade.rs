@@ -7,7 +7,6 @@ use crate::parameters::{Network, Network::*};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::ops::Bound::*;
 
 use chrono::{DateTime, Duration, Utc};
 use hex::{FromHex, ToHex};
@@ -15,11 +14,23 @@ use hex::{FromHex, ToHex};
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
+/// A list of network upgrades in the order that they must be activated.
+pub const NETWORK_UPGRADES_IN_ORDER: [NetworkUpgrade; 8] = [
+    Genesis,
+    BeforeOverwinter,
+    Overwinter,
+    Sapling,
+    Blossom,
+    Heartwood,
+    Canopy,
+    Nu5,
+];
+
 /// A Zcash network upgrade.
 ///
 /// Network upgrades can change the Zcash network protocol or consensus rules in
 /// incompatible ways.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NetworkUpgrade {
     /// The Zcash protocol for a Genesis block.
@@ -128,7 +139,7 @@ const FAKE_TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a
 /// particular network upgrade.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusBranchId(u32);
 
 impl ConsensusBranchId {
@@ -229,7 +240,7 @@ const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299
 /// <https://zips.z.cash/protocol/protocol.pdf#blockheader>
 pub const TESTNET_MAX_TIME_START_HEIGHT: block::Height = block::Height(653_606);
 
-impl NetworkUpgrade {
+impl Network {
     /// Returns a map between activation heights and network upgrades for `network`,
     /// in ascending height order.
     ///
@@ -241,13 +252,8 @@ impl NetworkUpgrade {
     /// When the environment variable TEST_FAKE_ACTIVATION_HEIGHTS is set
     /// and it's a test build, this returns a list of fake activation heights
     /// used by some tests.
-    pub fn activation_list(network: Network) -> BTreeMap<block::Height, NetworkUpgrade> {
-        let (mainnet_heights, testnet_heights) = {
-            #[cfg(not(feature = "zebra-test"))]
-            {
-                (MAINNET_ACTIVATION_HEIGHTS, TESTNET_ACTIVATION_HEIGHTS)
-            }
-
+    pub fn activation_list(&self) -> BTreeMap<block::Height, NetworkUpgrade> {
+        match self {
             // To prevent accidentally setting this somehow, only check the env var
             // when being compiled for tests. We can't use cfg(test) since the
             // test that uses this is in zebra-state, and cfg(test) is not
@@ -260,54 +266,93 @@ impl NetworkUpgrade {
             // feature should only be enabled for tests:
             // https://doc.rust-lang.org/cargo/reference/features.html#resolver-version-2-command-line-flags
             #[cfg(feature = "zebra-test")]
-            if std::env::var_os("TEST_FAKE_ACTIVATION_HEIGHTS").is_some() {
-                (
-                    FAKE_MAINNET_ACTIVATION_HEIGHTS,
-                    FAKE_TESTNET_ACTIVATION_HEIGHTS,
-                )
-            } else {
-                (MAINNET_ACTIVATION_HEIGHTS, TESTNET_ACTIVATION_HEIGHTS)
+            Mainnet if std::env::var_os("TEST_FAKE_ACTIVATION_HEIGHTS").is_some() => {
+                FAKE_MAINNET_ACTIVATION_HEIGHTS.iter().cloned().collect()
             }
-        };
-        match network {
-            Mainnet => mainnet_heights,
-            Testnet => testnet_heights,
+            #[cfg(feature = "zebra-test")]
+            Testnet(_) if std::env::var_os("TEST_FAKE_ACTIVATION_HEIGHTS").is_some() => {
+                FAKE_TESTNET_ACTIVATION_HEIGHTS.iter().cloned().collect()
+            }
+            Mainnet => MAINNET_ACTIVATION_HEIGHTS.iter().cloned().collect(),
+            Testnet(params) => params.activation_heights().clone(),
         }
-        .iter()
-        .cloned()
-        .collect()
+    }
+}
+
+impl NetworkUpgrade {
+    /// Returns the current network upgrade and its activation height for `network` and `height`.
+    pub fn current_with_activation_height(
+        network: &Network,
+        height: block::Height,
+    ) -> (NetworkUpgrade, block::Height) {
+        network
+            .activation_list()
+            .range(..=height)
+            .map(|(&h, &nu)| (nu, h))
+            .next_back()
+            .expect("every height has a current network upgrade")
     }
 
     /// Returns the current network upgrade for `network` and `height`.
-    pub fn current(network: Network, height: block::Height) -> NetworkUpgrade {
-        NetworkUpgrade::activation_list(network)
+    pub fn current(network: &Network, height: block::Height) -> NetworkUpgrade {
+        network
+            .activation_list()
             .range(..=height)
             .map(|(_, nu)| *nu)
             .next_back()
             .expect("every height has a current network upgrade")
     }
 
+    /// Returns the next expected network upgrade after this network upgrade
+    pub fn next_upgrade(self) -> Option<Self> {
+        match self {
+            Genesis => Some(BeforeOverwinter),
+            BeforeOverwinter => Some(Overwinter),
+            Overwinter => Some(Sapling),
+            Sapling => Some(Blossom),
+            Blossom => Some(Heartwood),
+            Heartwood => Some(Canopy),
+            Canopy => Some(Nu5),
+            Nu5 => None,
+        }
+    }
+
     /// Returns the next network upgrade for `network` and `height`.
     ///
     /// Returns None if the next upgrade has not been implemented in Zebra
     /// yet.
-    pub fn next(network: Network, height: block::Height) -> Option<NetworkUpgrade> {
-        NetworkUpgrade::activation_list(network)
+    #[cfg(test)]
+    pub fn next(network: &Network, height: block::Height) -> Option<NetworkUpgrade> {
+        use std::ops::Bound::*;
+
+        network
+            .activation_list()
             .range((Excluded(height), Unbounded))
             .map(|(_, nu)| *nu)
             .next()
     }
 
-    /// Returns the activation height for this network upgrade on `network`.
+    /// Returns the activation height for this network upgrade on `network`, or
+    ///
+    /// Returns the activation height of the first network upgrade that follows
+    /// this network upgrade if there is no activation height for this network upgrade
+    /// such as on Regtest or a configured Testnet where multiple network upgrades have the
+    /// same activation height, or if one is omitted when others that follow it are included.
     ///
     /// Returns None if this network upgrade is a future upgrade, and its
     /// activation height has not been set yet.
-    pub fn activation_height(&self, network: Network) -> Option<block::Height> {
-        NetworkUpgrade::activation_list(network)
+    ///
+    /// Returns None if this network upgrade has not been configured on a Testnet or Regtest.
+    pub fn activation_height(&self, network: &Network) -> Option<block::Height> {
+        network
+            .activation_list()
             .iter()
-            .filter(|(_, nu)| nu == &self)
+            .find(|(_, nu)| nu == &self)
             .map(|(height, _)| *height)
-            .next()
+            .or_else(|| {
+                self.next_upgrade()
+                    .and_then(|next_nu| next_nu.activation_height(network))
+            })
     }
 
     /// Returns `true` if `height` is the activation height of any network upgrade
@@ -315,8 +360,8 @@ impl NetworkUpgrade {
     ///
     /// Use [`NetworkUpgrade::activation_height`] to get the specific network
     /// upgrade.
-    pub fn is_activation_height(network: Network, height: block::Height) -> bool {
-        NetworkUpgrade::activation_list(network).contains_key(&height)
+    pub fn is_activation_height(network: &Network, height: block::Height) -> bool {
+        network.activation_list().contains_key(&height)
     }
 
     /// Returns an unordered mapping between NetworkUpgrades and their ConsensusBranchIds.
@@ -354,12 +399,14 @@ impl NetworkUpgrade {
     /// Returns the target block spacing for `network` and `height`.
     ///
     /// See [`NetworkUpgrade::target_spacing`] for details.
-    pub fn target_spacing_for_height(network: Network, height: block::Height) -> Duration {
+    pub fn target_spacing_for_height(network: &Network, height: block::Height) -> Duration {
         NetworkUpgrade::current(network, height).target_spacing()
     }
 
     /// Returns all the target block spacings for `network` and the heights where they start.
-    pub fn target_spacings(network: Network) -> impl Iterator<Item = (block::Height, Duration)> {
+    pub fn target_spacings(
+        network: &Network,
+    ) -> impl Iterator<Item = (block::Height, Duration)> + '_ {
         [
             (NetworkUpgrade::Genesis, PRE_BLOSSOM_POW_TARGET_SPACING),
             (
@@ -368,14 +415,10 @@ impl NetworkUpgrade {
             ),
         ]
         .into_iter()
-        .map(move |(upgrade, spacing_seconds)| {
-            let activation_height = upgrade
-                .activation_height(network)
-                .expect("missing activation height for target spacing change");
-
+        .filter_map(move |(upgrade, spacing_seconds)| {
+            let activation_height = upgrade.activation_height(network)?;
             let target_spacing = Duration::seconds(spacing_seconds);
-
-            (activation_height, target_spacing)
+            Some((activation_height, target_spacing))
         })
     }
 
@@ -384,13 +427,18 @@ impl NetworkUpgrade {
     ///
     /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
     pub fn minimum_difficulty_spacing_for_height(
-        network: Network,
+        network: &Network,
         height: block::Height,
     ) -> Option<Duration> {
         match (network, height) {
-            (Network::Testnet, height) if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT => None,
+            // TODO: Move `TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT` to a field on testnet::Parameters (#8364)
+            (Network::Testnet(_params), height)
+                if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT =>
+            {
+                None
+            }
             (Network::Mainnet, _) => None,
-            (Network::Testnet, _) => {
+            (Network::Testnet(_params), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
                 Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
             }
@@ -413,7 +461,7 @@ impl NetworkUpgrade {
     /// check for the time gap. This function implements the correct "greater than"
     /// check.
     pub fn is_testnet_min_difficulty_block(
-        network: Network,
+        network: &Network,
         block_height: block::Height,
         block_time: DateTime<Utc>,
         previous_block_time: DateTime<Utc>,
@@ -439,32 +487,44 @@ impl NetworkUpgrade {
     ///
     /// See [`NetworkUpgrade::averaging_window_timespan`] for details.
     pub fn averaging_window_timespan_for_height(
-        network: Network,
+        network: &Network,
         height: block::Height,
     ) -> Duration {
         NetworkUpgrade::current(network, height).averaging_window_timespan()
     }
 
-    /// Returns true if the maximum block time rule is active for `network` and `height`.
-    ///
-    /// Always returns true if `network` is the Mainnet.
-    /// If `network` is the Testnet, the `height` should be at least
-    /// TESTNET_MAX_TIME_START_HEIGHT to return true.
-    /// Returns false otherwise.
-    ///
-    /// Part of the consensus rules at <https://zips.z.cash/protocol/protocol.pdf#blockheader>
-    pub fn is_max_block_time_enforced(network: Network, height: block::Height) -> bool {
-        match network {
-            Network::Mainnet => true,
-            Network::Testnet => height >= TESTNET_MAX_TIME_START_HEIGHT,
-        }
-    }
     /// Returns the NetworkUpgrade given an u32 as ConsensusBranchId
     pub fn from_branch_id(branch_id: u32) -> Option<NetworkUpgrade> {
         CONSENSUS_BRANCH_IDS
             .iter()
             .find(|id| id.1 == ConsensusBranchId(branch_id))
             .map(|nu| nu.0)
+    }
+}
+
+impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
+    fn from(nu: zcash_protocol::consensus::NetworkUpgrade) -> Self {
+        match nu {
+            zcash_protocol::consensus::NetworkUpgrade::Overwinter => Self::Overwinter,
+            zcash_protocol::consensus::NetworkUpgrade::Sapling => Self::Sapling,
+            zcash_protocol::consensus::NetworkUpgrade::Blossom => Self::Blossom,
+            zcash_protocol::consensus::NetworkUpgrade::Heartwood => Self::Heartwood,
+            zcash_protocol::consensus::NetworkUpgrade::Canopy => Self::Canopy,
+            zcash_protocol::consensus::NetworkUpgrade::Nu5 => Self::Nu5,
+        }
+    }
+}
+
+impl From<zcash_primitives::consensus::NetworkUpgrade> for NetworkUpgrade {
+    fn from(value: zcash_primitives::consensus::NetworkUpgrade) -> Self {
+        match value {
+            zcash_primitives::consensus::NetworkUpgrade::Overwinter => NetworkUpgrade::Overwinter,
+            zcash_primitives::consensus::NetworkUpgrade::Sapling => NetworkUpgrade::Sapling,
+            zcash_primitives::consensus::NetworkUpgrade::Blossom => NetworkUpgrade::Blossom,
+            zcash_primitives::consensus::NetworkUpgrade::Heartwood => NetworkUpgrade::Heartwood,
+            zcash_primitives::consensus::NetworkUpgrade::Canopy => NetworkUpgrade::Canopy,
+            zcash_primitives::consensus::NetworkUpgrade::Nu5 => NetworkUpgrade::Nu5,
+        }
     }
 }
 
@@ -482,7 +542,7 @@ impl ConsensusBranchId {
     /// Returns the current consensus branch id for `network` and `height`.
     ///
     /// Returns None if the network has no branch id at this height.
-    pub fn current(network: Network, height: block::Height) -> Option<ConsensusBranchId> {
+    pub fn current(network: &Network, height: block::Height) -> Option<ConsensusBranchId> {
         NetworkUpgrade::current(network, height).branch_id()
     }
 }

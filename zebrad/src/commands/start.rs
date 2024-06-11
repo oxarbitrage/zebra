@@ -78,14 +78,17 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-use abscissa_core::{config, Command, FrameworkError, Runnable};
+use std::sync::Arc;
+
+use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{pin, select, sync::oneshot};
-use tower::{builder::ServiceBuilder, util::BoxService};
+use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_consensus::router::BackgroundTaskHandles;
+use zebra_chain::block::genesis::regtest_genesis_block;
+use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
 use zebra_rpc::server::RpcServer;
 
 use crate::{
@@ -112,11 +115,24 @@ pub struct StartCmd {
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
         let config = APPLICATION.config();
+        let is_regtest = config.network.network.is_regtest();
+
+        let config = if is_regtest {
+            Arc::new(ZebradConfig {
+                mempool: mempool::Config {
+                    debug_enable_at_height: Some(0),
+                    ..config.mempool
+                },
+                ..Arc::unwrap_or_clone(config)
+            })
+        } else {
+            config
+        };
 
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
-            config.network.network,
+            &config.network.network,
         );
 
         info!("opening database, this may take a few minutes");
@@ -124,12 +140,15 @@ impl StartCmd {
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::spawn_init(
                 config.state.clone(),
-                config.network.network,
+                &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
             )
             .await?;
+
+        info!("logging database metrics on startup");
+        read_only_state_service.log_db_metrics();
 
         let state = ServiceBuilder::new()
             .buffer(Self::state_buffer_bound())
@@ -168,13 +187,13 @@ impl StartCmd {
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
             zebra_consensus::router::init(
                 config.consensus.clone(),
-                config.network.network,
+                &config.network.network,
                 state.clone(),
             )
             .await;
 
         info!("initializing syncer");
-        let (syncer, sync_status) = ChainSync::new(
+        let (mut syncer, sync_status) = ChainSync::new(
             &config,
             max_checkpoint_height,
             peer_set.clone(),
@@ -235,7 +254,7 @@ impl StartCmd {
             sync_status.clone(),
             address_book.clone(),
             latest_chain_tip.clone(),
-            config.network.network,
+            config.network.network.clone(),
         );
 
         // Start concurrent tasks which don't add load to other tasks
@@ -261,13 +280,13 @@ impl StartCmd {
         info!("spawning delete old databases task");
         let mut old_databases_task_handle = zebra_state::check_and_delete_old_state_databases(
             &config.state,
-            config.network.network,
+            &config.network.network,
         );
 
         info!("spawning progress logging task");
         let progress_task_handle = tokio::spawn(
             show_block_chain_progress(
-                config.network.network,
+                config.network.network.clone(),
                 latest_chain_tip.clone(),
                 sync_status.clone(),
             )
@@ -277,7 +296,7 @@ impl StartCmd {
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
         let end_of_support_task_handle = tokio::spawn(
-            sync::end_of_support::start(config.network.network, latest_chain_tip.clone())
+            sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
                 .in_current_span(),
         );
 
@@ -297,7 +316,28 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
+        let syncer_task_handle = if is_regtest {
+            if !syncer
+                .state_contains(config.network.network.genesis_hash())
+                .await?
+            {
+                let genesis_hash = block_verifier_router
+                    .clone()
+                    .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+                    .await
+                    .expect("should validate Regtest genesis block");
+
+                assert_eq!(
+                    genesis_hash,
+                    config.network.network.genesis_hash(),
+                    "validated block hash should match network genesis hash"
+                )
+            }
+
+            tokio::spawn(std::future::pending().in_current_span())
+        } else {
+            tokio::spawn(syncer.sync().in_current_span())
+        };
 
         #[cfg(feature = "shielded-scan")]
         // Spawn never ending scan task only if we have keys to scan for.
@@ -306,7 +346,7 @@ impl StartCmd {
             info!("spawning shielded scanner with configured viewing keys");
             zebra_scan::spawn_init(
                 config.shielded_scan.clone(),
-                config.network.network,
+                config.network.network.clone(),
                 state,
                 chain_tip_change,
             )
@@ -324,7 +364,7 @@ impl StartCmd {
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
             let rpc = zebra_rpc::methods::get_block_template_rpcs::GetBlockTemplateRpcImpl::new(
-                config.network.network,
+                &config.network.network,
                 config.mining.clone(),
                 mempool,
                 read_only_state_service,
@@ -334,7 +374,7 @@ impl StartCmd {
                 address_book,
             );
 
-            crate::components::miner::spawn_init(&config.mining, rpc)
+            crate::components::miner::spawn_init(&config.network.network, &config.mining, rpc)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };

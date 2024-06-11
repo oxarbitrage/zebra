@@ -1,15 +1,14 @@
 //! Fixed test vectors for transactions.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::DateTime;
 use color_eyre::eyre::Result;
 use lazy_static::lazy_static;
 
 use crate::{
-    amount::Amount,
     block::{Block, Height, MAX_BLOCK_BYTES},
-    parameters::{Network, NetworkUpgrade},
+    parameters::Network,
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    transaction::{hash::WtxId, sighash::SigHasher, txid::TxIdBuilder, Transaction},
+    transaction::{sighash::SigHasher, txid::TxIdBuilder},
     transparent::Script,
 };
 
@@ -221,13 +220,6 @@ fn deserialize_large_transaction() {
     let output =
         transparent::Output::zcash_deserialize(&zebra_test::vectors::DUMMY_OUTPUT1[..]).unwrap();
 
-    // Create a lock time.
-    let lock_time = LockTime::Time(DateTime::<Utc>::from_naive_utc_and_offset(
-        NaiveDateTime::from_timestamp_opt(61, 0)
-            .expect("in-range number of seconds and valid nanosecond"),
-        Utc,
-    ));
-
     // Serialize the input so that we can determine its serialized size.
     let mut input_data = Vec::new();
     input
@@ -242,14 +234,12 @@ fn deserialize_large_transaction() {
         .take(tx_inputs_num)
         .collect::<Vec<_>>();
 
-    let outputs = vec![output];
-
     // Create an oversized transaction. Adding the output and lock time causes
     // the transaction to overflow the threshold.
     let oversized_tx = Transaction::V1 {
         inputs,
-        outputs,
-        lock_time,
+        outputs: vec![output],
+        lock_time: LockTime::Time(DateTime::from_timestamp(61, 0).unwrap()),
     };
 
     // Serialize the transaction.
@@ -343,19 +333,16 @@ fn empty_v5_librustzcash_round_trip() {
 #[test]
 fn fake_v5_round_trip() {
     let _init_guard = zebra_test::init();
-
-    fake_v5_round_trip_for_network(Network::Mainnet);
-    fake_v5_round_trip_for_network(Network::Testnet);
+    for network in Network::iter() {
+        fake_v5_round_trip_for_network(network);
+    }
 }
 
 fn fake_v5_round_trip_for_network(network: Network) {
-    let block_iter = match network {
-        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
-        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
-    };
+    let block_iter = network.block_iter();
 
     let overwinter_activation_height = NetworkUpgrade::Overwinter
-        .activation_height(network)
+        .activation_height(&network)
         .expect("a valid height")
         .0;
 
@@ -383,7 +370,7 @@ fn fake_v5_round_trip_for_network(network: Network) {
             .transactions
             .iter()
             .map(AsRef::as_ref)
-            .map(|t| arbitrary::transaction_to_fake_v5(t, network, Height(*height)))
+            .map(|t| arbitrary::transaction_to_fake_v5(t, &network, Height(*height)))
             .map(Into::into)
             .collect();
 
@@ -494,24 +481,21 @@ fn invalid_orchard_nullifier() {
 #[test]
 fn fake_v5_librustzcash_round_trip() {
     let _init_guard = zebra_test::init();
-
-    fake_v5_librustzcash_round_trip_for_network(Network::Mainnet);
-    fake_v5_librustzcash_round_trip_for_network(Network::Testnet);
+    for network in Network::iter() {
+        fake_v5_librustzcash_round_trip_for_network(network);
+    }
 }
 
 fn fake_v5_librustzcash_round_trip_for_network(network: Network) {
-    let block_iter = match network {
-        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
-        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
-    };
+    let block_iter = network.block_iter();
 
     let overwinter_activation_height = NetworkUpgrade::Overwinter
-        .activation_height(network)
+        .activation_height(&network)
         .expect("a valid height")
         .0;
 
     let nu5_activation_height = NetworkUpgrade::Nu5
-        .activation_height(network)
+        .activation_height(&network)
         .unwrap_or(Height::MAX_EXPIRY_HEIGHT)
         .0;
 
@@ -531,7 +515,7 @@ fn fake_v5_librustzcash_round_trip_for_network(network: Network) {
             .transactions
             .iter()
             .map(AsRef::as_ref)
-            .map(|t| arbitrary::transaction_to_fake_v5(t, network, Height(*height)))
+            .map(|t| arbitrary::transaction_to_fake_v5(t, &network, Height(*height)))
             .map(Into::into)
             .collect();
 
@@ -937,19 +921,16 @@ fn zip244_sighash() -> Result<()> {
 #[test]
 fn binding_signatures() {
     let _init_guard = zebra_test::init();
-
-    binding_signatures_for_network(Network::Mainnet);
-    binding_signatures_for_network(Network::Testnet);
+    for network in Network::iter() {
+        binding_signatures_for_network(network);
+    }
 }
 
 fn binding_signatures_for_network(network: Network) {
-    let block_iter = match network {
-        Network::Mainnet => zebra_test::vectors::MAINNET_BLOCKS.iter(),
-        Network::Testnet => zebra_test::vectors::TESTNET_BLOCKS.iter(),
-    };
+    let block_iter = network.block_iter();
 
     for (height, bytes) in block_iter {
-        let upgrade = NetworkUpgrade::current(network, Height(*height));
+        let upgrade = NetworkUpgrade::current(&network, Height(*height));
 
         let block = bytes
             .zcash_deserialize_into::<Block>()

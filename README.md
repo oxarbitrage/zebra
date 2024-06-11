@@ -68,7 +68,7 @@ Zebra is tested with the latest `stable` Rust version. Earlier versions are not
 supported or tested. Any Zebra release can start depending on new features in the
 latest stable Rust.
 
-Every few weeks, we release a [new Zebra version](https://github.com/ZcashFoundation/zebra/releases).
+Around every 6 weeks, we release a [new Zebra version](https://github.com/ZcashFoundation/zebra/releases).
 
 Below are quick summaries for installing the dependencies on your machine.
 
@@ -185,9 +185,7 @@ There are a few bugs in Zebra that we're still working on fixing:
 
 - Block download and verification sometimes times out during Zebra's initial sync [#5709](https://github.com/ZcashFoundation/zebra/issues/5709). The full sync still finishes reasonably quickly.
 
-- No Windows support [#3801](https://github.com/ZcashFoundation/zebra/issues/3801). We used to test with Windows Server 2019, but not any more; see the issue for details.
-
-- Experimental Tor support is disabled until [Zebra upgrades to the latest `arti-client`](https://github.com/ZcashFoundation/zebra/issues/5492). This happened due to a Rust dependency conflict, which could only be resolved by `arti` upgrading to a version of `x25519-dalek` with the dependency fix.
+- Experimental Tor support is disabled until Zebra upgrades to the latest `arti-client`. This happened due to a Rust dependency conflict ([#5492](https://github.com/ZcashFoundation/zebra/issues/5492)) and is still an issue due to [another dependency conflict](https://github.com/ZcashFoundation/zebra/issues/8328#issuecomment-1969989648).
 
 ## Documentation
 

@@ -21,8 +21,8 @@ use tower::{
 use zebra_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
-    parameters::genesis_hash,
 };
+use zebra_consensus::ParameterCheckpoint as _;
 use zebra_network as zn;
 use zebra_state as zs;
 
@@ -500,7 +500,7 @@ where
         ));
 
         let new_syncer = Self {
-            genesis_hash: genesis_hash(config.network.network),
+            genesis_hash: config.network.network.genesis_hash(),
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
@@ -1136,7 +1136,7 @@ where
 
     /// Returns `true` if the hash is present in the state, and `false`
     /// if the hash is not present in the state.
-    async fn state_contains(&mut self, hash: block::Hash) -> Result<bool, Report> {
+    pub(crate) async fn state_contains(&mut self, hash: block::Hash) -> Result<bool, Report> {
         match self
             .state
             .ready()

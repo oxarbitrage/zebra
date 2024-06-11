@@ -8,12 +8,10 @@ use zebra_chain::{
     amount::Amount,
     block::{Block, Height},
     parameters::Network,
-    serialization::ZcashDeserializeInto,
-    transaction::{UnminedTxId, VerifiedUnminedTx},
 };
 
 use crate::components::mempool::{
-    config, storage::tests::unmined_transactions_in_blocks, storage::*, Mempool,
+    storage::tests::unmined_transactions_in_blocks, storage::*, Mempool,
 };
 
 /// Eviction memory time used for tests. Most tests won't care about this
@@ -37,7 +35,7 @@ fn mempool_storage_crud_exact_mainnet() {
     });
 
     // Get one (1) unmined transaction
-    let unmined_tx = unmined_transactions_in_blocks(.., network)
+    let unmined_tx = unmined_transactions_in_blocks(.., &network)
         .next()
         .expect("at least one unmined transaction");
 
@@ -61,8 +59,9 @@ fn mempool_storage_basic() -> Result<()> {
 
     // Test multiple times to catch intermittent bugs since eviction is randomized
     for _ in 0..10 {
-        mempool_storage_basic_for_network(Network::Mainnet)?;
-        mempool_storage_basic_for_network(Network::Testnet)?;
+        for network in Network::iter() {
+            mempool_storage_basic_for_network(network)?;
+        }
     }
 
     Ok(())
@@ -70,7 +69,7 @@ fn mempool_storage_basic() -> Result<()> {
 
 fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
     // Get transactions from the first 10 blocks of the Zcash blockchain
-    let unmined_transactions: Vec<_> = unmined_transactions_in_blocks(..=10, network).collect();
+    let unmined_transactions: Vec<_> = unmined_transactions_in_blocks(..=10, &network).collect();
 
     assert!(
         MEMPOOL_TX_COUNT < unmined_transactions.len(),
@@ -163,7 +162,7 @@ fn mempool_storage_crud_same_effects_mainnet() {
     });
 
     // Get one (1) unmined transaction
-    let unmined_tx_1 = unmined_transactions_in_blocks(.., network)
+    let unmined_tx_1 = unmined_transactions_in_blocks(.., &network)
         .next()
         .expect("at least one unmined transaction");
 
@@ -194,7 +193,7 @@ fn mempool_storage_crud_same_effects_mainnet() {
     );
 
     // Get a different unmined transaction
-    let unmined_tx_2 = unmined_transactions_in_blocks(1.., network)
+    let unmined_tx_2 = unmined_transactions_in_blocks(1.., &network)
         .find(|tx| {
             tx.transaction
                 .transaction
@@ -237,10 +236,9 @@ fn mempool_storage_crud_same_effects_mainnet() {
 #[test]
 fn mempool_expired_basic() -> Result<()> {
     let _init_guard = zebra_test::init();
-
-    mempool_expired_basic_for_network(Network::Mainnet)?;
-    mempool_expired_basic_for_network(Network::Testnet)?;
-
+    for network in Network::iter() {
+        mempool_expired_basic_for_network(network)?;
+    }
     Ok(())
 }
 
@@ -252,14 +250,7 @@ fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
         ..Default::default()
     });
 
-    let block: Block = match network {
-        Network::Mainnet => {
-            zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?
-        }
-        Network::Testnet => {
-            zebra_test::vectors::BLOCK_TESTNET_925483_BYTES.zcash_deserialize_into()?
-        }
-    };
+    let block: Block = network.test_block(982681, 925483).unwrap();
 
     // Get a test transaction
     let tx = &*(block.transactions[1]).clone();

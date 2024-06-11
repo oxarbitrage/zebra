@@ -8,31 +8,10 @@ use zebra_chain::{
     },
 };
 
-use crate::constants::{self, magics};
+use crate::constants::{self, CURRENT_NETWORK_PROTOCOL_VERSION};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
-
-/// A magic number identifying the network.
-#[derive(Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub struct Magic(pub [u8; 4]);
-
-impl fmt::Debug for Magic {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("Magic").field(&hex::encode(self.0)).finish()
-    }
-}
-
-impl From<Network> for Magic {
-    /// Get the magic value associated to this `Network`.
-    fn from(network: Network) -> Self {
-        match network {
-            Network::Mainnet => magics::MAINNET,
-            Network::Testnet => magics::TESTNET,
-        }
-    }
-}
 
 /// A protocol version number.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -52,7 +31,7 @@ impl Version {
     ///
     /// If we are incompatible with our own minimum remote protocol version.
     pub fn min_remote_for_height(
-        network: Network,
+        network: &Network,
         height: impl Into<Option<block::Height>>,
     ) -> Version {
         let height = height.into().unwrap_or(block::Height(0));
@@ -76,9 +55,9 @@ impl Version {
     /// - during the initial block download,
     /// - after Zebra restarts, and
     /// - after Zebra's local network is slow or shut down.
-    fn initial_min_for_network(network: Network) -> Version {
+    fn initial_min_for_network(network: &Network) -> Version {
         *constants::INITIAL_MIN_NETWORK_PROTOCOL_VERSION
-            .get(&network)
+            .get(&network.kind())
             .expect("We always have a value for testnet or mainnet")
     }
 
@@ -86,7 +65,7 @@ impl Version {
     /// `height`.
     ///
     /// This is the minimum peer version when Zebra is close to the current tip.
-    fn min_specified_for_height(network: Network, height: block::Height) -> Version {
+    fn min_specified_for_height(network: &Network, height: block::Height) -> Version {
         let network_upgrade = NetworkUpgrade::current(network, height);
         Version::min_specified_for_upgrade(network, network_upgrade)
     }
@@ -94,24 +73,29 @@ impl Version {
     /// Returns the minimum specified network protocol version for `network` and
     /// `network_upgrade`.
     pub(crate) fn min_specified_for_upgrade(
-        network: Network,
+        network: &Network,
         network_upgrade: NetworkUpgrade,
     ) -> Version {
         // TODO: Should we reject earlier protocol versions during our initial
         //       sync? zcashd accepts 170_002 or later during its initial sync.
         Version(match (network, network_upgrade) {
             (_, Genesis) | (_, BeforeOverwinter) => 170_002,
-            (Testnet, Overwinter) => 170_003,
+            (Testnet(params), Overwinter) if params.is_default_testnet() => 170_003,
             (Mainnet, Overwinter) => 170_005,
+            // TODO: Use 170_006 for (Testnet(params), Sapling) if params.is_regtest() (`Regtest` in zcashd uses
+            //       version 170_006 for Sapling, and the same values as Testnet for other network upgrades.)
             (_, Sapling) => 170_007,
-            (Testnet, Blossom) => 170_008,
+            (Testnet(params), Blossom) if params.is_default_testnet() => 170_008,
             (Mainnet, Blossom) => 170_009,
-            (Testnet, Heartwood) => 170_010,
+            (Testnet(params), Heartwood) if params.is_default_testnet() => 170_010,
             (Mainnet, Heartwood) => 170_011,
-            (Testnet, Canopy) => 170_012,
+            (Testnet(params), Canopy) if params.is_default_testnet() => 170_012,
             (Mainnet, Canopy) => 170_013,
-            (Testnet, Nu5) => 170_050,
+            (Testnet(params), Nu5) if params.is_default_testnet() => 170_050,
             (Mainnet, Nu5) => 170_100,
+
+            // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
+            (Testnet(_params), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
         })
     }
 }
@@ -161,50 +145,22 @@ impl Default for Tweak {
 pub struct Filter(pub Vec<u8>);
 
 #[cfg(test)]
-mod proptest {
-
-    use proptest::prelude::*;
-
-    use super::Magic;
-
-    use crate::constants::magics;
-
-    #[test]
-    fn magic_debug() {
-        let _init_guard = zebra_test::init();
-
-        assert_eq!(format!("{:?}", magics::MAINNET), "Magic(\"24e92764\")");
-        assert_eq!(format!("{:?}", magics::TESTNET), "Magic(\"fa1af9bf\")");
-    }
-
-    proptest! {
-
-        #[test]
-        fn proptest_magic_from_array(data in any::<[u8; 4]>()) {
-            let _init_guard = zebra_test::init();
-
-            assert_eq!(format!("{:?}", Magic(data)), format!("Magic({:x?})", hex::encode(data)));
-        }
-    }
-}
-
-#[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
     fn version_extremes_mainnet() {
-        version_extremes(Mainnet)
+        version_extremes(&Mainnet)
     }
 
     #[test]
     fn version_extremes_testnet() {
-        version_extremes(Testnet)
+        version_extremes(&Network::new_default_testnet())
     }
 
     /// Test the min_specified_for_upgrade and min_specified_for_height functions for `network` with
     /// extreme values.
-    fn version_extremes(network: Network) {
+    fn version_extremes(network: &Network) {
         let _init_guard = zebra_test::init();
 
         assert_eq!(
@@ -222,17 +178,17 @@ mod test {
 
     #[test]
     fn version_consistent_mainnet() {
-        version_consistent(Mainnet)
+        version_consistent(&Mainnet)
     }
 
     #[test]
     fn version_consistent_testnet() {
-        version_consistent(Testnet)
+        version_consistent(&Network::new_default_testnet())
     }
 
     /// Check that the min_specified_for_upgrade and min_specified_for_height functions
     /// are consistent for `network`.
-    fn version_consistent(network: Network) {
+    fn version_consistent(network: &Network) {
         let _init_guard = zebra_test::init();
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);

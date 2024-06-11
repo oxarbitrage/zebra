@@ -211,7 +211,7 @@ pub struct ChainInner {
 impl Chain {
     /// Create a new Chain with the given finalized tip trees and network.
     pub(crate) fn new(
-        network: Network,
+        network: &Network,
         finalized_tip_height: Height,
         sprout_note_commitment_tree: Arc<sprout::tree::NoteCommitmentTree>,
         sapling_note_commitment_tree: Arc<sapling::tree::NoteCommitmentTree>,
@@ -247,7 +247,7 @@ impl Chain {
         };
 
         let mut chain = Self {
-            network,
+            network: network.clone(),
             inner,
             last_fork_height: None,
         };
@@ -373,7 +373,7 @@ impl Chain {
 
     /// Returns the [`Network`] for this chain.
     pub fn network(&self) -> Network {
-        self.network
+        self.network.clone()
     }
 
     /// Returns the [`ContextuallyVerifiedBlock`] with [`block::Hash`] or
@@ -636,13 +636,11 @@ impl Chain {
                 .next()
                 .expect("Zebra should never reach the max height in normal operation.");
 
-            if self.sprout_trees_by_height.get(&next_height).is_none() {
-                // TODO: Use `try_insert` once it stabilises.
-                self.sprout_trees_by_height.insert(
-                    next_height,
-                    highest_removed_tree.expect("There should be a cached removed tree."),
-                );
-            }
+            self.sprout_trees_by_height
+                .entry(next_height)
+                .or_insert_with(|| {
+                    highest_removed_tree.expect("There should be a cached removed tree.")
+                });
         }
     }
 
@@ -839,13 +837,11 @@ impl Chain {
                 .next()
                 .expect("Zebra should never reach the max height in normal operation.");
 
-            if self.sapling_trees_by_height.get(&next_height).is_none() {
-                // TODO: Use `try_insert` once it stabilises.
-                self.sapling_trees_by_height.insert(
-                    next_height,
-                    highest_removed_tree.expect("There should be a cached removed tree."),
-                );
-            }
+            self.sapling_trees_by_height
+                .entry(next_height)
+                .or_insert_with(|| {
+                    highest_removed_tree.expect("There should be a cached removed tree.")
+                });
         }
     }
 
@@ -1048,13 +1044,11 @@ impl Chain {
                 .next()
                 .expect("Zebra should never reach the max height in normal operation.");
 
-            if self.orchard_trees_by_height.get(&next_height).is_none() {
-                // TODO: Use `try_insert` once it stabilises.
-                self.orchard_trees_by_height.insert(
-                    next_height,
-                    highest_removed_tree.expect("There should be a cached removed tree."),
-                );
-            }
+            self.orchard_trees_by_height
+                .entry(next_height)
+                .or_insert_with(|| {
+                    highest_removed_tree.expect("There should be a cached removed tree.")
+                });
         }
     }
 
@@ -1270,8 +1264,7 @@ impl Chain {
     ) -> impl Iterator<Item = &TransparentTransfers> {
         addresses
             .iter()
-            .copied()
-            .flat_map(|address| self.partial_transparent_transfers.get(&address))
+            .flat_map(|address| self.partial_transparent_transfers.get(address))
     }
 
     /// Returns the transparent balance change for `addresses` in this non-finalized chain.
@@ -1426,10 +1419,10 @@ impl Chain {
         let history_tree_mut = Arc::make_mut(&mut history_tree);
         history_tree_mut
             .push(
-                self.network,
+                &self.network,
                 contextually_valid.block.clone(),
-                sapling_root,
-                orchard_root,
+                &sapling_root,
+                &orchard_root,
             )
             .map_err(Arc::new)?;
 
@@ -1754,7 +1747,7 @@ impl
             );
 
             // Update the address index with this UTXO
-            if let Some(receiving_address) = created_utxo.utxo.output.address(self.network) {
+            if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .entry(receiving_address)
@@ -1793,7 +1786,7 @@ impl
             );
 
             // Revert the address index for this UTXO
-            if let Some(receiving_address) = created_utxo.utxo.output.address(self.network) {
+            if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .get_mut(&receiving_address)
@@ -1857,7 +1850,7 @@ impl
             };
 
             // Index the spent output for the address
-            if let Some(spending_address) = spent_output.utxo.output.address(self.network) {
+            if let Some(spending_address) = spent_output.utxo.output.address(&self.network) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .entry(spending_address)
@@ -1909,7 +1902,7 @@ impl
             };
 
             // Revert the spent output for the address
-            if let Some(receiving_address) = spent_output.utxo.output.address(self.network) {
+            if let Some(receiving_address) = spent_output.utxo.output.address(&self.network) {
                 let address_transfers = self
                     .partial_transparent_transfers
                     .get_mut(&receiving_address)

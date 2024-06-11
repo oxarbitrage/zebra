@@ -8,17 +8,15 @@
 use std::collections::HashMap;
 
 use hex::ToHex;
-use itertools::Itertools;
 use jsonrpc::simple_http::SimpleHttpTransport;
 use jsonrpc::Client;
 
 use zcash_client_backend::decrypt_transaction;
-use zcash_client_backend::keys::UnifiedFullViewingKey;
 use zcash_primitives::consensus::{BlockHeight, BranchId};
 use zcash_primitives::transaction::Transaction;
 use zcash_primitives::zip32::AccountId;
 
-use zebra_scan::scan::sapling_key_to_scan_block_keys;
+use zebra_scan::scan::{dfvk_to_ufvk, sapling_key_to_dfvk};
 use zebra_scan::{storage::Storage, Config};
 
 /// Prints the memos of transactions from Zebra's scanning results storage.
@@ -41,26 +39,19 @@ use zebra_scan::{storage::Storage, Config};
 /// - The transaction fetched via RPC cannot be deserialized from raw bytes.
 #[allow(clippy::print_stdout)]
 pub fn main() {
-    let network = zcash_primitives::consensus::Network::MainNetwork;
-    let storage = Storage::new(&Config::default(), network.into(), true);
+    let network = zebra_chain::parameters::Network::Mainnet;
+    let storage = Storage::new(&Config::default(), &network, true);
     // If the first memo is empty, it doesn't get printed. But we never print empty memos anyway.
     let mut prev_memo = "".to_owned();
 
     for (key, _) in storage.sapling_keys_last_heights().iter() {
-        let dfvk = sapling_key_to_scan_block_keys(key, network.into())
-            .expect("Scanning key from the storage should be valid")
-            .0
-            .into_iter()
-            .exactly_one()
-            .expect("There should be exactly one dfvk");
-
-        let ufvk_with_acc_id = HashMap::from([(
-            AccountId::from(1),
-            UnifiedFullViewingKey::new(Some(dfvk), None).expect("`dfvk` should be `Some`"),
+        let ufvks = HashMap::from([(
+            AccountId::ZERO,
+            dfvk_to_ufvk(&sapling_key_to_dfvk(key, &network).expect("dfvk")).expect("ufvk"),
         )]);
 
         for (height, txids) in storage.sapling_results(key) {
-            let height = BlockHeight::from(height);
+            let height = BlockHeight::from(height.0);
 
             for txid in txids.iter() {
                 let tx = Transaction::read(
@@ -70,8 +61,8 @@ pub fn main() {
                 )
                 .expect("TX fetched via RPC should be deserializable from raw bytes");
 
-                for output in decrypt_transaction(&network, height, &tx, &ufvk_with_acc_id) {
-                    let memo = memo_bytes_to_string(output.memo.as_array());
+                for output in decrypt_transaction(&network, height, &tx, &ufvks).sapling_outputs() {
+                    let memo = memo_bytes_to_string(output.memo().as_array());
 
                     if !memo.is_empty()
                         // Filter out some uninteresting and repeating memos from ZECPages.

@@ -8,13 +8,12 @@ use tokio::sync::{
     oneshot,
 };
 
-use tower::BoxError;
-use zcash_primitives::{sapling::SaplingIvk, zip32::DiversifiableFullViewingKey};
+use sapling::zip32::DiversifiableFullViewingKey;
 use zebra_chain::{block::Height, parameters::Network};
 use zebra_node_services::scan_service::response::ScanResult;
 use zebra_state::SaplingScanningKey;
 
-use crate::scan::sapling_key_to_scan_block_keys;
+use crate::scan::sapling_key_to_dfvk;
 
 use super::ScanTask;
 
@@ -58,17 +57,11 @@ impl ScanTask {
     /// Returns newly registered keys for scanning.
     pub fn process_messages(
         cmd_receiver: &mut tokio::sync::mpsc::Receiver<ScanTaskCommand>,
-        registered_keys: &mut HashMap<
-            SaplingScanningKey,
-            (Vec<DiversifiableFullViewingKey>, Vec<SaplingIvk>),
-        >,
-        network: Network,
+        registered_keys: &mut HashMap<SaplingScanningKey, DiversifiableFullViewingKey>,
+        network: &Network,
     ) -> Result<
         (
-            HashMap<
-                SaplingScanningKey,
-                (Vec<DiversifiableFullViewingKey>, Vec<SaplingIvk>, Height),
-            >,
+            HashMap<SaplingScanningKey, (DiversifiableFullViewingKey, Height)>,
             HashMap<SaplingScanningKey, Sender<ScanResult>>,
             Vec<(Receiver<ScanResult>, oneshot::Sender<Receiver<ScanResult>>)>,
         ),
@@ -118,9 +111,9 @@ impl ScanTask {
                                 sapling_activation_height
                             };
 
-                            sapling_key_to_scan_block_keys(&key.0, network)
+                            sapling_key_to_dfvk(&key.0, network)
                                 .ok()
-                                .map(|parsed| (key.0, (parsed.0, parsed.1, birth_height)))
+                                .map(|parsed| (key.0, (parsed, birth_height)))
                         })
                         .collect();
 
@@ -129,10 +122,7 @@ impl ScanTask {
 
                     new_keys.extend(keys.clone());
 
-                    registered_keys.extend(
-                        keys.into_iter()
-                            .map(|(key, (dfvks, ivks, _))| (key, (dfvks, ivks))),
-                    );
+                    registered_keys.extend(keys.into_iter().map(|(key, (dfvk, _))| (key, dfvk)));
                 }
 
                 ScanTaskCommand::RemoveKeys { done_tx, keys } => {
@@ -183,14 +173,11 @@ impl ScanTask {
     /// Returns a oneshot channel receiver to notify the caller when the keys have been removed.
     pub fn remove_keys(
         &mut self,
-        keys: &[String],
+        keys: Vec<String>,
     ) -> Result<oneshot::Receiver<()>, TrySendError<ScanTaskCommand>> {
         let (done_tx, done_rx) = oneshot::channel();
 
-        self.send(ScanTaskCommand::RemoveKeys {
-            keys: keys.to_vec(),
-            done_tx,
-        })?;
+        self.send(ScanTaskCommand::RemoveKeys { keys, done_tx })?;
 
         Ok(done_rx)
     }
@@ -210,14 +197,14 @@ impl ScanTask {
     /// Sends a message to the scan task to start sending the results for the provided viewing keys to a channel.
     ///
     /// Returns the channel receiver.
-    pub async fn subscribe(
+    pub fn subscribe(
         &mut self,
         keys: HashSet<SaplingScanningKey>,
-    ) -> Result<Receiver<ScanResult>, BoxError> {
+    ) -> Result<oneshot::Receiver<Receiver<ScanResult>>, TrySendError<ScanTaskCommand>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
         self.send(ScanTaskCommand::SubscribeResults { keys, rsp_tx })?;
 
-        Ok(rsp_rx.await?)
+        Ok(rsp_rx)
     }
 }

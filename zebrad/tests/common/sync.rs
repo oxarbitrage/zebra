@@ -7,7 +7,6 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use color_eyre::eyre::Result;
 use tempfile::TempDir;
 
 use zebra_chain::{block::Height, parameters::Network};
@@ -183,7 +182,7 @@ impl MempoolBehavior {
 #[tracing::instrument(skip(reuse_tempdir))]
 pub fn sync_until(
     height: Height,
-    network: Network,
+    network: &Network,
     stop_regex: &str,
     timeout: Duration,
     // Test Settings
@@ -298,7 +297,7 @@ pub fn sync_until(
 #[tracing::instrument(skip(zebrad))]
 pub fn check_sync_logs_until(
     mut zebrad: TestChild<TempDir>,
-    network: Network,
+    network: &Network,
     stop_regex: &str,
     // Test Settings
     mempool_behavior: MempoolBehavior,
@@ -328,7 +327,7 @@ pub fn check_sync_logs_until(
 }
 
 /// Returns a test config for caching Zebra's state up to the mandatory checkpoint.
-pub fn cached_mandatory_checkpoint_test_config(network: Network) -> Result<ZebradConfig> {
+pub fn cached_mandatory_checkpoint_test_config(network: &Network) -> Result<ZebradConfig> {
     let mut config = persistent_test_config(network)?;
     config.state.cache_dir = "/zebrad-cache".into();
 
@@ -365,7 +364,7 @@ pub fn cached_mandatory_checkpoint_test_config(network: Network) -> Result<Zebra
 #[allow(clippy::print_stderr)]
 #[tracing::instrument]
 pub fn create_cached_database_height(
-    network: Network,
+    network: &Network,
     height: Height,
     checkpoint_sync: bool,
     stop_regex: &str,

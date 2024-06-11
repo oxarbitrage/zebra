@@ -1,6 +1,6 @@
 //! Fixed test vectors for the mempool.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use color_eyre::Report;
 use tokio::time::{self, timeout};
@@ -15,11 +15,9 @@ use zebra_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
 use crate::components::{
-    mempool::{self, storage::tests::unmined_transactions_in_blocks, *},
+    mempool::{self, *},
     sync::RecentSyncLengths,
 };
-
-use super::UnboxMempoolError;
 
 /// A [`MockService`] representing the network service.
 type MockPeerSet = MockService<zn::Request, zn::Response, PanicAssertion>;
@@ -44,7 +42,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
     let network = Network::Mainnet;
 
     // get the genesis block transactions from the Zcash blockchain.
-    let mut unmined_transactions = unmined_transactions_in_blocks(1..=10, network);
+    let mut unmined_transactions = unmined_transactions_in_blocks(1..=10, &network);
     let genesis_transaction = unmined_transactions
         .next()
         .expect("Missing genesis transaction");
@@ -56,7 +54,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
     let cost_limit = more_transactions.iter().map(|tx| tx.cost()).sum();
 
     let (mut service, _peer_set, _state_service, _chain_tip_change, _tx_verifier, mut recent_syncs) =
-        setup(network, cost_limit, true).await;
+        setup(&network, cost_limit, true).await;
 
     // Enable the mempool
     service.enable(&mut recent_syncs).await;
@@ -187,7 +185,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
     let network = Network::Mainnet;
 
     // Get transactions to use in the test
-    let unmined_transactions = unmined_transactions_in_blocks(1..=10, network);
+    let unmined_transactions = unmined_transactions_in_blocks(1..=10, &network);
     let mut transactions = unmined_transactions.collect::<Vec<_>>();
     // Split unmined_transactions into:
     // [transactions..., new_tx]
@@ -203,7 +201,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
         .sum();
 
     let (mut service, _peer_set, _state_service, _chain_tip_change, _tx_verifier, mut recent_syncs) =
-        setup(network, cost_limit, true).await;
+        setup(&network, cost_limit, true).await;
 
     // Enable the mempool
     service.enable(&mut recent_syncs).await;
@@ -277,10 +275,10 @@ async fn mempool_service_disabled() -> Result<(), Report> {
     let network = Network::Mainnet;
 
     let (mut service, _peer_set, _state_service, _chain_tip_change, _tx_verifier, mut recent_syncs) =
-        setup(network, u64::MAX, true).await;
+        setup(&network, u64::MAX, true).await;
 
     // get the genesis block transactions from the Zcash blockchain.
-    let mut unmined_transactions = unmined_transactions_in_blocks(1..=10, network);
+    let mut unmined_transactions = unmined_transactions_in_blocks(1..=10, &network);
     let genesis_transaction = unmined_transactions
         .next()
         .expect("Missing genesis transaction");
@@ -398,7 +396,7 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
         mut chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
-    ) = setup(network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
     mempool.enable(&mut recent_syncs).await;
@@ -513,7 +511,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         mut chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
-    ) = setup(network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
     mempool.enable(&mut recent_syncs).await;
@@ -600,10 +598,10 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
         _chain_tip_change,
         mut tx_verifier,
         mut recent_syncs,
-    ) = setup(network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, true).await;
 
     // Get transactions to use in the test
-    let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, network);
+    let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, &network);
     let rejected_tx = unmined_transactions.next().unwrap().clone();
 
     // Enable the mempool
@@ -675,10 +673,10 @@ async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
         _chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
-    ) = setup(network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, true).await;
 
     // Get transactions to use in the test
-    let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, network);
+    let mut unmined_transactions = unmined_transactions_in_blocks(1..=2, &network);
     let rejected_valid_tx = unmined_transactions.next().unwrap().clone();
 
     // Enable the mempool
@@ -760,7 +758,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         mut chain_tip_change,
         mut tx_verifier,
         mut recent_syncs,
-    ) = setup(network, u64::MAX, true).await;
+    ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
     mempool.enable(&mut recent_syncs).await;
@@ -909,7 +907,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
 /// Create a new [`Mempool`] instance using mocked services.
 async fn setup(
-    network: Network,
+    network: &Network,
     tx_cost_limit: u64,
     should_commit_genesis_block: bool,
 ) -> (
