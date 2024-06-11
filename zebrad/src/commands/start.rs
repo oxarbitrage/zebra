@@ -347,7 +347,7 @@ impl StartCmd {
             zebra_scan::spawn_init(
                 config.shielded_scan.clone(),
                 config.network.network.clone(),
-                state,
+                read_only_state_service.clone(),
                 chain_tip_change,
             )
         };
