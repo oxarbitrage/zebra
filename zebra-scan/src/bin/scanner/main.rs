@@ -8,6 +8,7 @@ use tracing::*;
 use zebra_chain::parameters::Network;
 use zebra_state::{ChainTipSender, SaplingScanningKey};
 
+use core::net::SocketAddr;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -27,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|key| (key, 1))
         .collect();
     let cache_dir = args.cache_dir;
+    let listen_addr = args.listen_addr;
 
     // Create a state config with arguments.
     let state_config = zebra_state::Config {
@@ -34,9 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..zebra_state::Config::default()
     };
 
-    // Create a state config with arguments.
+    // Create a scanner config with arguments.
     let scanner_config = zebra_scan::Config {
         sapling_keys_to_scan,
+        listen_addr,
         ..zebra_scan::Config::default()
     };
 
@@ -94,4 +97,8 @@ pub struct Args {
     /// The sapling keys to scan for.
     #[structopt(short, long)]
     pub sapling_keys_to_scan: Vec<SaplingScanningKey>,
+
+    /// IP address and port for the zebra-scan gRPC server.
+    #[structopt(short, long)]
+    pub listen_addr: Option<SocketAddr>,
 }
