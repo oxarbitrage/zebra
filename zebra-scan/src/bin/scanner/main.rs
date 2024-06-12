@@ -1,6 +1,7 @@
 //! The zebra-scanner binary.
 //!
 //! The zebra-scanner binary is a standalone binary that scans the Zcash blockchain for transactions using the given sapling keys.
+use lazy_static::lazy_static;
 use structopt::StructOpt;
 use tracing::*;
 
@@ -69,22 +70,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+// Default values for the zebra-scanner arguments.
+lazy_static! {
+    static ref DEFAULT_CACHE_DIR: String = zebra_state::Config::default()
+        .cache_dir
+        .to_str()
+        .expect("default cache dir is valid")
+        .to_string();
+    static ref DEFAULT_NETWORK: String = Network::default().to_string();
+}
+
 /// zebra-scanner arguments
 #[derive(Clone, Debug, Eq, PartialEq, StructOpt)]
 pub struct Args {
     /// Path to an existing zebra state cache directory.
-    #[structopt(default_value = "/media/alfredo/stuff/chain/zebra", short, long)]
+    #[structopt(default_value = &DEFAULT_CACHE_DIR, short, long)]
     pub cache_dir: PathBuf,
 
     /// The Zcash network where the scanner will run.
-    #[structopt(default_value = "Mainnet", short, long)]
+    #[structopt(default_value = &DEFAULT_NETWORK, short, long)]
     pub network: Network,
 
     /// The sapling keys to scan for.
-    #[structopt(
-        default_value = "zxviews1q0duytgcqqqqpqre26wkl45gvwwwd706xw608hucmvfalr759ejwf7qshjf5r9aa7323zulvz6plhttp5mltqcgs9t039cx2d09mgq05ts63n8u35hyv6h9nc9ctqqtue2u7cer2mqegunuulq2luhq3ywjcz35yyljewa4mgkgjzyfwh6fr6jd0dzd44ghk0nxdv2hnv4j5nxfwv24rwdmgllhe0p8568sgqt9ckt02v2kxf5ahtql6s0ltjpkckw8gtymxtxuu9gcr0swvz",
-        short,
-        long
-    )]
+    #[structopt(short, long)]
     pub sapling_keys_to_scan: Vec<SaplingScanningKey>,
 }

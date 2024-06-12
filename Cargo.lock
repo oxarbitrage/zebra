@@ -6195,6 +6195,7 @@ dependencies = [
  "insta",
  "itertools 0.13.0",
  "jubjub",
+ "lazy_static",
  "proptest",
  "proptest-derive",
  "rand 0.8.5",
