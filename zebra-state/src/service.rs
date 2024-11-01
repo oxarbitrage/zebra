@@ -24,15 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "elasticsearch")]
-use elasticsearch::{
-    auth::Credentials::Basic,
-    cert::CertificateValidation,
-    http::transport::{SingleNodeConnectionPool, TransportBuilder},
-    http::Url,
-    Elasticsearch,
-};
-
 use futures::future::FutureExt;
 use tokio::sync::{oneshot, watch};
 use tower::{util::BoxService, Service, ServiceExt};
@@ -48,10 +39,12 @@ use zebra_chain::{
     subtree::NoteCommitmentSubtreeIndex,
 };
 
+#[cfg(feature = "getblocktemplate-rpcs")]
+use zebra_chain::{block::Height, serialization::ZcashSerialize};
+
 use crate::{
     constants::{
-        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS_FOR_ZEBRA,
-        MAX_LEGACY_CHAIN_BLOCKS,
+        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     service::{
         block_iter::any_ancestor_blocks,
@@ -319,29 +312,12 @@ impl StateService {
         checkpoint_verify_concurrency_limit: usize,
     ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
         let timer = CodeTimer::start();
-
-        #[cfg(feature = "elasticsearch")]
-        let finalized_state = {
-            let conn_pool = SingleNodeConnectionPool::new(
-                Url::parse(config.elasticsearch_url.as_str())
-                    .expect("configured elasticsearch url is invalid"),
-            );
-            let transport = TransportBuilder::new(conn_pool)
-                .cert_validation(CertificateValidation::None)
-                .auth(Basic(
-                    config.clone().elasticsearch_username,
-                    config.clone().elasticsearch_password,
-                ))
-                .build()
-                .expect("elasticsearch transport builder should not fail");
-            let elastic_db = Some(Elasticsearch::new(transport));
-
-            FinalizedState::new(&config, network, elastic_db)
-        };
-
-        #[cfg(not(feature = "elasticsearch"))]
-        let finalized_state = { FinalizedState::new(&config, network) };
-
+        let finalized_state = FinalizedState::new(
+            &config,
+            network,
+            #[cfg(feature = "elasticsearch")]
+            true,
+        );
         timer.finish(module_path!(), line!(), "opening finalized state database");
 
         let timer = CodeTimer::start();
@@ -387,7 +363,7 @@ impl StateService {
 
         let read_service = ReadStateService::new(
             &finalized_state,
-            block_write_task,
+            Some(block_write_task),
             non_finalized_state_receiver,
         );
 
@@ -828,14 +804,14 @@ impl ReadStateService {
     /// and a watch channel for updating the shared recent non-finalized chain.
     pub(crate) fn new(
         finalized_state: &FinalizedState,
-        block_write_task: Arc<std::thread::JoinHandle<()>>,
+        block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
         non_finalized_state_receiver: watch::Receiver<NonFinalizedState>,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver: WatchReceiver::new(non_finalized_state_receiver),
-            block_write_task: Some(block_write_task),
+            block_write_task,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1218,6 +1194,38 @@ impl Service<ReadRequest> for ReadStateService {
                 .wait_for_panics()
             }
 
+            // Used by `getblockchaininfo` RPC method.
+            ReadRequest::TipPoolValues => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let tip_with_value_balance = state
+                            .non_finalized_state_receiver
+                            .with_watch_data(|non_finalized_state| {
+                                read::tip_with_value_balance(
+                                    non_finalized_state.best_chain(),
+                                    &state.db,
+                                )
+                            });
+
+                        // The work is done in the future.
+                        // TODO: Do this in the Drop impl with the variant name?
+                        timer.finish(module_path!(), line!(), "ReadRequest::TipPoolValues");
+
+                        let (tip_height, tip_hash, value_balance) = tip_with_value_balance?
+                            .ok_or(BoxError::from("no chain tip available yet"))?;
+
+                        Ok(ReadResponse::TipPoolValues {
+                            tip_height,
+                            tip_hash,
+                            value_balance,
+                        })
+                    })
+                })
+                .wait_for_panics()
+            }
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => {
                 let state = self.clone();
@@ -1467,7 +1475,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     &state.db,
                                     known_blocks,
                                     stop,
-                                    MAX_FIND_BLOCK_HEADERS_RESULTS_FOR_ZEBRA,
+                                    MAX_FIND_BLOCK_HEADERS_RESULTS,
                                 )
                             },
                         );
@@ -1899,6 +1907,46 @@ impl Service<ReadRequest> for ReadStateService {
                 })
                 .wait_for_panics()
             }
+
+            #[cfg(feature = "getblocktemplate-rpcs")]
+            ReadRequest::TipBlockSize => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        // Get the best chain tip height.
+                        let tip_height = state
+                            .non_finalized_state_receiver
+                            .with_watch_data(|non_finalized_state| {
+                                read::tip_height(non_finalized_state.best_chain(), &state.db)
+                            })
+                            .unwrap_or(Height(0));
+
+                        // Get the block at the best chain tip height.
+                        let block = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                read::block(
+                                    non_finalized_state.best_chain(),
+                                    &state.db,
+                                    tip_height.into(),
+                                )
+                            },
+                        );
+
+                        // The work is done in the future.
+                        timer.finish(module_path!(), line!(), "ReadRequest::TipBlockSize");
+
+                        // Respond with the length of the obtained block if any.
+                        match block {
+                            Some(b) => Ok(ReadResponse::TipBlockSize(Some(
+                                b.zcash_serialize_to_vec()?.len(),
+                            ))),
+                            None => Ok(ReadResponse::TipBlockSize(None)),
+                        }
+                    })
+                })
+                .wait_for_panics()
+            }
         }
     }
 }
@@ -1943,6 +1991,52 @@ pub fn init(
         latest_chain_tip,
         chain_tip_change,
     )
+}
+
+/// Initialize a read state service from the provided [`Config`].
+/// Returns a read-only state service,
+///
+/// Each `network` has its own separate on-disk database.
+///
+/// To share access to the state, clone the returned [`ReadStateService`].
+pub fn init_read_only(
+    config: Config,
+    network: &Network,
+) -> (
+    ReadStateService,
+    ZebraDb,
+    tokio::sync::watch::Sender<NonFinalizedState>,
+) {
+    let finalized_state = FinalizedState::new_with_debug(
+        &config,
+        network,
+        true,
+        #[cfg(feature = "elasticsearch")]
+        false,
+        true,
+    );
+    let (non_finalized_state_sender, non_finalized_state_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(network));
+
+    (
+        ReadStateService::new(&finalized_state, None, non_finalized_state_receiver),
+        finalized_state.db.clone(),
+        non_finalized_state_sender,
+    )
+}
+
+/// Calls [`init_read_only`] with the provided [`Config`] and [`Network`] from a blocking task.
+/// Returns a [`tokio::task::JoinHandle`] with a read state service and chain tip sender.
+pub fn spawn_init_read_only(
+    config: Config,
+    network: &Network,
+) -> tokio::task::JoinHandle<(
+    ReadStateService,
+    ZebraDb,
+    tokio::sync::watch::Sender<NonFinalizedState>,
+)> {
+    let network = network.clone();
+    tokio::task::spawn_blocking(move || init_read_only(config, &network))
 }
 
 /// Calls [`init`] with the provided [`Config`] and [`Network`] from a blocking task.

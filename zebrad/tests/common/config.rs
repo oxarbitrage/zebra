@@ -16,7 +16,7 @@ use color_eyre::eyre::Result;
 use tempfile::TempDir;
 
 use zebra_chain::parameters::Network;
-use zebra_test::net::random_known_port;
+use zebra_test::{command::TestChild, net::random_known_port};
 use zebrad::{
     components::{mempool, sync, tracing},
     config::ZebradConfig,
@@ -80,27 +80,6 @@ pub fn default_test_config(net: &Network) -> Result<ZebradConfig> {
         mining.miner_address = Some(miner_address.parse().expect("hard-coded address is valid"));
     }
 
-    #[cfg(feature = "shielded-scan")]
-    {
-        let mut shielded_scan = zebra_scan::Config::ephemeral();
-        shielded_scan.db_config_mut().cache_dir = "zebra-scan".into();
-
-        let config = ZebradConfig {
-            network,
-            state,
-            sync,
-            mempool,
-            consensus,
-            tracing,
-            mining,
-            shielded_scan,
-            ..ZebradConfig::default()
-        };
-
-        Ok(config)
-    }
-
-    #[cfg(not(feature = "shielded-scan"))]
     Ok(ZebradConfig {
         network,
         state,
@@ -152,6 +131,27 @@ pub fn random_known_rpc_port_config(
 ) -> Result<ZebradConfig> {
     // [Note on port conflict](#Note on port conflict)
     let listen_port = random_known_port();
+    rpc_port_config(listen_port, parallel_cpu_threads, network)
+}
+
+/// Returns a `zebrad` config with an OS-assigned RPC port.
+///
+/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
+pub fn os_assigned_rpc_port_config(
+    parallel_cpu_threads: bool,
+    network: &Network,
+) -> Result<ZebradConfig> {
+    rpc_port_config(0, parallel_cpu_threads, network)
+}
+
+/// Returns a `zebrad` config with the provided RPC port.
+///
+/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
+pub fn rpc_port_config(
+    listen_port: u16,
+    parallel_cpu_threads: bool,
+    network: &Network,
+) -> Result<ZebradConfig> {
     let listen_ip = "127.0.0.1".parse().expect("hard-coded IP is valid");
     let zebra_rpc_listener = SocketAddr::new(listen_ip, listen_port);
 
@@ -166,6 +166,19 @@ pub fn random_known_rpc_port_config(
         // Default config, users who want to detect port conflicts configure this
         config.rpc.parallel_cpu_threads = 1;
     }
+    config.rpc.enable_cookie_auth = false;
 
     Ok(config)
+}
+
+/// Reads Zebra's RPC server listen address from a testchild's logs
+pub fn read_listen_addr_from_logs(
+    child: &mut TestChild<TempDir>,
+    expected_msg: &str,
+) -> Result<SocketAddr> {
+    let line = child.expect_stdout_line_matches(expected_msg)?;
+    let rpc_addr_position =
+        line.find(expected_msg).expect("already checked for match") + expected_msg.len();
+    let rpc_addr = line[rpc_addr_position..].trim().to_string();
+    Ok(rpc_addr.parse()?)
 }

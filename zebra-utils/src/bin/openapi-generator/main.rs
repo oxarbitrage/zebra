@@ -1,8 +1,10 @@
 //! Generate an openapi.yaml file from the Zebra RPC methods
 
-use std::{collections::HashMap, error::Error, fs::File, io::Write};
+use std::{error::Error, fs::File, io::Write};
 
+use indexmap::IndexMap;
 use quote::ToTokens;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 use syn::LitStr;
 
@@ -14,7 +16,7 @@ const SERVER: &str = "http://localhost:8232";
 // The API methods
 #[derive(Serialize, Debug)]
 struct Methods {
-    paths: HashMap<String, HashMap<String, MethodConfig>>,
+    paths: IndexMap<String, IndexMap<String, MethodConfig>>,
 }
 
 // The configuration for each method
@@ -24,7 +26,7 @@ struct MethodConfig {
     description: String,
     #[serde(rename = "requestBody")]
     request_body: RequestBody,
-    responses: HashMap<String, Response>,
+    responses: IndexMap<String, Response>,
 }
 
 // The request body
@@ -52,7 +54,7 @@ struct Application {
 struct Schema {
     #[serde(rename = "type")]
     type_: String,
-    properties: HashMap<String, Property>,
+    properties: IndexMap<String, Property>,
 }
 
 // The properties of the request body
@@ -94,8 +96,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     ];
 
-    // Create a hashmap to store the method names and configuration
-    let mut methods = HashMap::new();
+    // Create an indexmap to store the method names and configuration
+    let mut methods = IndexMap::new();
 
     for zebra_rpc_methods_path in paths {
         // Read the source code from the file
@@ -104,8 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Parse the source code into a syn AST
         let syn_file = syn::parse_file(&source_code)?;
 
-        // Create a hashmap to store the methods configuration
-        let mut methods_config = HashMap::new();
+        // Create an indexmap to store the methods configuration
+        let mut methods_config = IndexMap::new();
 
         // Iterate over items in the file looking for traits
         for item in &syn_file.items {
@@ -149,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // Create the responses
                         let responses = create_responses(&method_name, have_parameters)?;
 
-                        // Add the method configuration to the hashmap
+                        // Add the method configuration to the indexmap
                         methods_config.insert(
                             request_type,
                             MethodConfig {
@@ -160,7 +162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             },
                         );
 
-                        // Add the method name and configuration to the hashmap
+                        // Add the method name and configuration to the indexmap
                         methods.insert(format!("/{}", method_name), methods_config.clone());
                     }
                 }
@@ -172,9 +174,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let all_methods = Methods { paths: methods };
 
     // Add openapi header and write to file
-    let yaml_string = serde_yaml::to_string(&all_methods)?;
+    let yml_string = serde_yml::to_string(&all_methods)?;
     let mut w = File::create("openapi.yaml")?;
-    w.write_all(format!("{}{}", create_yaml(), yaml_string).as_bytes())?;
+    w.write_all(format!("{}{}", create_yaml(), yml_string).as_bytes())?;
 
     Ok(())
 }
@@ -244,7 +246,7 @@ fn method_doc(method: &syn::TraitItem) -> Result<(Vec<String>, String), Box<dyn 
         None => return Err("Description not found in method documentation".into()),
     };
 
-    Ok((method_doc, description))
+    Ok((method_doc, description.trim_end_matches("\"]").to_string()))
 }
 
 // Extract the tags from the method documentation. TODO: Assuming 1 tag per method for now
@@ -357,15 +359,20 @@ fn create_request_body(method_name: &str, parameters_example: &str) -> RequestBo
         default: method_name.to_string(),
     };
 
-    // Add a hardcoded request_id to the request body
+    // Add random string is used to identify the requests done by the client
+    let rand_string: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(10)
+        .map(char::from)
+        .collect();
     let request_id_prop = Property {
-        type_: "number".to_string(),
+        type_: "string".to_string(),
         items: None,
-        default: "123".to_string(),
+        default: rand_string,
     };
 
     // Create the schema and add the first 2 properties
-    let mut schema = HashMap::new();
+    let mut schema = IndexMap::new();
     schema.insert("method".to_string(), method_name_prop);
     schema.insert("id".to_string(), request_id_prop);
 
@@ -400,8 +407,8 @@ fn create_request_body(method_name: &str, parameters_example: &str) -> RequestBo
 fn create_responses(
     method_name: &str,
     have_parameters: bool,
-) -> Result<HashMap<String, Response>, Box<dyn Error>> {
-    let mut responses = HashMap::new();
+) -> Result<IndexMap<String, Response>, Box<dyn Error>> {
+    let mut responses = IndexMap::new();
 
     let properties = get_default_properties(method_name)?;
 
@@ -418,7 +425,7 @@ fn create_responses(
     };
     responses.insert("200".to_string(), res_ok);
 
-    let mut properties = HashMap::new();
+    let mut properties = IndexMap::new();
     if have_parameters {
         properties.insert(
             "error".to_string(),
@@ -453,92 +460,105 @@ fn add_params_to_description(description: &str, params_description: &str) -> Str
     new_description
 }
 
+fn default_property<T: serde::Serialize>(
+    type_: &str,
+    items: Option<ArrayItems>,
+    default_value: T,
+) -> Result<Property, Box<dyn Error>> {
+    Ok(Property {
+        type_: type_.to_string(),
+        items,
+        default: serde_json::to_string(&default_value)?,
+    })
+}
+
 // Get requests examples by using defaults from the Zebra RPC methods
-fn get_default_properties(method_name: &str) -> Result<HashMap<String, Property>, Box<dyn Error>> {
-    // TODO: Complete the list of methods
-
-    let type_ = "object".to_string();
+// TODO: Make this function more concise/readable (https://github.com/ZcashFoundation/zebra/pull/8616#discussion_r1643193949)
+fn get_default_properties(method_name: &str) -> Result<IndexMap<String, Property>, Box<dyn Error>> {
+    let type_ = "object";
     let items = None;
-    let mut props = HashMap::new();
+    let mut props = IndexMap::new();
 
-    let properties = match method_name {
-        "getinfo" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetInfo::default())?,
-                },
-            );
-            props
-        }
-        "getbestblockhash" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetBlockHash::default())?,
-                },
-            );
-            props
-        }
+    // TODO: An entry has to be added here manually for each new RPC method introduced, can we automate?
+    let default_result = match method_name {
+        // mining
+        // TODO: missing `getblocktemplate`. It's a complex method that requires a lot of parameters.
+        "getnetworkhashps" => default_property(type_, items.clone(), u64::default())?,
+        "getblocksubsidy" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::subsidy::BlockSubsidy::default(),
+        )?,
+        "getmininginfo" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::get_mining_info::Response::default(),
+        )?,
+        "getnetworksolps" => default_property(type_, items.clone(), u64::default())?,
+        "submitblock" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::submit_block::Response::default(),
+        )?,
+        // util
+        "validateaddress" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::validate_address::Response::default(),
+        )?,
+        "z_validateaddress" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::z_validate_address::Response::default(),
+        )?,
+        // address
+        "getaddressbalance" => default_property(type_, items.clone(), AddressBalance::default())?,
+        "getaddressutxos" => default_property(type_, items.clone(), GetAddressUtxos::default())?,
+        "getaddresstxids" => default_property(type_, items.clone(), Vec::<String>::default())?,
+        // network
+        "getpeerinfo" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::peer_info::PeerInfo::default(),
+        )?,
+        // blockchain
+        "getdifficulty" => default_property(type_, items.clone(), f64::default())?,
         "getblockchaininfo" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetBlockChainInfo::default())?,
-                },
-            );
-            props
+            default_property(type_, items.clone(), GetBlockChainInfo::default())?
         }
-        "getblock" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetBlock::default())?,
-                },
-            );
-            props
+        "getrawmempool" => default_property(type_, items.clone(), Vec::<String>::default())?,
+        "getblockhash" => default_property(type_, items.clone(), GetBlockHash::default())?,
+        "z_getsubtreesbyindex" => {
+            default_property(type_, items.clone(), trees::GetSubtrees::default())?
         }
-        "getblockhash" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetBlockHash::default())?,
-                },
-            );
-            props
+        "z_gettreestate" => default_property(type_, items.clone(), GetTreestate::default())?,
+        "getblockcount" => default_property(type_, items.clone(), u32::default())?,
+        "getbestblockhash" => default_property(type_, items.clone(), GetBlockHash::default())?,
+        "getblock" => default_property(type_, items.clone(), GetBlock::default())?,
+        // wallet
+        "z_listunifiedreceivers" => default_property(
+            type_,
+            items.clone(),
+            get_block_template_rpcs::types::unified_address::Response::default(),
+        )?,
+        // control
+        "getinfo" => default_property(type_, items.clone(), GetInfo::default())?,
+        "stop" => default_property(type_, items.clone(), ())?,
+        // transaction
+        "sendrawtransaction" => {
+            default_property(type_, items.clone(), SentTransactionHash::default())?
         }
-        "z_gettreestate" => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items,
-                    default: serde_json::to_string(&GetTreestate::default())?,
-                },
-            );
-            props
+        "getrawtransaction" => {
+            default_property(type_, items.clone(), GetRawTransaction::default())?
         }
-        _ => {
-            props.insert(
-                "result".to_string(),
-                Property {
-                    type_,
-                    items: None,
-                    default: "{}".to_string(),
-                },
-            );
-            props
-        }
+        // default
+        _ => Property {
+            type_: type_.to_string(),
+            items: None,
+            default: "{}".to_string(),
+        },
     };
-    Ok(properties)
+
+    props.insert("result".to_string(), default_result);
+    Ok(props)
 }

@@ -5,51 +5,16 @@ use std::{fmt, str::FromStr, sync::Arc};
 use thiserror::Error;
 
 use crate::{
-    block::{self, Height, HeightDiff},
+    block::{self, Height},
     parameters::NetworkUpgrade,
 };
 
 pub mod magic;
+pub mod subsidy;
 pub mod testnet;
 
 #[cfg(test)]
 mod tests;
-
-/// The ZIP-212 grace period length after the Canopy activation height.
-///
-/// # Consensus
-///
-/// ZIP-212 requires Zcash nodes to validate that Sapling spends and Orchard actions follows a
-/// specific plaintext format after Canopy's activation.
-///
-/// > [Heartwood onward] All Sapling and Orchard outputs in coinbase transactions MUST decrypt to a
-/// > note plaintext , i.e. the procedure in § 4.19.3 ‘Decryption using a Full Viewing Key (Sapling
-/// > and Orchard)’ on p. 67 does not return ⊥, using a sequence of 32 zero bytes as the outgoing
-/// > viewing key . (This implies that before Canopy activation, Sapling outputs of a coinbase
-/// > transaction MUST have note plaintext lead byte equal to 0x01.)
-///
-/// > [Canopy onward] Any Sapling or Orchard output of a coinbase transaction decrypted to a note
-/// > plaintext according to the preceding rule MUST have note plaintext lead byte equal to 0x02.
-/// > (This applies even during the “grace period” specified in [ZIP-212].)
-///
-/// <https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus>
-///
-/// Wallets have a grace period of 32,256 blocks after Canopy's activation to validate those blocks,
-/// but nodes do not.
-///
-/// > There is a "grace period" of 32256 blocks starting from the block at which this ZIP activates,
-/// > during which note plaintexts with lead byte 0x01 MUST still be accepted [by wallets].
-/// >
-/// > Let ActivationHeight be the activation height of this ZIP, and let GracePeriodEndHeight be
-/// > ActivationHeight + 32256.
-///
-/// <https://zips.z.cash/zip-0212#changes-to-the-process-of-receiving-sapling-or-orchard-notes>
-///
-/// Zebra uses `librustzcash` to validate that rule, but it won't validate it during the grace
-/// period. Therefore Zebra must validate those blocks during the grace period using checkpoints.
-/// Therefore the mandatory checkpoint height ([`Network::mandatory_checkpoint_height`]) must be
-/// after the grace period.
-const ZIP_212_GRACE_PERIOD_DURATION: HeightDiff = 32_256;
 
 /// An enum describing the kind of network, whether it's the production mainnet or a testnet.
 // Note: The order of these variants is important for correct bincode (de)serialization
@@ -76,7 +41,7 @@ impl From<Network> for NetworkKind {
 }
 
 /// An enum describing the possible network choices.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize)]
 #[serde(into = "NetworkKind")]
 pub enum Network {
     /// The production mainnet.
@@ -156,6 +121,22 @@ impl fmt::Display for Network {
     }
 }
 
+impl std::fmt::Debug for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mainnet => write!(f, "{self}"),
+            Self::Testnet(params) if params.is_regtest() => f
+                .debug_struct("Regtest")
+                .field("activation_heights", params.activation_heights())
+                .finish(),
+            Self::Testnet(params) if params.is_default_testnet() => {
+                write!(f, "{self}")
+            }
+            Self::Testnet(params) => f.debug_tuple("ConfiguredTestnet").field(params).finish(),
+        }
+    }
+}
+
 impl Network {
     /// Creates a new [`Network::Testnet`] with the default Testnet [`testnet::Parameters`].
     pub fn new_default_testnet() -> Self {
@@ -168,8 +149,14 @@ impl Network {
     }
 
     /// Creates a new [`Network::Testnet`] with `Regtest` parameters and the provided network upgrade activation heights.
-    pub fn new_regtest(nu5_activation_height: Option<u32>) -> Self {
-        Self::new_configured_testnet(testnet::Parameters::new_regtest(nu5_activation_height))
+    pub fn new_regtest(
+        nu5_activation_height: Option<u32>,
+        nu6_activation_height: Option<u32>,
+    ) -> Self {
+        Self::new_configured_testnet(testnet::Parameters::new_regtest(
+            nu5_activation_height,
+            nu6_activation_height,
+        ))
     }
 
     /// Returns true if the network is the default Testnet, or false otherwise.
@@ -234,34 +221,17 @@ impl Network {
     /// Mandatory checkpoints are a Zebra-specific feature.
     /// If a Zcash consensus rule only applies before the mandatory checkpoint,
     /// Zebra can skip validation of that rule.
-    ///
-    /// ZIP-212 grace period is only applied to default networks.
+    /// This is necessary because Zebra can't fully validate the blocks prior to Canopy.
     // TODO:
     // - Support constructing pre-Canopy coinbase tx and block templates and return `Height::MAX` instead of panicking
     //   when Canopy activation height is `None` (#8434)
-    // - Add semantic block validation during the ZIP-212 grace period and update this method to always apply the ZIP-212 grace period
     pub fn mandatory_checkpoint_height(&self) -> Height {
-        // Currently this is after the ZIP-212 grace period.
-        //
-        // See the `ZIP_212_GRACE_PERIOD_DURATION` documentation for more information.
-
-        let canopy_activation = NetworkUpgrade::Canopy
+        // Currently this is just before Canopy activation
+        NetworkUpgrade::Canopy
             .activation_height(self)
-            .expect("Canopy activation height must be present for both networks");
-
-        let is_a_default_network = match self {
-            Network::Mainnet => true,
-            Network::Testnet(params) => params.is_default_testnet(),
-        };
-
-        if is_a_default_network {
-            (canopy_activation + ZIP_212_GRACE_PERIOD_DURATION)
-                .expect("ZIP-212 grace period ends at a valid block height")
-        } else {
-            canopy_activation
-                .previous()
-                .expect("Canopy activation must be above Genesis height")
-        }
+            .expect("Canopy activation height must be present on all networks")
+            .previous()
+            .expect("Canopy activation height must be above min height")
     }
 
     /// Return the network name as defined in
@@ -281,6 +251,7 @@ impl Network {
     }
 
     /// Returns the Sapling activation height for this network.
+    // TODO: Return an `Option` here now that network upgrade activation heights are configurable on Regtest and custom Testnets
     pub fn sapling_activation_height(&self) -> Height {
         super::NetworkUpgrade::Sapling
             .activation_height(self)
@@ -304,68 +275,6 @@ impl FromStr for Network {
 #[derive(Clone, Debug, Error)]
 #[error("Invalid network: {0}")]
 pub struct InvalidNetworkError(String);
-
-impl zcash_primitives::consensus::Parameters for Network {
-    fn activation_height(
-        &self,
-        nu: zcash_primitives::consensus::NetworkUpgrade,
-    ) -> Option<zcash_primitives::consensus::BlockHeight> {
-        // Heights are hard-coded below Height::MAX or checked when the config is parsed.
-        NetworkUpgrade::from(nu)
-            .activation_height(self)
-            .map(|Height(h)| zcash_primitives::consensus::BlockHeight::from_u32(h))
-    }
-
-    fn coin_type(&self) -> u32 {
-        match self {
-            Network::Mainnet => zcash_primitives::constants::mainnet::COIN_TYPE,
-            // The regtest cointype reuses the testnet cointype,
-            // See <https://github.com/satoshilabs/slips/blob/master/slip-0044.md>
-            Network::Testnet(_) => zcash_primitives::constants::testnet::COIN_TYPE,
-        }
-    }
-
-    fn address_network(&self) -> Option<zcash_address::Network> {
-        match self {
-            Network::Mainnet => Some(zcash_address::Network::Main),
-            // TODO: Check if network is `Regtest` first, and if it is, return `zcash_address::Network::Regtest`
-            Network::Testnet(_params) => Some(zcash_address::Network::Test),
-        }
-    }
-
-    fn hrp_sapling_extended_spending_key(&self) -> &str {
-        match self {
-            Network::Mainnet => {
-                zcash_primitives::constants::mainnet::HRP_SAPLING_EXTENDED_SPENDING_KEY
-            }
-            Network::Testnet(params) => params.hrp_sapling_extended_spending_key(),
-        }
-    }
-
-    fn hrp_sapling_extended_full_viewing_key(&self) -> &str {
-        match self {
-            Network::Mainnet => {
-                zcash_primitives::constants::mainnet::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY
-            }
-            Network::Testnet(params) => params.hrp_sapling_extended_full_viewing_key(),
-        }
-    }
-
-    fn hrp_sapling_payment_address(&self) -> &str {
-        match self {
-            Network::Mainnet => zcash_primitives::constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
-            Network::Testnet(params) => params.hrp_sapling_payment_address(),
-        }
-    }
-
-    fn b58_pubkey_address_prefix(&self) -> [u8; 2] {
-        self.kind().b58_pubkey_address_prefix()
-    }
-
-    fn b58_script_address_prefix(&self) -> [u8; 2] {
-        self.kind().b58_script_address_prefix()
-    }
-}
 
 impl zcash_protocol::consensus::Parameters for Network {
     fn network_type(&self) -> zcash_address::Network {

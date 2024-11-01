@@ -613,6 +613,7 @@ where
     /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the Sprout `joinsplit_data` shielded data in the transaction
     /// - the `sapling_shielded_data` in the transaction
+    #[allow(clippy::unwrap_in_result)]
     fn verify_v4_transaction(
         request: &Request,
         network: &Network,
@@ -627,7 +628,9 @@ where
         Self::verify_v4_transaction_network_upgrade(&tx, upgrade)?;
 
         let shielded_sighash = tx.sighash(
-            upgrade,
+            upgrade
+                .branch_id()
+                .expect("Overwinter-onwards must have branch ID, and we checkpoint on Canopy"),
             HashType::ALL,
             cached_ffi_transaction.all_previous_outputs(),
             None,
@@ -674,7 +677,8 @@ where
             | NetworkUpgrade::Blossom
             | NetworkUpgrade::Heartwood
             | NetworkUpgrade::Canopy
-            | NetworkUpgrade::Nu5 => Ok(()),
+            | NetworkUpgrade::Nu5
+            | NetworkUpgrade::Nu6 => Ok(()),
 
             // Does not support V4 transactions
             NetworkUpgrade::Genesis
@@ -705,6 +709,7 @@ where
     /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the sapling shielded data of the transaction, if any
     /// - the orchard shielded data of the transaction, if any
+    #[allow(clippy::unwrap_in_result)]
     fn verify_v5_transaction(
         request: &Request,
         network: &Network,
@@ -719,7 +724,9 @@ where
         Self::verify_v5_transaction_network_upgrade(&transaction, upgrade)?;
 
         let shielded_sighash = transaction.sighash(
-            upgrade,
+            upgrade
+                .branch_id()
+                .expect("Overwinter-onwards must have branch ID, and we checkpoint on Canopy"),
             HashType::ALL,
             cached_ffi_transaction.all_previous_outputs(),
             None,
@@ -759,7 +766,7 @@ where
             //
             // Note: Here we verify the transaction version number of the above rule, the group
             // id is checked in zebra-chain crate, in the transaction serialize.
-            NetworkUpgrade::Nu5 => Ok(()),
+            NetworkUpgrade::Nu5 | NetworkUpgrade::Nu6 => Ok(()),
 
             // Does not support V5 transactions
             NetworkUpgrade::Genesis

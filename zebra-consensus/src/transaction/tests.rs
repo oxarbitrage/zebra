@@ -1429,7 +1429,12 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
         };
 
         // Sign the transaction
-        let sighash = transaction.sighash(network_upgrade, HashType::ALL, &[], None);
+        let sighash = transaction.sighash(
+            network_upgrade.branch_id().expect("must have branch ID"),
+            HashType::ALL,
+            &[],
+            None,
+        );
 
         match &mut transaction {
             Transaction::V4 {
@@ -1500,7 +1505,12 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
         };
 
         // Sign the transaction
-        let sighash = transaction.sighash(network_upgrade, HashType::ALL, &[], None);
+        let sighash = transaction.sighash(
+            network_upgrade.branch_id().expect("must have branch ID"),
+            HashType::ALL,
+            &[],
+            None,
+        );
 
         match &mut transaction {
             Transaction::V4 {
@@ -2935,7 +2945,7 @@ async fn mempool_zip317_error() {
         fund_height,
         true,
         0,
-        Amount::try_from(10).expect("invalid value"),
+        Amount::try_from(10).expect("valid amount"),
     );
 
     // Create a non-coinbase V5 tx.
@@ -2988,7 +2998,7 @@ async fn mempool_zip317_error() {
     assert!(verifier_response.is_err());
     assert_eq!(
         verifier_response.err(),
-        Some(TransactionError::Zip317(zip317::Error::FeeBelowMinimumRate))
+        Some(TransactionError::Zip317(zip317::Error::UnpaidActions))
     );
 }
 
@@ -3007,7 +3017,7 @@ async fn mempool_zip317_ok() {
         fund_height,
         true,
         0,
-        Amount::try_from(10001).expect("invalid value"),
+        Amount::try_from(10_001).expect("valid amount"),
     );
 
     // Create a non-coinbase V5 tx.

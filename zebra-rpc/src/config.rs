@@ -1,8 +1,10 @@
 //! User-configurable RPC settings.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use zebra_chain::common::default_cache_dir;
 
 pub mod mining;
 
@@ -30,6 +32,22 @@ pub struct Config {
     /// They can also query your node's state.
     pub listen_addr: Option<SocketAddr>,
 
+    /// IP address and port for the indexer RPC server.
+    ///
+    /// Note: The indexer RPC server is disabled by default.
+    /// To enable the indexer RPC server, compile `zebrad` with the
+    /// `indexer` feature flag and set a listen address in the config:
+    /// ```toml
+    /// [rpc]
+    /// indexer_listen_addr = '127.0.0.1:8230'
+    /// ```
+    ///
+    /// # Security
+    ///
+    /// If you bind Zebra's indexer RPC port to a public IP address,
+    /// anyone on the internet can query your node's state.
+    pub indexer_listen_addr: Option<SocketAddr>,
+
     /// The number of threads used to process RPC requests and responses.
     ///
     /// Zebra's RPC server has a separate thread pool and a `tokio` executor for each thread.
@@ -55,6 +73,12 @@ pub struct Config {
     /// Test-only option that makes Zebra say it is at the chain tip,
     /// no matter what the estimated height or local clock is.
     pub debug_force_finished_sync: bool,
+
+    /// The directory where Zebra stores RPC cookies.
+    pub cookie_dir: PathBuf,
+
+    /// Enable cookie-based authentication for RPCs.
+    pub enable_cookie_auth: bool,
 }
 
 // This impl isn't derivable because it depends on features.
@@ -64,6 +88,9 @@ impl Default for Config {
         Self {
             // Disable RPCs by default.
             listen_addr: None,
+
+            // Disable indexer RPCs by default.
+            indexer_listen_addr: None,
 
             // Use a single thread, so we can detect RPC port conflicts.
             #[cfg(not(feature = "getblocktemplate-rpcs"))]
@@ -75,6 +102,12 @@ impl Default for Config {
 
             // Debug options are always off by default.
             debug_force_finished_sync: false,
+
+            // Use the default cache dir for the auth cookie.
+            cookie_dir: default_cache_dir(),
+
+            // Enable cookie-based authentication by default.
+            enable_cookie_auth: true,
         }
     }
 }

@@ -2,29 +2,38 @@
 //!
 //! These fixes are applied at the HTTP level, before the RPC request is parsed.
 
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use futures::TryStreamExt;
-use hyper::{body::Bytes, Body};
+use jsonrpc_http_server::{
+    hyper::{body::Bytes, header, Body, Request},
+    RequestMiddleware, RequestMiddlewareAction,
+};
 
-use jsonrpc_http_server::RequestMiddleware;
+use super::cookie::Cookie;
 
 /// HTTP [`RequestMiddleware`] with compatibility workarounds.
 ///
 /// This middleware makes the following changes to HTTP requests:
 ///
-/// ## Remove `jsonrpc` field in JSON RPC 1.0
+/// ### Remove `jsonrpc` field in JSON RPC 1.0
 ///
 /// Removes "jsonrpc: 1.0" fields from requests,
 /// because the "jsonrpc" field was only added in JSON-RPC 2.0.
 ///
 /// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
 ///
-/// ## Add missing `content-type` HTTP header
+/// ### Add missing `content-type` HTTP header
 ///
 /// Some RPC clients don't include a `content-type` HTTP header.
 /// But unlike web browsers, [`jsonrpc_http_server`] does not do content sniffing.
 ///
 /// If there is no `content-type` header, we assume the content is JSON,
 /// and let the parser error if we are incorrect.
+///
+/// ### Authenticate incoming requests
+///
+/// If the cookie-based RPC authentication is enabled, check that the incoming request contains the
+/// authentication cookie.
 ///
 /// This enables compatibility with `zcash-cli`.
 ///
@@ -33,18 +42,47 @@ use jsonrpc_http_server::RequestMiddleware;
 /// Any user-specified data in RPC requests is hex or base58check encoded.
 /// We assume lightwalletd validates data encodings before sending it on to Zebra.
 /// So any fixes Zebra performs won't change user-specified data.
-#[derive(Copy, Clone, Debug)]
-pub struct FixHttpRequestMiddleware;
+#[derive(Clone, Debug, Default)]
+pub struct HttpRequestMiddleware {
+    cookie: Option<Cookie>,
+}
 
-impl RequestMiddleware for FixHttpRequestMiddleware {
-    fn on_request(
-        &self,
-        mut request: hyper::Request<hyper::Body>,
-    ) -> jsonrpc_http_server::RequestMiddlewareAction {
+/// A trait for updating an object, consuming it and returning the updated version.
+pub trait With<T> {
+    /// Updates `self` with an instance of type `T` and returns the updated version of `self`.
+    fn with(self, _: T) -> Self;
+}
+
+impl With<Cookie> for HttpRequestMiddleware {
+    fn with(mut self, cookie: Cookie) -> Self {
+        self.cookie = Some(cookie);
+        self
+    }
+}
+
+impl RequestMiddleware for HttpRequestMiddleware {
+    fn on_request(&self, mut request: Request<Body>) -> RequestMiddlewareAction {
         tracing::trace!(?request, "original HTTP request");
 
+        // Check if the request is authenticated
+        if !self.check_credentials(request.headers_mut()) {
+            let error = jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(401),
+                message: "unauthenticated method".to_string(),
+                data: None,
+            };
+            return jsonrpc_http_server::Response {
+                code: jsonrpc_http_server::hyper::StatusCode::from_u16(401)
+                    .expect("hard-coded status code should be valid"),
+                content_type: header::HeaderValue::from_static("application/json; charset=utf-8"),
+                content: serde_json::to_string(&jsonrpc_core::Response::from(error, None))
+                    .expect("hard-coded result should serialize"),
+            }
+            .into();
+        }
+
         // Fix the request headers if needed and we can do so.
-        FixHttpRequestMiddleware::insert_or_replace_content_type_header(request.headers_mut());
+        HttpRequestMiddleware::insert_or_replace_content_type_header(request.headers_mut());
 
         // Fix the request body
         let request = request.map(|body| {
@@ -74,7 +112,7 @@ impl RequestMiddleware for FixHttpRequestMiddleware {
 
         tracing::trace!(?request, "modified HTTP request");
 
-        jsonrpc_http_server::RequestMiddlewareAction::Proceed {
+        RequestMiddlewareAction::Proceed {
             // TODO: disable this security check if we see errors from lightwalletd.
             should_continue_on_invalid_cors: false,
             request,
@@ -82,7 +120,7 @@ impl RequestMiddleware for FixHttpRequestMiddleware {
     }
 }
 
-impl FixHttpRequestMiddleware {
+impl HttpRequestMiddleware {
     /// Remove any "jsonrpc: 1.0" fields in `data`, and return the resulting string.
     pub fn remove_json_1_fields(data: String) -> String {
         // Replace "jsonrpc = 1.0":
@@ -118,16 +156,16 @@ impl FixHttpRequestMiddleware {
     /// # Security
     ///
     /// - `content-type` headers exist so that applications know they are speaking the correct protocol with the correct format.
-    /// We can be a bit flexible, but there are some types (such as binary) we shouldn't allow.
-    /// In particular, the "application/x-www-form-urlencoded" header should be rejected, so browser forms can't be used to attack
-    /// a local RPC port. See "The Role of Routers in the CSRF Attack" in
-    /// <https://www.invicti.com/blog/web-security/importance-content-type-header-http-requests/>
+    ///   We can be a bit flexible, but there are some types (such as binary) we shouldn't allow.
+    ///   In particular, the "application/x-www-form-urlencoded" header should be rejected, so browser forms can't be used to attack
+    ///   a local RPC port. See "The Role of Routers in the CSRF Attack" in
+    ///   <https://www.invicti.com/blog/web-security/importance-content-type-header-http-requests/>
     /// - Checking all the headers is secure, but only because hyper has custom code that just reads the first content-type header.
-    /// <https://github.com/hyperium/headers/blob/f01cc90cf8d601a716856bc9d29f47df92b779e4/src/common/content_type.rs#L102-L108>
-    pub fn insert_or_replace_content_type_header(headers: &mut hyper::header::HeaderMap) {
-        if !headers.contains_key(hyper::header::CONTENT_TYPE)
+    ///   <https://github.com/hyperium/headers/blob/f01cc90cf8d601a716856bc9d29f47df92b779e4/src/common/content_type.rs#L102-L108>
+    pub fn insert_or_replace_content_type_header(headers: &mut header::HeaderMap) {
+        if !headers.contains_key(header::CONTENT_TYPE)
             || headers
-                .get(hyper::header::CONTENT_TYPE)
+                .get(header::CONTENT_TYPE)
                 .filter(|value| {
                     value
                         .to_str()
@@ -138,9 +176,23 @@ impl FixHttpRequestMiddleware {
                 .is_some()
         {
             headers.insert(
-                hyper::header::CONTENT_TYPE,
-                hyper::header::HeaderValue::from_static("application/json"),
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
             );
         }
+    }
+
+    /// Check if the request is authenticated.
+    pub fn check_credentials(&self, headers: &header::HeaderMap) -> bool {
+        self.cookie.as_ref().map_or(true, |internal_cookie| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|auth_header| auth_header.to_str().ok())
+                .and_then(|auth_header| auth_header.split_whitespace().nth(1))
+                .and_then(|encoded| URL_SAFE.decode(encoded).ok())
+                .and_then(|decoded| String::from_utf8(decoded).ok())
+                .and_then(|request_cookie| request_cookie.split(':').nth(1).map(String::from))
+                .map_or(false, |passwd| internal_cookie.authenticate(passwd))
+        })
     }
 }

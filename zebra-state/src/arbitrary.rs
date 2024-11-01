@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed},
+    amount::Amount,
     block::{self, Block},
     transaction::Transaction,
     transparent,
@@ -11,7 +11,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    request::ContextuallyVerifiedBlock, service::chain_tip::ChainTipBlock, CheckpointVerifiedBlock,
+    request::ContextuallyVerifiedBlock, service::chain_tip::ChainTipBlock,
     SemanticallyVerifiedBlock,
 };
 
@@ -37,6 +37,7 @@ impl Prepare for Arc<Block> {
             height,
             new_outputs,
             transaction_hashes,
+            deferred_balance: None,
         }
     }
 }
@@ -50,27 +51,6 @@ where
     }
 }
 
-impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
-    fn from(prepared: SemanticallyVerifiedBlock) -> Self {
-        let SemanticallyVerifiedBlock {
-            block,
-            hash,
-            height,
-            new_outputs: _,
-            transaction_hashes,
-        } = prepared;
-
-        Self {
-            hash,
-            height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
-            transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
-        }
-    }
-}
-
 impl SemanticallyVerifiedBlock {
     /// Returns a [`ContextuallyVerifiedBlock`] created from this block,
     /// with fake zero-valued spent UTXOs.
@@ -79,18 +59,6 @@ impl SemanticallyVerifiedBlock {
     #[cfg(test)]
     pub fn test_with_zero_spent_utxos(&self) -> ContextuallyVerifiedBlock {
         ContextuallyVerifiedBlock::test_with_zero_spent_utxos(self)
-    }
-
-    /// Returns a [`ContextuallyVerifiedBlock`] created from this block,
-    /// using a fake chain value pool change.
-    ///
-    /// Only for use in tests.
-    #[cfg(test)]
-    pub fn test_with_chain_pool_change(
-        &self,
-        fake_chain_value_pool_change: ValueBalance<NegativeAllowed>,
-    ) -> ContextuallyVerifiedBlock {
-        ContextuallyVerifiedBlock::test_with_chain_pool_change(self, fake_chain_value_pool_change)
     }
 
     /// Returns a [`ContextuallyVerifiedBlock`] created from this block,
@@ -133,19 +101,17 @@ impl ContextuallyVerifiedBlock {
     }
 
     /// Create a [`ContextuallyVerifiedBlock`] from a [`Block`] or [`SemanticallyVerifiedBlock`],
-    /// using a fake chain value pool change.
+    /// with no chain value pool change.
     ///
     /// Only for use in tests.
-    pub fn test_with_chain_pool_change(
-        block: impl Into<SemanticallyVerifiedBlock>,
-        fake_chain_value_pool_change: ValueBalance<NegativeAllowed>,
-    ) -> Self {
+    pub fn test_with_zero_chain_pool_change(block: impl Into<SemanticallyVerifiedBlock>) -> Self {
         let SemanticallyVerifiedBlock {
             block,
             hash,
             height,
             new_outputs,
             transaction_hashes,
+            deferred_balance: _,
         } = block.into();
 
         Self {
@@ -158,40 +124,7 @@ impl ContextuallyVerifiedBlock {
             // TODO: fix the tests, and stop adding unrelated inputs and outputs.
             spent_outputs: new_outputs,
             transaction_hashes,
-            chain_value_pool_change: fake_chain_value_pool_change,
+            chain_value_pool_change: ValueBalance::zero(),
         }
-    }
-
-    /// Create a [`ContextuallyVerifiedBlock`] from a [`Block`] or [`SemanticallyVerifiedBlock`],
-    /// with no chain value pool change.
-    ///
-    /// Only for use in tests.
-    pub fn test_with_zero_chain_pool_change(block: impl Into<SemanticallyVerifiedBlock>) -> Self {
-        Self::test_with_chain_pool_change(block, ValueBalance::zero())
-    }
-}
-
-impl CheckpointVerifiedBlock {
-    /// Create a block that's ready to be committed to the finalized state,
-    /// using a precalculated [`block::Hash`] and [`block::Height`].
-    ///
-    /// This is a test-only method, prefer [`CheckpointVerifiedBlock::with_hash`].
-    #[cfg(any(test, feature = "proptest-impl"))]
-    pub fn with_hash_and_height(
-        block: Arc<Block>,
-        hash: block::Hash,
-        height: block::Height,
-    ) -> Self {
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let new_outputs =
-            transparent::new_ordered_outputs_with_height(&block, height, &transaction_hashes);
-
-        Self(SemanticallyVerifiedBlock {
-            block,
-            hash,
-            height,
-            new_outputs,
-            transaction_hashes,
-        })
     }
 }

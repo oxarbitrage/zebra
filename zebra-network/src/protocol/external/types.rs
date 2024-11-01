@@ -72,19 +72,30 @@ impl Version {
 
     /// Returns the minimum specified network protocol version for `network` and
     /// `network_upgrade`.
+    ///
+    /// ## ZIP-253
+    ///
+    /// > Nodes compatible with a network upgrade activation MUST advertise a network protocol
+    /// > version that is greater than or equal to the MIN_NETWORK_PROTOCOL_VERSION for that
+    /// > activation.
+    ///
+    /// <https://zips.z.cash/zip-0253>
+    ///
+    /// ### Notes
+    ///
+    /// - The citation above is a generalization of a statement in ZIP-253 since that ZIP is
+    ///   concerned only with NU6 on Mainnet and Testnet.
     pub(crate) fn min_specified_for_upgrade(
         network: &Network,
         network_upgrade: NetworkUpgrade,
     ) -> Version {
-        // TODO: Should we reject earlier protocol versions during our initial
-        //       sync? zcashd accepts 170_002 or later during its initial sync.
         Version(match (network, network_upgrade) {
             (_, Genesis) | (_, BeforeOverwinter) => 170_002,
             (Testnet(params), Overwinter) if params.is_default_testnet() => 170_003,
             (Mainnet, Overwinter) => 170_005,
-            // TODO: Use 170_006 for (Testnet(params), Sapling) if params.is_regtest() (`Regtest` in zcashd uses
-            //       version 170_006 for Sapling, and the same values as Testnet for other network upgrades.)
-            (_, Sapling) => 170_007,
+            (Testnet(params), Sapling) if params.is_default_testnet() => 170_007,
+            (Testnet(params), Sapling) if params.is_regtest() => 170_006,
+            (Mainnet, Sapling) => 170_007,
             (Testnet(params), Blossom) if params.is_default_testnet() => 170_008,
             (Mainnet, Blossom) => 170_009,
             (Testnet(params), Heartwood) if params.is_default_testnet() => 170_010,
@@ -93,9 +104,11 @@ impl Version {
             (Mainnet, Canopy) => 170_013,
             (Testnet(params), Nu5) if params.is_default_testnet() => 170_050,
             (Mainnet, Nu5) => 170_100,
+            (Testnet(params), Nu6) if params.is_default_testnet() => 170_110,
+            (Mainnet, Nu6) => 170_120,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
-            (Testnet(_params), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
+            (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
         })
     }
 }
@@ -192,7 +205,7 @@ mod test {
         let _init_guard = zebra_test::init();
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
-        assert!(highest_network_upgrade == Nu5 || highest_network_upgrade == Canopy,
+        assert!(highest_network_upgrade == Nu6 || highest_network_upgrade == Nu5,
                 "expected coverage of all network upgrades: add the new network upgrade to the list in this test");
 
         for &network_upgrade in &[
@@ -203,6 +216,7 @@ mod test {
             Heartwood,
             Canopy,
             Nu5,
+            Nu6,
         ] {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {

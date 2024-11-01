@@ -46,8 +46,10 @@ pub use request::{
 };
 pub use response::{KnownBlock, MinedTx, ReadResponse, Response};
 pub use service::{
-    chain_tip::{ChainTipChange, LatestChainTip, TipAction},
-    check, init, spawn_init,
+    chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
+    check, init, init_read_only,
+    non_finalized_state::NonFinalizedState,
+    spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
     OutputIndex, OutputLocation, TransactionIndex, TransactionLocation,
 };
@@ -61,13 +63,11 @@ pub use service::finalized_state::{
 
 // Allow use in the scanner and external tests
 #[cfg(any(test, feature = "proptest-impl", feature = "shielded-scan"))]
-pub use service::{
-    finalized_state::{
-        DiskWriteBatch, FromDisk, IntoDisk, ReadDisk, TypedColumnFamily, WriteDisk,
-        WriteTypedBatch, ZebraDb,
-    },
-    ReadStateService,
+pub use service::finalized_state::{
+    DiskWriteBatch, FromDisk, IntoDisk, ReadDisk, TypedColumnFamily, WriteDisk, WriteTypedBatch,
 };
+
+pub use service::{finalized_state::ZebraDb, ReadStateService};
 
 #[cfg(feature = "getblocktemplate-rpcs")]
 pub use response::GetBlockTemplateChainInfo;
@@ -76,7 +76,6 @@ pub use response::GetBlockTemplateChainInfo;
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{
     arbitrary::{populated_state, CHAIN_TIP_UPDATE_WAIT_LIMIT},
-    chain_tip::{ChainTipBlock, ChainTipSender},
     finalized_state::{RawBytes, KV, MAX_ON_DISK_HEIGHT},
     init_test, init_test_services,
 };
@@ -96,4 +95,4 @@ pub(crate) use config::hidden::{
     write_database_format_version_to_disk, write_state_database_format_version_to_disk,
 };
 
-pub(crate) use request::ContextuallyVerifiedBlock;
+pub use request::ContextuallyVerifiedBlock;
