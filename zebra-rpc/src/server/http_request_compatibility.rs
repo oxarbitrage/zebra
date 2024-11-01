@@ -60,6 +60,83 @@ impl With<Cookie> for HttpRequestMiddleware {
     }
 }
 
+impl HttpRequestMiddleware {
+    /// Handle incoming JSON-RPC requests
+    pub async fn handle_request(
+        &self,
+        request: crate::server::JsonRpcRequest,
+        headers: warp::http::HeaderMap,
+        mut grpc_client: crate::server::EndpointClient<tonic::transport::Channel>,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        tracing::trace!(?request, "original HTTP request");
+
+        // Check if the request is authenticated
+        if !self.check_credentials(&headers) {
+            let error = crate::server::JsonRpcError {
+                code: 401,
+                message: "unauthenticated method".to_string(),
+            };
+
+            let response = crate::server::JsonRpcResponse {
+                id: request.id,
+                result: serde_json::to_value(error).unwrap(),
+            };
+
+            return Ok(warp::reply::json(&response));
+        }
+
+        // Match the JSON-RPC `method` field to call the appropriate gRPC method
+        if request.method == "getinfo" {
+            let grpc_request = crate::server::Request::new(crate::server::Empty {});
+            let result = match grpc_client.get_info(grpc_request).await {
+                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
+                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
+            };
+            let response = crate::server::JsonRpcResponse {
+                id: request.id.clone(),
+                result,
+            };
+            Ok(warp::reply::json(&response))
+        } else if request.method == "getblockchaininfo" {
+            let grpc_request = crate::server::Request::new(crate::server::Empty {});
+            let result = match grpc_client.get_blockchain_info(grpc_request).await {
+                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
+                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
+            };
+            let response = crate::server::JsonRpcResponse {
+                id: request.id.clone(),
+                result,
+            };
+            Ok(warp::reply::json(&response))
+        } else if request.method == "getaddressbalance" {
+            // todo: fix the panics
+            let address_params: Result<crate::server::AddressStrings, _> =
+                serde_json::from_value(request.params[0].clone());
+
+            let result = match grpc_client
+                .get_address_balance(address_params.unwrap())
+                .await
+            {
+                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
+                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
+            };
+
+            let response = crate::server::JsonRpcResponse {
+                id: request.id.clone(),
+                result,
+            };
+
+            Ok(warp::reply::json(&response))
+        } else {
+            let response = crate::server::JsonRpcResponse {
+                id: request.id,
+                result: serde_json::to_value("unsupported method").unwrap(),
+            };
+            Ok(warp::reply::json(&response))
+        }
+    }
+}
+
 impl RequestMiddleware for HttpRequestMiddleware {
     fn on_request(&self, mut request: Request<Body>) -> RequestMiddlewareAction {
         tracing::trace!(?request, "original HTTP request");

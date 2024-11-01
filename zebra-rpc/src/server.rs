@@ -17,6 +17,12 @@ use tokio::task::JoinHandle;
 use tower::Service;
 use tracing::*;
 
+use tonic::{
+    transport::{Channel, Server, Uri},
+    Request,
+};
+use warp::Filter;
+
 use zebra_chain::{
     block, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, parameters::Network,
 };
@@ -25,8 +31,9 @@ use zebra_node_services::mempool;
 
 use crate::{
     config::Config,
-    methods::{Rpc, RpcImpl},
+    methods::{GrpcImpl, Rpc, RpcImpl},
     server::{
+        endpoint_client::EndpointClient, endpoint_server::EndpointServer,
         http_request_compatibility::HttpRequestMiddleware,
         rpc_call_compatibility::FixRpcResponseMiddleware,
     },
@@ -41,6 +48,13 @@ pub mod rpc_call_compatibility;
 
 #[cfg(test)]
 mod tests;
+
+// The generated endpoint proto
+tonic::include_proto!("zebra.endpoint.rpc");
+
+/// The file descriptor set for the generated endpoint proto
+pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
+    tonic::include_file_descriptor_set!("endpoint_descriptor");
 
 /// Zebra RPC Server
 #[derive(Clone)]
@@ -150,6 +164,11 @@ impl RpcServer {
         AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
     {
         if let Some(listen_addr) = config.listen_addr {
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+                .build_v1()
+                .unwrap();
+
             info!("Trying to open RPC endpoint at {}...", listen_addr,);
 
             // Create handler compatible with V1 and V2 RPC protocols
@@ -173,19 +192,21 @@ impl RpcServer {
                 io.extend_with(get_block_template_rpc_impl.to_delegate());
             }
 
+            let network2 = network.clone();
+
             // Initialize the rpc methods with the zebra version
             let (rpc_impl, rpc_tx_queue_task_handle) = RpcImpl::new(
                 build_version.clone(),
-                user_agent,
+                user_agent.clone(),
                 network.clone(),
                 config.debug_force_finished_sync,
                 #[cfg(feature = "getblocktemplate-rpcs")]
                 mining_config.debug_like_zcashd,
                 #[cfg(not(feature = "getblocktemplate-rpcs"))]
                 true,
-                mempool,
-                state,
-                latest_chain_tip,
+                mempool.clone(),
+                state.clone(),
+                latest_chain_tip.clone(),
             );
 
             io.extend_with(rpc_impl.to_delegate());
@@ -195,6 +216,11 @@ impl RpcServer {
             if parallel_cpu_threads == 0 {
                 parallel_cpu_threads = available_parallelism().map(usize::from).unwrap_or(1);
             }
+
+            // Clone the build version for the server instance
+            let build_version2 = build_version.clone();
+            let config2 = config.clone();
+            let config3 = config.clone();
 
             // The server is a blocking task, which blocks on executor shutdown.
             // So we need to start it in a std::thread.
@@ -226,10 +252,10 @@ impl RpcServer {
                     let close_handle = server_instance.close_handle();
 
                     let rpc_server_handle = RpcServer {
-                        config,
-                        network,
-                        build_version: build_version.to_string(),
-                        close_handle,
+                        config: config.clone(),
+                        network: network.clone(),
+                        build_version: build_version2.to_string(),
+                        close_handle: close_handle.clone(),
                     };
 
                     (server_instance, rpc_server_handle)
@@ -242,6 +268,73 @@ impl RpcServer {
                 Ok(rpc_server) => rpc_server,
                 Err(panic_object) => panic::resume_unwind(panic_object),
             };
+
+            // `grpc_server_listen_addr` should came from the config
+            let grpc_server_listen_addr = "127.0.0.1:8080".parse().unwrap();
+            let grpc_server_url: Uri = format!("http://{}", grpc_server_listen_addr)
+                .parse()
+                .unwrap();
+
+            // Start the gRPC server
+            let _: JoinHandle<Result<(), tower::BoxError>> = tokio::spawn(async move {
+                let (grpc, _rpc_tx_queue_task_handle2) = GrpcImpl::new(
+                    build_version.clone(),
+                    user_agent.clone(),
+                    network2,
+                    config2.debug_force_finished_sync,
+                    #[cfg(feature = "getblocktemplate-rpcs")]
+                    mining_config.debug_like_zcashd,
+                    #[cfg(not(feature = "getblocktemplate-rpcs"))]
+                    true,
+                    mempool,
+                    state,
+                    latest_chain_tip,
+                );
+
+                Server::builder()
+                    .accept_http1(true)
+                    .add_service(reflection_service)
+                    .add_service(EndpointServer::new(grpc))
+                    .serve(grpc_server_listen_addr)
+                    .await?;
+                Ok(())
+            });
+
+            // Create the middleware for the HTTP request
+            let middleware = if config3.enable_cookie_auth {
+                let cookie = Cookie::default();
+                cookie::write_to_disk(&cookie, &config3.cookie_dir)
+                    .expect("Zebra must be able to write the auth cookie to the disk");
+                HttpRequestMiddleware::default().with(cookie)
+            } else {
+                HttpRequestMiddleware::default()
+            };
+
+            // Create the warp proxy server
+            let _: JoinHandle<Result<(), tower::BoxError>> = tokio::spawn(async move {
+                let grpc_channel = Channel::builder(grpc_server_url).connect().await?;
+
+                let grpc_client = EndpointClient::new(grpc_channel);
+                let middleware = std::sync::Arc::new(middleware);
+
+                let proxy = warp::post()
+                    .and(warp::path::end())
+                    .and(warp::body::json())
+                    .and(warp::header::headers_cloned())
+                    .and(with_grpc_client(grpc_client)) // Pass the Arc directly
+                    .and_then(move |request, headers, grpc_client| {
+                        let middleware = std::sync::Arc::clone(&middleware);
+                        async move {
+                            middleware
+                                .handle_request(request, headers, grpc_client)
+                                .await
+                        }
+                    });
+
+                warp::serve(proxy).run(([127, 0, 0, 1], 8081)).await;
+
+                Ok(())
+            });
 
             // The server is a blocking task, which blocks on executor shutdown.
             // So we need to wait on it on a std::thread, inside a tokio blocking task.
@@ -344,4 +437,34 @@ impl Drop for RpcServer {
         // Without this shutdown, Zebra's RPC unit tests sometimes crashed with memory errors.
         self.shutdown_blocking();
     }
+}
+
+// Define JSON-RPC request and response structures
+#[derive(Debug, serde::Deserialize)]
+pub struct JsonRpcRequest {
+    jsonrpc: String,
+    id: String,
+    method: String,
+    params: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
+pub struct JsonRpcResponse {
+    //jsonrpc: String,
+    result: serde_json::Value,
+    id: String,
+    //error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+// Warp Filter to pass the gRPC client
+fn with_grpc_client(
+    grpc_client: EndpointClient<Channel>,
+) -> impl Filter<Extract = (EndpointClient<Channel>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || grpc_client.clone())
 }

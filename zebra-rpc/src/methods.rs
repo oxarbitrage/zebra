@@ -1547,6 +1547,12 @@ enum NetworkUpgradeStatus {
     Pending,
 }
 
+impl std::fmt::Display for NetworkUpgradeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// The [`ConsensusBranchId`]s for the tip and the next block.
 ///
 /// These branch IDs are different when the next block is a network upgrade activation block.
@@ -1881,5 +1887,383 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
         };
 
         Ok(Height(sanitized_height))
+    }
+}
+
+/// Represent an empty argument for RPC methods that don't require any arguments.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Default)]
+pub struct Empty;
+
+use tonic::{Response, Status};
+
+/// gRPC method implementations.
+#[derive(Clone)]
+pub struct GrpcImpl<Mempool, State, Tip>
+where
+    Mempool: Service<
+            mempool::Request,
+            Response = mempool::Response,
+            Error = zebra_node_services::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    Mempool::Future: Send,
+    State: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    State::Future: Send,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    // Configuration
+    //
+    /// Zebra's application version, with build metadata.
+    build_version: String,
+
+    /// Zebra's RPC user agent.
+    user_agent: String,
+
+    /// The configured network for this RPC service.
+    network: Network,
+
+    /// Test-only option that makes Zebra say it is at the chain tip,
+    /// no matter what the estimated height or local clock is.
+    debug_force_finished_sync: bool,
+
+    /// Test-only option that makes RPC responses more like `zcashd`.
+    #[allow(dead_code)]
+    debug_like_zcashd: bool,
+
+    // Services
+    //
+    /// A handle to the mempool service.
+    mempool: Mempool,
+
+    /// A handle to the state service.
+    state: State,
+
+    /// Allows efficient access to the best tip of the blockchain.
+    latest_chain_tip: Tip,
+
+    // Tasks
+    //
+    /// A sender component of a channel used to send transactions to the mempool queue.
+    queue_sender: broadcast::Sender<UnminedTx>,
+}
+
+impl<Mempool, State, Tip> GrpcImpl<Mempool, State, Tip>
+where
+    Mempool: Service<
+            mempool::Request,
+            Response = mempool::Response,
+            Error = zebra_node_services::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    Mempool::Future: Send,
+    State: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    State::Future: Send,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    /// Create a new instance of the RPC handler.
+    //
+    // TODO:
+    // - put some of the configs or services in their own struct?
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<VersionString, UserAgentString>(
+        build_version: VersionString,
+        user_agent: UserAgentString,
+        network: Network,
+        debug_force_finished_sync: bool,
+        debug_like_zcashd: bool,
+        mempool: Mempool,
+        state: State,
+        latest_chain_tip: Tip,
+    ) -> (Self, JoinHandle<()>)
+    where
+        VersionString: ToString + Clone + Send + 'static,
+        UserAgentString: ToString + Clone + Send + 'static,
+    {
+        let (runner, queue_sender) = Queue::start();
+
+        let mut build_version = build_version.to_string();
+        let user_agent = user_agent.to_string();
+
+        // Match zcashd's version format, if the version string has anything in it
+        if !build_version.is_empty() && !build_version.starts_with('v') {
+            build_version.insert(0, 'v');
+        }
+
+        let rpc_impl = GrpcImpl {
+            build_version,
+            user_agent,
+            network: network.clone(),
+            debug_force_finished_sync,
+            debug_like_zcashd,
+            mempool: mempool.clone(),
+            state: state.clone(),
+            latest_chain_tip: latest_chain_tip.clone(),
+            queue_sender,
+        };
+
+        // run the process queue
+        let rpc_tx_queue_task_handle = tokio::spawn(
+            runner
+                .run(mempool, state, latest_chain_tip, network)
+                .in_current_span(),
+        );
+
+        (rpc_impl, rpc_tx_queue_task_handle)
+    }
+}
+
+impl From<GetBlockChainInfo> for crate::server::GetBlockChainInfo {
+    fn from(info: GetBlockChainInfo) -> Self {
+        // Convert value_pools array to Vec for Protobuf
+        let value_pools: Vec<crate::server::ValuePoolBalance> = info
+            .value_pools
+            .iter()
+            .map(|pool| crate::server::ValuePoolBalance {
+                id: pool.data().0.to_string(),
+                chain_value: pool.data().1.lossy_zec(),
+                chain_value_zat: pool.data().2.into(),
+            })
+            .collect();
+
+        // Convert `upgrades` to a list of ordered entries
+        let upgrades: Vec<crate::server::UpgradeEntry> = info
+            .upgrades
+            .into_iter()
+            .map(|(key, upgrade_info)| crate::server::UpgradeEntry {
+                key: key.0.to_string(),
+                value: Some(crate::server::NetworkUpgradeInfo {
+                    name: upgrade_info.name.to_string(),
+                    status: upgrade_info.status.to_string(),
+                    activation_height: upgrade_info.activation_height.0,
+                }),
+            })
+            .collect();
+
+        // Convert consensus branch
+        let consensus = crate::server::TipConsensusBranch {
+            chain_tip: info.consensus.chain_tip.0.to_string(),
+            next_block: info.consensus.next_block.0.to_string(),
+        };
+
+        crate::server::GetBlockChainInfo {
+            chain: info.chain,
+            blocks: info.blocks.0, // Assuming `Height` wraps an integer
+            best_block_hash: hex::encode(info.best_block_hash.0), // Encode to hex if necessary
+            estimated_height: info.estimated_height.0,
+            value_pools,
+            upgrades,
+            consensus: Some(consensus),
+        }
+    }
+}
+
+impl From<crate::server::AddressStrings> for AddressStrings {
+    fn from(addresses: crate::server::AddressStrings) -> Self {
+        AddressStrings {
+            addresses: addresses.addresses,
+        }
+    }
+}
+
+impl From<AddressBalance> for crate::server::AddressBalance {
+    fn from(balance: AddressBalance) -> Self {
+        crate::server::AddressBalance {
+            balance: balance.balance,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl<Mempool, State, Tip> crate::server::endpoint_server::Endpoint for GrpcImpl<Mempool, State, Tip>
+where
+    Mempool: Service<
+            mempool::Request,
+            Response = mempool::Response,
+            Error = zebra_node_services::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    Mempool::Future: Send,
+    State: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    State::Future: Send,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    async fn get_info(
+        &self,
+        _: tonic::Request<crate::server::Empty>,
+    ) -> std::result::Result<Response<crate::server::GetInfo>, Status> {
+        let response = crate::server::GetInfo {
+            build: self.build_version.clone(),
+            subversion: self.user_agent.clone(),
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn get_blockchain_info(
+        &self,
+        _: tonic::Request<crate::server::Empty>,
+    ) -> std::result::Result<Response<crate::server::GetBlockChainInfo>, Status> {
+        let network = self.network.clone();
+        let debug_force_finished_sync = self.debug_force_finished_sync;
+        let mut state = self.state.clone();
+
+        // `chain` field
+        let chain = network.bip70_network_name();
+
+        let request = zebra_state::ReadRequest::TipPoolValues;
+        let response: zebra_state::ReadResponse = state
+            .ready()
+            .and_then(|service| service.call(request))
+            .await
+            .map_server_error()
+            .unwrap();
+
+        let zebra_state::ReadResponse::TipPoolValues {
+            tip_height,
+            tip_hash,
+            value_balance,
+        } = response
+        else {
+            unreachable!("unmatched response to a TipPoolValues request")
+        };
+
+        let request = zebra_state::ReadRequest::BlockHeader(tip_hash.into());
+        let response: zebra_state::ReadResponse = state
+            .ready()
+            .and_then(|service| service.call(request))
+            .await
+            .map_server_error()
+            .unwrap();
+
+        let zebra_state::ReadResponse::BlockHeader(block_header) = response else {
+            unreachable!("unmatched response to a BlockHeader request")
+        };
+
+        let tip_block_time = block_header
+            .ok_or_server_error("unexpectedly could not read best chain tip block header")
+            .unwrap()
+            .time;
+
+        let now = Utc::now();
+        let zebra_estimated_height =
+            NetworkChainTipHeightEstimator::new(tip_block_time, tip_height, &network)
+                .estimate_height_at(now);
+
+        // If we're testing the mempool, force the estimated height to be the actual tip height, otherwise,
+        // check if the estimated height is below Zebra's latest tip height, or if the latest tip's block time is
+        // later than the current time on the local clock.
+        let estimated_height = if tip_block_time > now
+            || zebra_estimated_height < tip_height
+            || debug_force_finished_sync
+        {
+            tip_height
+        } else {
+            zebra_estimated_height
+        };
+
+        // `upgrades` object
+        //
+        // Get the network upgrades in height order, like `zcashd`.
+        let mut upgrades = IndexMap::new();
+        for (activation_height, network_upgrade) in network.full_activation_list() {
+            // Zebra defines network upgrades based on incompatible consensus rule changes,
+            // but zcashd defines them based on ZIPs.
+            //
+            // All the network upgrades with a consensus branch ID are the same in Zebra and zcashd.
+            if let Some(branch_id) = network_upgrade.branch_id() {
+                // zcashd's RPC seems to ignore Disabled network upgrades, so Zebra does too.
+                let status = if tip_height >= activation_height {
+                    NetworkUpgradeStatus::Active
+                } else {
+                    NetworkUpgradeStatus::Pending
+                };
+
+                let upgrade = NetworkUpgradeInfo {
+                    name: network_upgrade,
+                    activation_height,
+                    status,
+                };
+                upgrades.insert(ConsensusBranchIdHex(branch_id), upgrade);
+            }
+        }
+
+        // `consensus` object
+        let next_block_height =
+            (tip_height + 1).expect("valid chain tips are a lot less than Height::MAX");
+        let consensus = TipConsensusBranch {
+            chain_tip: ConsensusBranchIdHex(
+                NetworkUpgrade::current(&network, tip_height)
+                    .branch_id()
+                    .unwrap_or(ConsensusBranchId::RPC_MISSING_ID),
+            ),
+            next_block: ConsensusBranchIdHex(
+                NetworkUpgrade::current(&network, next_block_height)
+                    .branch_id()
+                    .unwrap_or(ConsensusBranchId::RPC_MISSING_ID),
+            ),
+        };
+
+        let response = GetBlockChainInfo {
+            chain,
+            blocks: tip_height,
+            best_block_hash: tip_hash,
+            estimated_height: estimated_height,
+            value_pools: types::ValuePoolBalance::from_value_balance(value_balance),
+            upgrades,
+            consensus,
+        }
+        .into();
+
+        Ok(Response::new(response))
+    }
+
+    async fn get_address_balance(
+        &self,
+        address_strings: tonic::Request<crate::server::AddressStrings>,
+    ) -> std::result::Result<Response<crate::server::AddressBalance>, Status> {
+        let state = self.state.clone();
+
+        let converted_addresses: AddressStrings = address_strings.into_inner().into();
+        let valid_addresses: HashSet<Address> = converted_addresses.valid_addresses().unwrap();
+
+        let request = zebra_state::ReadRequest::AddressBalance(valid_addresses);
+        let response = state.oneshot(request).await.map_server_error().unwrap();
+
+        let res = match response {
+            zebra_state::ReadResponse::AddressBalance(balance) => AddressBalance {
+                balance: u64::from(balance),
+            },
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+        .into();
+
+        Ok(Response::new(res))
     }
 }
