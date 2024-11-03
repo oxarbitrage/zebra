@@ -297,6 +297,8 @@ impl RpcServer {
                     .add_service(EndpointServer::new(grpc))
                     .serve(grpc_server_listen_addr)
                     .await?;
+
+                info!("Started gRPC server at {}", grpc_server_listen_addr);
                 Ok(())
             });
 

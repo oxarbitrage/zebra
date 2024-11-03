@@ -86,53 +86,88 @@ impl HttpRequestMiddleware {
         }
 
         // Match the JSON-RPC `method` field to call the appropriate gRPC method
-        if request.method == "getinfo" {
-            let grpc_request = crate::server::Request::new(crate::server::Empty {});
-            let result = match grpc_client.get_info(grpc_request).await {
-                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
-                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
-            };
-            let response = crate::server::JsonRpcResponse {
-                id: request.id.clone(),
-                result,
-            };
-            Ok(warp::reply::json(&response))
-        } else if request.method == "getblockchaininfo" {
-            let grpc_request = crate::server::Request::new(crate::server::Empty {});
-            let result = match grpc_client.get_blockchain_info(grpc_request).await {
-                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
-                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
-            };
-            let response = crate::server::JsonRpcResponse {
-                id: request.id.clone(),
-                result,
-            };
-            Ok(warp::reply::json(&response))
-        } else if request.method == "getaddressbalance" {
-            // todo: fix the panics
-            let address_params: Result<crate::server::AddressStrings, _> =
-                serde_json::from_value(request.params[0].clone());
+        match request.method.as_str() {
+            "getinfo" => {
+                let grpc_request = crate::server::Request::new(crate::server::Empty {});
+                let grpc_response = grpc_client
+                    .get_info(grpc_request)
+                    .await
+                    .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
+                    .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
+                    .map_err(|_| warp::reject::reject())?;
+                let json_response = crate::server::JsonRpcResponse {
+                    id: request.id,
+                    result: grpc_response,
+                };
+                Ok(warp::reply::json(&json_response))
+            }
+            "getblockchaininfo" => {
+                let grpc_request = crate::server::Request::new(crate::server::Empty {});
+                let grpc_response = grpc_client
+                    .get_blockchain_info(grpc_request)
+                    .await
+                    .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
+                    .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
+                    .map_err(|_| warp::reject::reject())?;
+                let json_response = crate::server::JsonRpcResponse {
+                    id: request.id,
+                    result: grpc_response,
+                };
+                Ok(warp::reply::json(&json_response))
+            }
+            "getaddressbalance" => {
+                let address_params: crate::server::AddressStrings =
+                    serde_json::from_value(request.params.get(0).cloned().unwrap_or_default())
+                        .map_err(|_| warp::reject::reject())?;
 
-            let result = match grpc_client
-                .get_address_balance(address_params.unwrap())
-                .await
-            {
-                Ok(grpc_response) => serde_json::to_value(grpc_response.into_inner()).unwrap(),
-                Err(e) => serde_json::to_value(e.to_string()).unwrap(),
-            };
+                let grpc_response = grpc_client
+                    .get_address_balance(address_params)
+                    .await
+                    .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
+                    .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
+                    .map_err(|_| warp::reject::reject())?;
 
-            let response = crate::server::JsonRpcResponse {
-                id: request.id.clone(),
-                result,
-            };
+                let json_response = crate::server::JsonRpcResponse {
+                    id: request.id.clone(),
+                    result: grpc_response,
+                };
+                Ok(warp::reply::json(&json_response))
+            }
+            "sendrawtransaction" => {
+                // Check for exactly one parameter
+                if request.params.len() != 1 {
+                    let json_response = crate::server::JsonRpcResponse {
+                        id: request.id,
+                        result: serde_json::to_value("invalid params").unwrap(),
+                    };
+                    return Ok(warp::reply::json(&json_response));
+                }
 
-            Ok(warp::reply::json(&response))
-        } else {
-            let response = crate::server::JsonRpcResponse {
-                id: request.id,
-                result: serde_json::to_value("unsupported method").unwrap(),
-            };
-            Ok(warp::reply::json(&response))
+                let hex_param = request.params[0].as_str().ok_or_else(|| warp::reject())?;
+                let grpc_request = crate::server::Request::new(crate::server::RawTransactionHex {
+                    hex: hex_param.to_string(),
+                });
+
+                let grpc_response = grpc_client
+                    .send_raw_transaction(grpc_request)
+                    .await
+                    .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
+                    .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
+                    .map_err(|_| warp::reject::reject())?;
+
+                let json_response = crate::server::JsonRpcResponse {
+                    id: request.id.clone(),
+                    result: grpc_response,
+                };
+                Ok(warp::reply::json(&json_response))
+            }
+            _ => {
+                let json_response = crate::server::JsonRpcResponse {
+                    id: request.id,
+                    result: serde_json::to_value("unsupported method").unwrap(),
+                };
+                Ok(warp::reply::json(&json_response))
+            }
         }
     }
 }

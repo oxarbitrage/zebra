@@ -13,6 +13,9 @@ service Endpoint {
 
   // 
   rpc get_address_balance(AddressStrings) returns (AddressBalance);
+
+  //
+  rpc send_raw_transaction(RawTransactionHex) returns (SentTransactionHash);
 }
 
 // A response to a GetInfo call.
@@ -79,6 +82,15 @@ message AddressStrings {
     repeated string addresses = 1;
 }
 
+//
 message AddressBalance {
     uint64 balance = 1;
+}
+
+message RawTransactionHex {
+    string hex = 1;
+}
+
+message SentTransactionHash {
+    string hash = 1;
 }

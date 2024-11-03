@@ -2091,6 +2091,17 @@ impl From<AddressBalance> for crate::server::AddressBalance {
     }
 }
 
+///
+pub struct RawTransactionHex(pub String);
+
+impl From<SentTransactionHash> for crate::server::SentTransactionHash {
+    fn from(hash: SentTransactionHash) -> Self {
+        crate::server::SentTransactionHash {
+            hash: hash.0.to_string(),
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl<Mempool, State, Tip> crate::server::endpoint_server::Endpoint for GrpcImpl<Mempool, State, Tip>
 where
@@ -2250,6 +2261,7 @@ where
     ) -> std::result::Result<Response<crate::server::AddressBalance>, Status> {
         let state = self.state.clone();
 
+        // TODO: fix all the unwraps here and in the above calls, use status::from_error as `send_raw_transaction`.
         let converted_addresses: AddressStrings = address_strings.into_inner().into();
         let valid_addresses: HashSet<Address> = converted_addresses.valid_addresses().unwrap();
 
@@ -2265,5 +2277,65 @@ where
         .into();
 
         Ok(Response::new(res))
+    }
+
+    async fn send_raw_transaction(
+        &self,
+        raw_transaction_hex: tonic::Request<crate::server::RawTransactionHex>,
+    ) -> std::result::Result<Response<crate::server::SentTransactionHash>, Status> {
+        let mempool = self.mempool.clone();
+        let queue_sender = self.queue_sender.clone();
+
+        let raw_transaction_hex = raw_transaction_hex.into_inner().hex;
+
+        let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex).map_err(|_| {
+            Status::invalid_argument("raw transaction is not specified as a hex string")
+        })?;
+
+        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
+            .map_err(|_| Status::invalid_argument("raw transaction is structurally invalid"))?;
+
+        let transaction_hash = raw_transaction.hash();
+
+        // send transaction to the rpc queue, ignore any error.
+        let unmined_transaction = UnminedTx::from(raw_transaction.clone());
+        let _ = queue_sender.send(unmined_transaction);
+
+        let transaction_parameter = mempool::Gossip::Tx(raw_transaction.into());
+        let request = mempool::Request::Queue(vec![transaction_parameter]);
+
+        let response = mempool
+            .oneshot(request)
+            .await
+            .map_err(|e| Status::from_error(e))?;
+
+        let mut queue_results = match response {
+            mempool::Response::Queued(results) => results,
+            _ => unreachable!("incorrect response variant from mempool service"),
+        };
+
+        assert_eq!(
+            queue_results.len(),
+            1,
+            "mempool service returned more results than expected"
+        );
+
+        let queue_result = queue_results
+            .pop()
+            .expect("there should be exactly one item in Vec")
+            .inspect_err(|err| tracing::debug!("sent transaction to mempool: {:?}", &err))
+            .map_err(|e| Status::from_error(e))?
+            .await;
+
+        tracing::debug!("sent transaction to mempool: {:?}", &queue_result);
+
+        let res = queue_result
+            .map_err(|e| Status::from_error(Box::new(e)))
+            .map(|_| SentTransactionHash(transaction_hash))
+            .map_server_error();
+
+        Ok(Response::new(
+            res.map_err(|e| Status::from_error(Box::new(e)))?.into(),
+        ))
     }
 }
