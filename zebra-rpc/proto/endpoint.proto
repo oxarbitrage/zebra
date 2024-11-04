@@ -59,6 +59,7 @@ message ValuePoolBalance {
     uint64 chain_value_zat = 3;
 }
 
+//
 message UpgradeEntry {
     string key = 1;
     NetworkUpgradeInfo value = 2;
@@ -87,10 +88,12 @@ message AddressBalance {
     uint64 balance = 1;
 }
 
+//
 message RawTransactionHex {
     string hex = 1;
 }
 
+//
 message SentTransactionHash {
     string hash = 1;
 }

@@ -10,8 +10,9 @@ use jsonrpc_http_server::{
 };
 
 use crate::server::{
-    cookie::Cookie, Empty, EndpointClient, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    Request as TonicRequest,
+    cookie::Cookie,
+    types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
+    Empty, EndpointClient, Request as TonicRequest,
 };
 
 /// HTTP [`RequestMiddleware`] with compatibility workarounds.
@@ -69,12 +70,12 @@ impl HttpRequestMiddleware {
         request: JsonRpcRequest,
         expeted_len: usize,
     ) -> Option<JsonRpcResponse> {
-        if request.params.len() != expeted_len {
-            return Some(JsonRpcResponse {
-                id: request.id,
-                result: serde_json::to_value("invalid number of parameters")
+        if request.params().len() != expeted_len {
+            return Some(JsonRpcResponse::new(
+                serde_json::to_value("invalid number of parameters")
                     .expect("string to serde_json::Value conversion"),
-            });
+                request.id().to_string(),
+            ));
         }
         None
     }
@@ -95,16 +96,16 @@ impl HttpRequestMiddleware {
                 message: "unauthenticated method".to_string(),
             };
 
-            let response = JsonRpcResponse {
-                id: request.id,
-                result: serde_json::to_value(error).unwrap(),
-            };
+            let response = JsonRpcResponse::new(
+                serde_json::to_value(error).unwrap(),
+                request.id().to_string(),
+            );
 
             return Ok(warp::reply::json(&response));
         }
 
         // Match the JSON-RPC `method` field to call the appropriate gRPC method
-        match request.method.as_str() {
+        match request.method() {
             "getinfo" => {
                 // Check for exactly zero parameter
                 if let Some(response) = Self::check_parameters_length(request.clone(), 0) {
@@ -118,10 +119,8 @@ impl HttpRequestMiddleware {
                     .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
                     .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
                     .map_err(|_| warp::reject::reject())?;
-                let json_response = JsonRpcResponse {
-                    id: request.id,
-                    result: grpc_response,
-                };
+                let json_response = JsonRpcResponse::new(grpc_response, request.id().to_string());
+
                 Ok(warp::reply::json(&json_response))
             }
             "getblockchaininfo" => {
@@ -137,10 +136,8 @@ impl HttpRequestMiddleware {
                     .map(|grpc_response| serde_json::to_value(grpc_response.into_inner()))
                     .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
                     .map_err(|_| warp::reject::reject())?;
-                let json_response = JsonRpcResponse {
-                    id: request.id,
-                    result: grpc_response,
-                };
+                let json_response = JsonRpcResponse::new(grpc_response, request.id().to_string());
+
                 Ok(warp::reply::json(&json_response))
             }
             "getaddressbalance" => {
@@ -150,7 +147,7 @@ impl HttpRequestMiddleware {
                 }
 
                 let address_params: crate::server::AddressStrings =
-                    serde_json::from_value(request.params.get(0).cloned().unwrap_or_default())
+                    serde_json::from_value(request.params().get(0).cloned().unwrap_or_default())
                         .map_err(|_| warp::reject::reject())?;
 
                 let grpc_response = grpc_client
@@ -160,10 +157,8 @@ impl HttpRequestMiddleware {
                     .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
                     .map_err(|_| warp::reject::reject())?;
 
-                let json_response = JsonRpcResponse {
-                    id: request.id.clone(),
-                    result: grpc_response,
-                };
+                let json_response = JsonRpcResponse::new(grpc_response, request.id().to_string());
+
                 Ok(warp::reply::json(&json_response))
             }
             "sendrawtransaction" => {
@@ -172,7 +167,7 @@ impl HttpRequestMiddleware {
                     return Ok(warp::reply::json(&response));
                 }
 
-                let hex_param = request.params[0].as_str().ok_or_else(|| warp::reject())?;
+                let hex_param = request.params()[0].as_str().ok_or_else(|| warp::reject())?;
                 let grpc_request = TonicRequest::new(crate::server::RawTransactionHex {
                     hex: hex_param.to_string(),
                 });
@@ -184,17 +179,17 @@ impl HttpRequestMiddleware {
                     .unwrap_or_else(|e| serde_json::to_value(e.to_string()))
                     .map_err(|_| warp::reject::reject())?;
 
-                let json_response = JsonRpcResponse {
-                    id: request.id.clone(),
-                    result: grpc_response,
-                };
+                let json_response = JsonRpcResponse::new(grpc_response, request.id().to_string());
+
                 Ok(warp::reply::json(&json_response))
             }
             _ => {
-                let json_response = JsonRpcResponse {
-                    id: request.id,
-                    result: serde_json::to_value("unsupported method").unwrap(),
-                };
+                let json_response = JsonRpcResponse::new(
+                    serde_json::to_value("unsupported method")
+                        .expect("string to serde_json::Value conversion"),
+                    request.id().to_string(),
+                );
+
                 Ok(warp::reply::json(&json_response))
             }
         }
