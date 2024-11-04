@@ -442,7 +442,7 @@ impl Drop for RpcServer {
 }
 
 // Define JSON-RPC request and response structures
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct JsonRpcRequest {
     jsonrpc: String,
     id: String,
