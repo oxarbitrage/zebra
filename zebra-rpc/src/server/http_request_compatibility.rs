@@ -11,7 +11,7 @@ use jsonrpc_http_server::{
 
 use crate::server::{
     cookie::Cookie,
-    types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
+    jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
     Empty, EndpointClient, Request as TonicRequest,
 };
 

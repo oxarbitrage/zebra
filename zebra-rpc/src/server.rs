@@ -44,8 +44,8 @@ use crate::methods::{GetBlockTemplateRpc, GetBlockTemplateRpcImpl};
 
 pub mod cookie;
 pub mod http_request_compatibility;
+pub mod jsonrpc;
 pub mod rpc_call_compatibility;
-pub mod types;
 
 #[cfg(test)]
 mod tests;
@@ -441,31 +441,6 @@ impl Drop for RpcServer {
         self.shutdown_blocking();
     }
 }
-
-/*
-// Define JSON-RPC request and response structures
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct JsonRpcRequest {
-    jsonrpc: String,
-    id: String,
-    method: String,
-    params: Vec<serde_json::Value>,
-}
-
-#[derive(serde::Serialize)]
-pub struct JsonRpcResponse {
-    //jsonrpc: String,
-    result: serde_json::Value,
-    id: String,
-    //error: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct JsonRpcError {
-    pub code: i64,
-    pub message: String,
-}
-*/
 
 // Warp Filter to pass the gRPC client
 fn with_grpc_client(
