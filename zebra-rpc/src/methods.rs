@@ -15,6 +15,7 @@ use indexmap::IndexMap;
 use jsonrpc_core::{self, BoxFuture, Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use tokio::{sync::broadcast, task::JoinHandle};
+use tonic::{Response, Status};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -1889,12 +1890,6 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
         Ok(Height(sanitized_height))
     }
 }
-
-/// Represent an empty argument for RPC methods that don't require any arguments.
-#[derive(Debug, serde::Deserialize, serde::Serialize, Default)]
-pub struct Empty;
-
-use tonic::{Response, Status};
 
 /// gRPC method implementations.
 #[derive(Clone)]

@@ -1,9 +1,6 @@
-//!
-//!
-
+//! gRPC types and conversions for Zebra RPC methods.
 impl From<crate::methods::GetBlockChainInfo> for crate::server::GetBlockChainInfo {
     fn from(info: crate::methods::GetBlockChainInfo) -> Self {
-        // Convert value_pools array to Vec for Protobuf
         let value_pools: Vec<crate::server::ValuePoolBalance> = info
             .value_pools
             .iter()
@@ -14,7 +11,6 @@ impl From<crate::methods::GetBlockChainInfo> for crate::server::GetBlockChainInf
             })
             .collect();
 
-        // Convert `upgrades` to a list of ordered entries
         let upgrades: Vec<crate::server::UpgradeEntry> = info
             .upgrades
             .into_iter()
@@ -28,7 +24,6 @@ impl From<crate::methods::GetBlockChainInfo> for crate::server::GetBlockChainInf
             })
             .collect();
 
-        // Convert consensus branch
         let consensus = crate::server::TipConsensusBranch {
             chain_tip: info.consensus.chain_tip.0.to_string(),
             next_block: info.consensus.next_block.0.to_string(),
@@ -36,8 +31,8 @@ impl From<crate::methods::GetBlockChainInfo> for crate::server::GetBlockChainInf
 
         crate::server::GetBlockChainInfo {
             chain: info.chain,
-            blocks: info.blocks.0, // Assuming `Height` wraps an integer
-            best_block_hash: hex::encode(info.best_block_hash.0), // Encode to hex if necessary
+            blocks: info.blocks.0,
+            best_block_hash: hex::encode(info.best_block_hash.0),
             estimated_height: info.estimated_height.0,
             value_pools,
             upgrades,
@@ -61,9 +56,6 @@ impl From<crate::methods::AddressBalance> for crate::server::AddressBalance {
         }
     }
 }
-
-///
-pub struct RawTransactionHex(pub String);
 
 impl From<crate::methods::SentTransactionHash> for crate::server::SentTransactionHash {
     fn from(hash: crate::methods::SentTransactionHash) -> Self {
