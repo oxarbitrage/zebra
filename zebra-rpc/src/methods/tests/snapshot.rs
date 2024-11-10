@@ -7,8 +7,11 @@
 
 use std::collections::BTreeMap;
 
+use futures::FutureExt;
 use insta::dynamic_redaction;
 use tower::buffer::Buffer;
+
+use jsonrpsee::core::RpcResult;
 
 use zebra_chain::{
     block::Block,
@@ -611,7 +614,7 @@ fn snapshot_rpc_getblock_verbose(
 /// Check invalid height `getblock` response using `cargo insta`.
 fn snapshot_rpc_getblock_invalid(
     variant: &'static str,
-    response: Result<GetBlock>,
+    response: RpcResult<GetBlock>,
     settings: &insta::Settings,
 ) {
     settings
@@ -653,7 +656,7 @@ fn snapshot_rpc_getaddresstxids_valid(
 /// Snapshot invalid `getaddressbalance` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getaddresstxids_invalid(
     variant: &'static str,
-    transactions: Result<Vec<String>>,
+    transactions: RpcResult<Vec<String>>,
     settings: &insta::Settings,
 ) {
     settings.bind(|| {

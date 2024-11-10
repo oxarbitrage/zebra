@@ -180,7 +180,7 @@ fn rpc_server_spawn_unallocated_port(parallel_cpu_threads: bool, do_shutdown: bo
             // The server and queue tasks should shut down without errors or panics
             let rpc_server_task_result = rpc_server_task_handle.await;
             assert!(
-                matches!(rpc_server_task_result, Ok(())),
+                matches!(rpc_server_task_result, Ok(_)),
                 "unexpected server task panic during shutdown: {rpc_server_task_result:?}"
             );
 
@@ -279,7 +279,7 @@ fn rpc_server_spawn_port_conflict() {
         // The second server should panic, so its task handle should return the panic
         let rpc_server_2_task_result = rpc_server_2_task_handle.await;
         match rpc_server_2_task_result {
-            Ok(()) => panic!(
+            Ok(_) => panic!(
                 "RPC server with conflicting port should exit with an error: \
                  unexpected Ok result"
             ),
@@ -393,7 +393,7 @@ fn rpc_server_spawn_port_conflict_parallel_auto() {
         // (See the function docs for details.)
         let rpc_server_2_task_result = rpc_server_2_task_handle.await;
         match rpc_server_2_task_result {
-            Ok(()) => info!(
+            Ok(_) => info!(
                 "Parallel RPC server with conflicting port should exit with an error: \
                  but we're ok with it ignoring the conflict for now"
             ),
