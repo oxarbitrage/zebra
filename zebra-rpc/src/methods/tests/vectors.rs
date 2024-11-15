@@ -341,7 +341,7 @@ async fn rpc_getblock_missing_error() {
 
     // Make sure Zebra returns the correct error code `-8` for missing blocks
     // https://github.com/zcash/lightwalletd/blob/v0.4.16/common/common.go#L287-L290
-    let block_future = rpc.get_block("0".to_string(), Some(0u8));
+    let block_future = tokio::spawn(async move { rpc.get_block("0".to_string(), Some(0u8)).await });
 
     // Make the mock service respond with no block
     let response_handler = state
@@ -351,7 +351,7 @@ async fn rpc_getblock_missing_error() {
 
     let block_response = block_future.await;
     let block_response = block_response
-        //.expect("unexpected panic in spawned request future")
+        .expect("unexpected panic in spawned request future")
         .expect_err("unexpected success from missing block state response");
     assert_eq!(block_response.code(), ErrorCode::ServerError(-8).code());
 
