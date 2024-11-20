@@ -11,6 +11,7 @@ use std::{collections::HashSet, fmt::Debug, sync::Arc};
 use chrono::Utc;
 use futures::{stream::FuturesOrdered, StreamExt, TryFutureExt};
 use hex::{FromHex, ToHex};
+use hex_data::HexData;
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee_proc_macros::rpc;
@@ -24,10 +25,14 @@ use zebra_chain::{
     block::{self, Height, SerializedBlock},
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{ConsensusBranchId, Network, NetworkUpgrade},
-    serialization::ZcashDeserialize,
+    serialization::{ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address},
+    work::{
+        difficulty::{CompactDifficulty, ExpandedDifficulty},
+        equihash::Solution,
+    },
 };
 use zebra_node_services::mempool;
 use zebra_state::{HashOrHeight, MinedTx, OutputIndex, OutputLocation, TransactionLocation};
@@ -163,6 +168,23 @@ pub trait Rpc {
     #[method(name = "getblock")]
     async fn get_block(&self, hash_or_height: String, verbosity: Option<u8>)
         -> RpcResult<GetBlock>;
+
+    /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
+    ///
+    /// zcashd reference: [`getblockheader`](https://zcash.github.io/rpc/getblockheader.html)
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `hash_or_height`: (string, required, example="1") The hash or height for the block to be returned.
+    /// - `verbose`: (bool, optional, default=false, example=true) false for hex encoded data, true for a json object
+    #[method(name = "getblockheader")]
+    async fn get_block_header(
+        &self,
+        hash_or_height: String,
+        verbose: Option<bool>,
+    ) -> RpcResult<GetBlockHeader>;
 
     /// Returns the hash of the current best blockchain tip block, as a [`GetBlockHash`] JSON string.
     ///
@@ -545,13 +567,11 @@ where
             .await
             .map_server_error()?;
 
-        let zebra_state::ReadResponse::BlockHeader(block_header) = response else {
+        let zebra_state::ReadResponse::BlockHeader { header, .. } = response else {
             unreachable!("unmatched response to a BlockHeader request")
         };
 
-        let tip_block_time = block_header
-            .ok_or_server_error("unexpectedly could not read best chain tip block header")?
-            .time;
+        let tip_block_time = header.time;
 
         let now = Utc::now();
         let zebra_estimated_height =
@@ -788,10 +808,6 @@ where
                 }
             };
 
-            // TODO:  look up the height if we only have a hash,
-            //        this needs a new state request for the height -> hash index
-            let height = hash_or_height.height();
-
             // # Concurrency
             //
             // We look up by block hash so the hash, transaction IDs, and confirmations
@@ -869,20 +885,17 @@ where
                 _ => unreachable!("unmatched response to a depth request"),
             };
 
-            let time = if should_read_block_header {
+            let (time, height) = if should_read_block_header {
                 let block_header_response = futs.next().await.expect("`futs` should not be empty");
 
                 match block_header_response.map_server_error()? {
-                    zebra_state::ReadResponse::BlockHeader(header) => Some(
-                        header
-                            .ok_or_server_error("Block not found")?
-                            .time
-                            .timestamp(),
-                    ),
+                    zebra_state::ReadResponse::BlockHeader { header, height, .. } => {
+                        (Some(header.time.timestamp()), Some(height))
+                    }
                     _ => unreachable!("unmatched response to a BlockHeader request"),
                 }
             } else {
-                None
+                (None, hash_or_height.height())
             };
 
             let sapling = SaplingTrees {
@@ -910,6 +923,99 @@ where
                 None,
             ))
         }
+    }
+
+    async fn get_block_header(
+        &self,
+        hash_or_height: String,
+        verbose: Option<bool>,
+    ) -> RpcResult<GetBlockHeader> {
+        let state = self.state.clone();
+        let verbose = verbose.unwrap_or(true);
+        let network = self.network.clone();
+
+        let hash_or_height: HashOrHeight = hash_or_height.parse().map_server_error()?;
+        let zebra_state::ReadResponse::BlockHeader {
+            header,
+            hash,
+            height,
+            next_block_hash,
+        } = state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
+            .map_server_error()?
+        else {
+            panic!("unexpected response to BlockHeader request")
+        };
+
+        let response = if !verbose {
+            GetBlockHeader::Raw(HexData(header.zcash_serialize_to_vec().map_server_error()?))
+        } else {
+            let zebra_state::ReadResponse::SaplingTree(sapling_tree) = state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::SaplingTree(hash_or_height))
+                .await
+                .map_server_error()?
+            else {
+                panic!("unexpected response to SaplingTree request")
+            };
+
+            // This could be `None` if there's a chain reorg between state queries.
+            let sapling_tree = sapling_tree.ok_or_server_error("missing sapling tree for block")?;
+
+            let zebra_state::ReadResponse::Depth(depth) = state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::Depth(hash))
+                .await
+                .map_server_error()?
+            else {
+                panic!("unexpected response to SaplingTree request")
+            };
+
+            // From <https://zcash.github.io/rpc/getblock.html>
+            // TODO: Deduplicate const definition, consider refactoring this to avoid duplicate logic
+            const NOT_IN_BEST_CHAIN_CONFIRMATIONS: i64 = -1;
+
+            // Confirmations are one more than the depth.
+            // Depth is limited by height, so it will never overflow an i64.
+            let confirmations = depth
+                .map(|depth| i64::from(depth) + 1)
+                .unwrap_or(NOT_IN_BEST_CHAIN_CONFIRMATIONS);
+
+            let mut nonce = *header.nonce;
+            nonce.reverse();
+
+            let final_sapling_root: [u8; 32] = if sapling_tree.position().is_some() {
+                let mut root: [u8; 32] = sapling_tree.root().into();
+                root.reverse();
+                root
+            } else {
+                [0; 32]
+            };
+
+            let difficulty = header.difficulty_threshold.relative_to_network(&network);
+
+            let block_header = GetBlockHeaderObject {
+                hash: GetBlockHash(hash),
+                confirmations,
+                height,
+                version: header.version,
+                merkle_root: header.merkle_root,
+                final_sapling_root,
+                time: header.time.timestamp(),
+                nonce,
+                solution: header.solution,
+                bits: header.difficulty_threshold,
+                difficulty,
+                previous_block_hash: GetBlockHash(header.previous_block_hash),
+                next_block_hash: next_block_hash.map(GetBlockHash),
+            };
+
+            GetBlockHeader::Object(Box::new(block_header))
+        };
+
+        Ok(response)
     }
 
     fn get_best_block_hash(&self) -> RpcResult<GetBlockHash> {
@@ -957,6 +1063,7 @@ where
             #[cfg(feature = "getblocktemplate-rpcs")]
             mempool::Response::FullTransactions {
                 mut transactions,
+                transaction_dependencies: _,
                 last_seen_tip_hash: _,
             } => {
                 // Sort transactions in descending order by fee/size, using hash in serialized byte order as a tie-breaker
@@ -978,7 +1085,6 @@ where
 
                 Ok(tx_ids)
             }
-
             mempool::Response::TransactionIds(unmined_transaction_ids) => {
                 let mut tx_ids: Vec<String> = unmined_transaction_ids
                     .iter()
@@ -990,7 +1096,6 @@ where
 
                 Ok(tx_ids)
             }
-
             _ => unreachable!("unmatched response to a transactionids request"),
         }
     }
@@ -1646,6 +1751,101 @@ impl Default for GetBlock {
             time: None,
             tx: Vec::new(),
             trees: GetBlockTrees::default(),
+        }
+    }
+}
+
+/// Response to a `getblockheader` RPC request.
+///
+/// See the notes for the [`Rpc::get_block_header`] method.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum GetBlockHeader {
+    /// The request block header, hex-encoded.
+    Raw(hex_data::HexData),
+
+    /// The block header object.
+    Object(Box<GetBlockHeaderObject>),
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+/// Verbose response to a `getblockheader` RPC request.
+///
+/// See the notes for the [`Rpc::get_block_header`] method.
+pub struct GetBlockHeaderObject {
+    /// The hash of the requested block.
+    pub hash: GetBlockHash,
+
+    /// The number of confirmations of this block in the best chain,
+    /// or -1 if it is not in the best chain.
+    pub confirmations: i64,
+
+    /// The height of the requested block.
+    pub height: Height,
+
+    /// The version field of the requested block.
+    pub version: u32,
+
+    /// The merkle root of the requesteed block.
+    #[serde(with = "hex", rename = "merkleroot")]
+    pub merkle_root: block::merkle::Root,
+
+    /// The root of the Sapling commitment tree after applying this block.
+    #[serde(with = "hex", rename = "finalsaplingroot")]
+    pub final_sapling_root: [u8; 32],
+
+    /// The block time of the requested block header in non-leap seconds since Jan 1 1970 GMT.
+    pub time: i64,
+
+    /// The nonce of the requested block header.
+    #[serde(with = "hex")]
+    pub nonce: [u8; 32],
+
+    /// The Equihash solution in the requested block header.
+    #[serde(with = "hex")]
+    solution: Solution,
+
+    /// The difficulty threshold of the requested block header displayed in compact form.
+    #[serde(with = "hex")]
+    pub bits: CompactDifficulty,
+
+    /// Floating point number that represents the difficulty limit for this block as a multiple
+    /// of the minimum difficulty for the network.
+    pub difficulty: f64,
+
+    /// The previous block hash of the requested block header.
+    #[serde(rename = "previousblockhash")]
+    pub previous_block_hash: GetBlockHash,
+
+    /// The next block hash after the requested block header.
+    #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
+    pub next_block_hash: Option<GetBlockHash>,
+}
+
+impl Default for GetBlockHeader {
+    fn default() -> Self {
+        GetBlockHeader::Object(Box::default())
+    }
+}
+
+impl Default for GetBlockHeaderObject {
+    fn default() -> Self {
+        let difficulty: ExpandedDifficulty = zebra_chain::work::difficulty::U256::one().into();
+
+        GetBlockHeaderObject {
+            hash: GetBlockHash::default(),
+            confirmations: 0,
+            height: Height::MIN,
+            version: 4,
+            merkle_root: block::merkle::Root([0; 32]),
+            final_sapling_root: Default::default(),
+            time: 0,
+            nonce: [0; 32],
+            solution: Solution::for_proposal(),
+            bits: difficulty.to_compact(),
+            difficulty: 1.0,
+            previous_block_hash: Default::default(),
+            next_block_hash: Default::default(),
         }
     }
 }
