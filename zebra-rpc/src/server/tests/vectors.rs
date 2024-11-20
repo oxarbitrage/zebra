@@ -155,7 +155,7 @@ async fn rpc_server_spawn_unallocated_port(parallel_cpu_threads: bool, do_shutdo
     block_verifier_router.expect_no_requests().await;
 
     if do_shutdown {
-        let _ = rpc_server_task_handle.abort();
+        rpc_server_task_handle.abort();
     }
 }
 

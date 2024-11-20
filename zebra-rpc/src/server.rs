@@ -214,8 +214,10 @@ impl RpcServer {
             .merge(get_block_template_rpc_impl.into_rpc())
             .unwrap();
 
-        let server_task: JoinHandle<Result<(), tower::BoxError>> =
-            tokio::spawn(async move { Ok(server_instance.start(rpc_module).stopped().await) });
+        let server_task: JoinHandle<Result<(), tower::BoxError>> = tokio::spawn(async move {
+            server_instance.start(rpc_module).stopped().await;
+            Ok(())
+        });
         Ok(server_task)
     }
 
