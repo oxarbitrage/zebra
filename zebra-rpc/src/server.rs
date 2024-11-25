@@ -7,7 +7,7 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{fmt, panic, thread::available_parallelism};
+use std::{fmt, panic};
 
 use cookie::Cookie;
 
@@ -180,12 +180,6 @@ impl RpcServer {
             state,
             latest_chain_tip,
         );
-
-        // If zero, automatically scale threads to the number of CPU cores
-        let mut parallel_cpu_threads = config.parallel_cpu_threads;
-        if parallel_cpu_threads == 0 {
-            parallel_cpu_threads = available_parallelism().map(usize::from).unwrap_or(1);
-        }
 
         let http_middleware_layer = if config.enable_cookie_auth {
             let cookie = Cookie::default();

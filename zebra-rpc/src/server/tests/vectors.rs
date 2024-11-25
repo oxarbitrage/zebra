@@ -20,30 +20,21 @@ use zebra_test::mock_service::MockService;
 
 use super::super::*;
 
-/// Test that the JSON-RPC server spawns when configured with a single thread.
+/// Test that the JSON-RPC server spawns.
 #[tokio::test]
-async fn rpc_server_spawn_single_thread() {
-    rpc_server_spawn(false).await
-}
-
-/// Test that the JSON-RPC server spawns when configured with multiple threads.
-#[tokio::test]
-#[cfg(not(target_os = "windows"))]
-async fn rpc_server_spawn_parallel_threads() {
-    rpc_server_spawn(true).await
+async fn rpc_server_spawn_test() {
+    rpc_server_spawn().await
 }
 
 /// Test if the RPC server will spawn on a randomly generated port.
-///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
 #[tracing::instrument]
-async fn rpc_server_spawn(parallel_cpu_threads: bool) {
+async fn rpc_server_spawn() {
     let _init_guard = zebra_test::init();
 
     let config = Config {
         listen_addr: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()),
         indexer_listen_addr: None,
-        parallel_cpu_threads: if parallel_cpu_threads { 2 } else { 1 },
+        parallel_cpu_threads: 0,
         debug_force_finished_sync: false,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
@@ -77,40 +68,23 @@ async fn rpc_server_spawn(parallel_cpu_threads: bool) {
     block_verifier_router.expect_no_requests().await;
 }
 
-/// Test that the JSON-RPC server spawns when configured with a single thread,
-/// on an OS-assigned unallocated port.
+/// Test that the JSON-RPC server spawns on an OS-assigned unallocated port.
 #[tokio::test]
-async fn rpc_server_spawn_unallocated_port_single_thread() {
-    rpc_server_spawn_unallocated_port(false, false).await
+async fn rpc_server_spawn_unallocated_port() {
+    rpc_spawn_unallocated_port(false).await
 }
 
-/// Test that the JSON-RPC server spawns and shuts down when configured with a single thread,
-/// on an OS-assigned unallocated port.
+/// Test that the JSON-RPC server spawns and shuts down on an OS-assigned unallocated port.
 #[tokio::test]
-async fn rpc_server_spawn_unallocated_port_single_thread_shutdown() {
-    rpc_server_spawn_unallocated_port(false, true).await
-}
-
-/// Test that the JSON-RPC server spawns when configured with multiple threads,
-/// on an OS-assigned unallocated port.
-#[tokio::test]
-async fn rpc_sever_spawn_unallocated_port_parallel_threads() {
-    rpc_server_spawn_unallocated_port(true, false).await
-}
-
-/// Test that the JSON-RPC server spawns and shuts down when configured with multiple threads,
-/// on an OS-assigned unallocated port.
-#[tokio::test]
-async fn rpc_sever_spawn_unallocated_port_parallel_threads_shutdown() {
-    rpc_server_spawn_unallocated_port(true, true).await
+async fn rpc_server_spawn_unallocated_port_shutdown() {
+    rpc_spawn_unallocated_port(true).await
 }
 
 /// Test if the RPC server will spawn on an OS-assigned unallocated port.
 ///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores,
-/// and `do_shutdown` to true to close the server using the close handle.
+/// Set `do_shutdown` to true to close the server using the close handle.
 #[tracing::instrument]
-async fn rpc_server_spawn_unallocated_port(parallel_cpu_threads: bool, do_shutdown: bool) {
+async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
     let _init_guard = zebra_test::init();
 
     let port = zebra_test::net::random_unallocated_port();
@@ -119,7 +93,7 @@ async fn rpc_server_spawn_unallocated_port(parallel_cpu_threads: bool, do_shutdo
     let config = Config {
         listen_addr: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into()),
         indexer_listen_addr: None,
-        parallel_cpu_threads: if parallel_cpu_threads { 0 } else { 1 },
+        parallel_cpu_threads: 0,
         debug_force_finished_sync: false,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
@@ -173,8 +147,8 @@ async fn rpc_server_spawn_port_conflict() {
     let config = Config {
         listen_addr: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into()),
         indexer_listen_addr: None,
-        parallel_cpu_threads: 1,
         debug_force_finished_sync: false,
+        parallel_cpu_threads: 0,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
     };
