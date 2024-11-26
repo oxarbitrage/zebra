@@ -11,7 +11,9 @@ use std::{fmt, panic};
 
 use cookie::Cookie;
 
+use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{Server, ServerHandle};
+
 use tokio::task::JoinHandle;
 use tower::Service;
 use tracing::*;
@@ -25,7 +27,10 @@ use zebra_node_services::mempool;
 use crate::{
     config::Config,
     methods::{RpcImpl, RpcServer as _},
-    server::http_request_compatibility::HttpRequestMiddlewareLayer,
+    server::{
+        http_request_compatibility::HttpRequestMiddlewareLayer,
+        rpc_call_compatibility::FixRpcResponseMiddleware,
+    },
 };
 
 #[cfg(feature = "getblocktemplate-rpcs")]
@@ -33,6 +38,7 @@ use crate::methods::{GetBlockTemplateRpcImpl, GetBlockTemplateRpcServer};
 
 pub mod cookie;
 pub mod http_request_compatibility;
+pub mod rpc_call_compatibility;
 
 #[cfg(test)]
 mod tests;
@@ -112,7 +118,6 @@ impl RpcServer {
         latest_chain_tip: Tip,
         network: Network,
     ) -> Result<ServerTask, tower::BoxError>
-    //Option<(ServerHandle, JoinHandle<()>, Option<Self>)>
     where
         VersionString: ToString + Clone + Send + 'static,
         UserAgentString: ToString + Clone + Send + 'static,
@@ -147,8 +152,6 @@ impl RpcServer {
         SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
         AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
     {
-        //if let Some(listen_addr) = config.listen_addr {
-
         let listen_addr = config
             .listen_addr
             .expect("caller should make sure listen_addr is set");
@@ -191,9 +194,15 @@ impl RpcServer {
         };
 
         let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
+
+        let rpc_middleware = RpcServiceBuilder::new()
+            .rpc_logger(1024)
+            .layer_fn(FixRpcResponseMiddleware::new);
+
         let server_instance = Server::builder()
             .http_only()
             .set_http_middleware(http_middleware)
+            .set_rpc_middleware(rpc_middleware)
             .build(listen_addr)
             .await
             .expect("Unable to start RPC server");
