@@ -977,6 +977,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core2"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "239fa3ae9b63c2dc74bd3fa852d4792b8b305ae64eeede946265b6af62f1fff3"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,12 +1344,12 @@ dependencies = [
 
 [[package]]
 name = "equihash"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab579d7cf78477773b03e80bc2f89702ef02d7112c711d54ca93dcdce68533d5"
+checksum = "756c3654e279e572484a6061a4f90a67849baeab43be89a622b9950105254674"
 dependencies = [
  "blake2b_simd",
- "byteorder",
+ "core2",
 ]
 
 [[package]]
@@ -1616,6 +1625,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "getset"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eded738faa0e88d3abc9d1a13cb11adc2073c400969eeb8793cf7132589959fc"
+dependencies = [
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.85",
+]
+
+[[package]]
 name = "gimli"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1736,6 +1757,18 @@ name = "halo2_legacy_pdqsort"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47716fe1ae67969c5e0b2ef826f32db8c3be72be325e1aa3c1951d06b5575ec5"
+
+[[package]]
+name = "halo2_poseidon"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa3da60b81f02f9b33ebc6252d766f843291fb4d2247a07ae73d20b791fc56f"
+dependencies = [
+ "bitvec",
+ "ff",
+ "group",
+ "pasta_curves",
+]
 
 [[package]]
 name = "halo2_proofs"
@@ -2142,9 +2175,9 @@ dependencies = [
 
 [[package]]
 name = "incrementalmerkletree"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d45063fbc4b0a37837f6bfe0445f269d13d730ad0aa3b5a7f74aa7bf27a0f4df"
+checksum = "216c71634ac6f6ed13c2102d64354c0a04dcbdc30e31692c5972d3974d8b6d97"
 dependencies = [
  "either",
 ]
@@ -2583,12 +2616,9 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
 name = "memuse"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2145869435ace5ea6ea3d35f59be559317ec9a0d04e1812d5f185a87b6d36f1a"
-dependencies = [
- "nonempty",
-]
+checksum = "3d97bbf43eb4f088f8ca469930cde17fa036207c9a5e02ccc5107c4e8b17c964"
 
 [[package]]
 name = "metrics"
@@ -2851,17 +2881,20 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchard"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f18e997fa121de5c73e95cdc7e8512ae43b7de38904aeea5e5713cc48f3c0ba"
+checksum = "02f7152474406422f572de163e0bc63b2126cdbfe17bc849efbbde36fcfe647e"
 dependencies = [
  "aes",
  "bitvec",
  "blake2b_simd",
+ "core2",
  "ff",
  "fpe",
+ "getset",
  "group",
  "halo2_gadgets",
+ "halo2_poseidon",
  "halo2_proofs",
  "hex",
  "incrementalmerkletree",
@@ -2872,6 +2905,7 @@ dependencies = [
  "rand 0.8.5",
  "reddsa",
  "serde",
+ "sinsemilla",
  "subtle",
  "tracing",
  "visibility",
@@ -3247,6 +3281,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "proc-macro-error2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+dependencies = [
+ "proc-macro-error-attr2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -4359,6 +4415,17 @@ name = "similar"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1de1d4f81173b03af4c0cbed3c898f6bff5b870e4a7f5d6f4057d62a7a4b686e"
+
+[[package]]
+name = "sinsemilla"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d268ae0ea06faafe1662e9967cd4f9022014f5eeb798e0c302c876df8b7af9c"
+dependencies = [
+ "group",
+ "pasta_curves",
+ "subtle",
+]
 
 [[package]]
 name = "sketches-ddsketch"
@@ -5888,11 +5955,11 @@ dependencies = [
 
 [[package]]
 name = "zcash_encoding"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "052d8230202f0a018cd9b5d1b56b94cd25e18eccc2d8665073bcea8261ab87fc"
+checksum = "3654116ae23ab67dd1f849b01f8821a8a156f884807ff665eac109bf28306c4d"
 dependencies = [
- "byteorder",
+ "core2",
  "nonempty",
 ]
 
@@ -5935,9 +6002,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_note_encryption"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b4580cd6cee12e44421dac43169be8d23791650816bdb34e6ddfa70ac89c1c5"
+checksum = "77efec759c3798b6e4d829fcc762070d9b229b0f13338c40bf993b7b609c2272"
 dependencies = [
  "chacha20",
  "chacha20poly1305",
@@ -6010,11 +6077,13 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bc22b9155b2c7eb20105cd06de170d188c1bc86489b92aa3fda7b8da8d96acf"
+checksum = "82cb36b15b5a1be70b30c32ce40372dead6561df8a467e297f96b892873a63a2"
 dependencies = [
+ "core2",
  "document-features",
+ "hex",
  "memuse",
 ]
 

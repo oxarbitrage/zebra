@@ -75,7 +75,7 @@ byteorder = "1.5.0"
 # TODO: Internal miner feature functionality was removed at https://github.com/ZcashFoundation/zebra/issues/8180
 #       See what was removed at https://github.com/ZcashFoundation/zebra/blob/v1.5.1/zebra-chain/Cargo.toml#L73-L85
 #       Restore support when conditions are met. https://github.com/ZcashFoundation/zebra/issues/8183
-equihash = "0.2.0"
+equihash = "0.2.1"
 
 group = "0.13.0"
 incrementalmerkletree.workspace = true
@@ -98,7 +98,7 @@ halo2 = { package = "halo2_proofs", version = "0.3.0" }
 orchard.workspace = true
 zcash_encoding.workspace = true
 zcash_history.workspace = true
-zcash_note_encryption = "0.4.0"
+zcash_note_encryption = "0.4.1"
 zcash_primitives = { workspace = true, features = ["transparent-inputs"] }
 sapling-crypto.workspace = true
 zcash_protocol.workspace = true
