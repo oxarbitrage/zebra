@@ -44,10 +44,16 @@ pub use error::{
 pub use request::{
     CheckpointVerifiedBlock, HashOrHeight, ReadRequest, Request, SemanticallyVerifiedBlock,
 };
-pub use response::{KnownBlock, MinedTx, ReadResponse, Response};
+
+#[cfg(feature = "indexer")]
+pub use request::Spend;
+
+pub use response::{GetBlockTemplateChainInfo, KnownBlock, MinedTx, ReadResponse, Response};
 pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
-    check, init, init_read_only,
+    check,
+    finalized_state::FinalizedState,
+    init, init_read_only,
     non_finalized_state::NonFinalizedState,
     spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
@@ -69,9 +75,6 @@ pub use service::finalized_state::{
 
 pub use service::{finalized_state::ZebraDb, ReadStateService};
 
-#[cfg(feature = "getblocktemplate-rpcs")]
-pub use response::GetBlockTemplateChainInfo;
-
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{
@@ -79,9 +82,6 @@ pub use service::{
     finalized_state::{RawBytes, KV, MAX_ON_DISK_HEIGHT},
     init_test, init_test_services,
 };
-
-#[cfg(any(test, feature = "proptest-impl"))]
-pub use constants::latest_version_for_adding_subtrees;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use config::hidden::{

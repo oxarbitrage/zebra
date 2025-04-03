@@ -21,8 +21,8 @@ use zebra_state::{
 use zebra_chain::diagnostic::task::WaitForPanics;
 
 use crate::{
-    constants::MISSING_BLOCK_ERROR_CODE,
     methods::{hex_data::HexData, GetBlockHeightAndHash},
+    server,
 };
 
 /// How long to wait between calls to `getbestblockheightandhash` when it:
@@ -149,6 +149,14 @@ impl TrustedChainSync {
                         break false;
                     }
                 };
+
+                // # Correctness
+                //
+                // Ensure that the secondary rocksdb instance has caught up to the primary instance
+                // before attempting to commit the new block to the non-finalized state. It is sufficient
+                // to call this once here, as a new chain tip block has already been retrieved and so
+                // we know that the primary rocksdb instance has already been updated.
+                self.try_catch_up_with_primary().await;
 
                 let block_hash = block.hash;
                 let commit_result = if self.non_finalized_state.chain_count() == 0 {
@@ -382,8 +390,11 @@ impl SyncerRpcMethods for RpcRequestClient {
             }
             Err(err)
                 if err
-                    .downcast_ref::<jsonrpc_core::Error>()
-                    .is_some_and(|err| err.code == MISSING_BLOCK_ERROR_CODE) =>
+                    .downcast_ref::<jsonrpsee_types::ErrorCode>()
+                    .is_some_and(|err| {
+                        let code: i32 = server::error::LegacyCode::InvalidParameter.into();
+                        err.code() == code
+                    }) =>
             {
                 Ok(None)
             }

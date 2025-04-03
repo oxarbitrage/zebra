@@ -5,6 +5,78 @@ All notable changes to Zebra are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Zebra 2.2.0](https://github.com/ZcashFoundation/zebra/releases/tag/v2.2.0) - 2025-02-03
+
+In this release, Zebra introduced an additional consensus check on the branch ID of Nu6 transactions
+(which is currently also checked elsewhere; but we believe it's important to check on its own to protect
+against future code changes), along with important refactors and improvements.
+
+### Added
+
+- An index to track spending transaction ids by spent outpoints and revealed nullifiers ([#8895](https://github.com/ZcashFoundation/zebra/pull/8895))
+- Accessor methods to `zebra-rpc` request/response types ([#9113](https://github.com/ZcashFoundation/zebra/pull/9113))
+- `getblock` RPC method now can return transaction details with verbosity=2 ([#9083](https://github.com/ZcashFoundation/zebra/pull/9083))
+- Serialized NU5 blocks to test vectors ([#9098](https://github.com/ZcashFoundation/zebra/pull/9098))
+
+### Changed
+
+- Migrated from deprecated `jsonrpc_*` crates to `jsonrpsee` ([#9059](https://github.com/ZcashFoundation/zebra/pull/9059), [#9151](https://github.com/ZcashFoundation/zebra/pull/9151))
+- Optimized checks for coinbase transactions ([#9126](https://github.com/ZcashFoundation/zebra/pull/9126))
+- Avoid re-verifying transactions in blocks if those transactions are in the mempool ([#8951](https://github.com/ZcashFoundation/zebra/pull/8951), [#9118](https://github.com/ZcashFoundation/zebra/pull/9118))
+- Allow transactions spending coinbase outputs to have transparent outputs on Regtest ([#9085](https://github.com/ZcashFoundation/zebra/pull/9085))
+
+### Fixed
+
+- Respond to getblockchaininfo with genesis block when empty state ([#9138](https://github.com/ZcashFoundation/zebra/pull/9138))
+- Verify consensus branch ID in SIGHASH precomputation ([#9139](https://github.com/ZcashFoundation/zebra/pull/9139))
+- More closely match zcashd RPC errors and `getrawtransaction` RPC behaviour ([#9049](https://github.com/ZcashFoundation/zebra/pull/9049))
+- Fixes bugs in the lightwalletd integration tests ([#9052](https://github.com/ZcashFoundation/zebra/pull/9052))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@Fallengirl, @arya2, @conradoplg, @elijahhampton, @futreall, @gustavovalverde, @idky137, @mpguerra, @oxarbitrage, @rex4539, @rootdiae, @sandakersmann and @upbqdn
+
+
+## [Zebra 2.1.0](https://github.com/ZcashFoundation/zebra/releases/tag/v2.1.0) - 2024-12-06
+
+This release adds a check to verify that V5 transactions in the mempool have the correct consensus branch ID; 
+Zebra would previously accept those and return a transaction ID (indicating success) even though they would
+be eventually rejected by the block consensus checks. Similarly, Zebra also now returns an error when trying
+to submit transactions that would eventually fail some consensus checks (e.g. double spends) but would also 
+return a transaction ID indicating success.  The release also bumps
+Zebra's initial minimum protocol version such that this release of Zebra will always reject connections with peers advertising
+a network protocol version below 170,120 on Mainnet and 170,110 on Testnet instead of accepting those connections until Zebra's
+chain state reaches the NU6 activation height.
+The `getblock` RPC method has been updated and now returns some additional information
+such as the block height (even if you provide a block hash) and other fields as supported
+by the `getblockheader` RPC call.
+
+### Breaking Changes
+
+- Upgrade minimum protocol versions for all Zcash networks ([#9058](https://github.com/ZcashFoundation/zebra/pull/9058))
+
+### Added
+
+- `getblockheader` RPC method ([#8967](https://github.com/ZcashFoundation/zebra/pull/8967))
+- `rust-toolchain.toml` file ([#8985](https://github.com/ZcashFoundation/zebra/pull/8985))
+
+### Changed
+
+- Updated `getblock` RPC to more closely match zcashd ([#9006](https://github.com/ZcashFoundation/zebra/pull/9006))
+- Updated error messages to include inner error types (notably for the transaction verifier) ([#9066](https://github.com/ZcashFoundation/zebra/pull/9066))
+
+### Fixed
+
+- Validate consensus branch ids of mempool transactions ([#9063](https://github.com/ZcashFoundation/zebra/pull/9063))
+- Verify mempool transactions with unmined inputs if those inputs are in the mempool to support TEX transactions ([#8857](https://github.com/ZcashFoundation/zebra/pull/8857))
+- Wait until transactions have been added to the mempool before returning success response from `sendrawtransaction` RPC ([#9067](https://github.com/ZcashFoundation/zebra/pull/9067))
+
+### Contributors
+
+Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+@arya2, @conradoplg, @cypherpepe, @gustavovalverde, @idky137, @oxarbitrage, @pinglanlu and @upbqdn
+
 ## [Zebra 2.0.1](https://github.com/ZcashFoundation/zebra/releases/tag/v2.0.1) - 2024-10-30
 
 - Zebra now supports NU6 on Mainnet. This patch release updates dependencies

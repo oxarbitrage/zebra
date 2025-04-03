@@ -1,7 +1,9 @@
 //! Fixed test vectors for RPC methods.
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
+use futures::FutureExt;
 use tower::buffer::Buffer;
 
 use zebra_chain::{
@@ -12,9 +14,10 @@ use zebra_chain::{
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::UnminedTxId,
 };
+use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::BoxError;
 
-use zebra_state::{LatestChainTip, ReadStateService};
+use zebra_state::{GetBlockTemplateChainInfo, LatestChainTip, ReadStateService};
 use zebra_test::mock_service::MockService;
 
 use super::super::*;
@@ -26,8 +29,9 @@ async fn rpc_getinfo() {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "/Zebra:RPC test/",
         Mainnet,
         false,
@@ -35,13 +39,36 @@ async fn rpc_getinfo() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(state.clone(), 1),
         NoChainTip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
-    let get_info = rpc.get_info().expect("We should have a GetInfo struct");
+    let getinfo_future = tokio::spawn(async move { rpc.get_info().await });
+
+    // Make the mock service respond with
+    let response_handler = state
+        .expect_request(zebra_state::ReadRequest::ChainInfo)
+        .await;
+    response_handler.respond(zebra_state::ReadResponse::ChainInfo(
+        GetBlockTemplateChainInfo {
+            tip_hash: Mainnet.genesis_hash(),
+            tip_height: Height::MIN,
+            history_tree: Default::default(),
+            expected_difficulty: Default::default(),
+            cur_time: zebra_chain::serialization::DateTime32::now(),
+            min_time: zebra_chain::serialization::DateTime32::now(),
+            max_time: zebra_chain::serialization::DateTime32::now(),
+        },
+    ));
+
+    let get_info = getinfo_future
+        .await
+        .expect("getinfo future should not panic")
+        .expect("getinfo future should not return an error");
 
     // make sure there is a `build` field in the response,
     // and that is equal to the provided string, with an added 'v' version prefix.
-    assert_eq!(get_info.build, "vRPC test");
+    assert_eq!(get_info.build, "v0.0.1");
 
     // make sure there is a `subversion` field,
     // and that is equal to the Zebra user agent.
@@ -53,6 +80,52 @@ async fn rpc_getinfo() {
     // The queue task should continue without errors or panics
     let rpc_tx_queue_task_result = rpc_tx_queue_task_handle.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+// Helper function that returns the nonce, final sapling root and
+// block commitments of a given Block.
+async fn get_block_data(
+    read_state: &ReadStateService,
+    block: Arc<Block>,
+    height: usize,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let zebra_state::ReadResponse::SaplingTree(sapling_tree) = read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::SaplingTree(HashOrHeight::Height(
+            (height as u32).try_into().unwrap(),
+        )))
+        .await
+        .expect("should have sapling tree for block hash")
+    else {
+        panic!("unexpected response to SaplingTree request")
+    };
+
+    let mut expected_nonce = *block.header.nonce;
+    expected_nonce.reverse();
+    let sapling_tree = sapling_tree.expect("should always have sapling root");
+    let expected_final_sapling_root: [u8; 32] = if sapling_tree.position().is_some() {
+        let mut root: [u8; 32] = sapling_tree.root().into();
+        root.reverse();
+        root
+    } else {
+        [0; 32]
+    };
+
+    let expected_block_commitments = match block
+        .commitment(&Mainnet)
+        .expect("Unexpected failure while parsing the blockcommitments field in get_block_data")
+    {
+        Commitment::PreSaplingReserved(bytes) => bytes,
+        Commitment::FinalSaplingRoot(_) => expected_final_sapling_root,
+        Commitment::ChainHistoryActivationReserved => [0; 32],
+        Commitment::ChainHistoryRoot(root) => root.bytes_in_display_order(),
+        Commitment::ChainHistoryBlockTxAuthCommitment(hash) => hash.bytes_in_display_order(),
+    };
+    (
+        expected_nonce,
+        expected_final_sapling_root,
+        expected_block_commitments,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -71,15 +144,18 @@ async fn rpc_getblock() {
         zebra_state::populated_state(blocks.clone(), &Mainnet).await;
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
         true,
         Buffer::new(mempool.clone(), 1),
-        read_state,
+        read_state.clone(),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Make height calls with verbosity=0 and check response
@@ -132,19 +208,39 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
                 hash: GetBlockHash(block.hash()),
                 confirmations: (blocks.len() - i).try_into().expect("valid i64"),
                 height: Some(Height(i.try_into().expect("valid u32"))),
-                time: None,
+                time: Some(block.header.time.timestamp()),
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Hash(tx.hash()))
                     .collect(),
                 trees,
+                size: None,
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -156,19 +252,39 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
                 hash: GetBlockHash(block.hash()),
                 confirmations: (blocks.len() - i).try_into().expect("valid i64"),
-                height: None,
-                time: None,
+                height: Some(Height(i.try_into().expect("valid u32"))),
+                time: Some(block.header.time.timestamp()),
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Hash(tx.hash()))
                     .collect(),
                 trees,
+                size: None,
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -180,6 +296,9 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
@@ -190,9 +309,30 @@ async fn rpc_getblock() {
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Object(TransactionObject {
+                        hex: (*tx).clone().into(),
+                        height: Some(i.try_into().expect("valid u32")),
+                        confirmations: Some((blocks.len() - i).try_into().expect("valid i64"))
+                    }))
                     .collect(),
                 trees,
+                size: Some(block.zcash_serialize_to_vec().unwrap().len() as i64),
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -204,6 +344,9 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
@@ -214,9 +357,30 @@ async fn rpc_getblock() {
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Object(TransactionObject {
+                        hex: (*tx).clone().into(),
+                        height: Some(i.try_into().expect("valid u32")),
+                        confirmations: Some((blocks.len() - i).try_into().expect("valid i64"))
+                    }))
                     .collect(),
                 trees,
+                size: Some(block.zcash_serialize_to_vec().unwrap().len() as i64),
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -228,19 +392,39 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
                 hash: GetBlockHash(block.hash()),
                 confirmations: (blocks.len() - i).try_into().expect("valid i64"),
                 height: Some(Height(i.try_into().expect("valid u32"))),
-                time: None,
+                time: Some(block.header.time.timestamp()),
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Hash(tx.hash()))
                     .collect(),
                 trees,
+                size: None,
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -252,19 +436,39 @@ async fn rpc_getblock() {
             .await
             .expect("We should have a GetBlock struct");
 
+        let (expected_nonce, expected_final_sapling_root, expected_block_commitments) =
+            get_block_data(&read_state, block.clone(), i).await;
+
         assert_eq!(
             get_block,
             GetBlock::Object {
                 hash: GetBlockHash(block.hash()),
                 confirmations: (blocks.len() - i).try_into().expect("valid i64"),
-                height: None,
-                time: None,
+                height: Some(Height(i.try_into().expect("valid u32"))),
+                time: Some(block.header.time.timestamp()),
                 tx: block
                     .transactions
                     .iter()
-                    .map(|tx| tx.hash().encode_hex())
+                    .map(|tx| GetBlockTransaction::Hash(tx.hash()))
                     .collect(),
                 trees,
+                size: None,
+                version: Some(block.header.version),
+                merkle_root: Some(block.header.merkle_root),
+                block_commitments: Some(expected_block_commitments),
+                final_sapling_root: Some(expected_final_sapling_root),
+                final_orchard_root: None,
+                nonce: Some(expected_nonce),
+                bits: Some(block.header.difficulty_threshold),
+                difficulty: Some(
+                    block
+                        .header
+                        .difficulty_threshold
+                        .relative_to_network(&Mainnet)
+                ),
+                previous_block_hash: Some(GetBlockHash(block.header.previous_block_hash)),
+                next_block_hash: blocks.get(i + 1).map(|b| GetBlockHash(b.hash())),
+                solution: Some(block.header.solution),
             }
         );
     }
@@ -284,8 +488,9 @@ async fn rpc_getblock_parse_error() {
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -293,6 +498,8 @@ async fn rpc_getblock_parse_error() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(state.clone(), 1),
         NoChainTip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Make sure we get an error if Zebra can't parse the block height.
@@ -327,8 +534,9 @@ async fn rpc_getblock_missing_error() {
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -336,11 +544,13 @@ async fn rpc_getblock_missing_error() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(state.clone(), 1),
         NoChainTip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Make sure Zebra returns the correct error code `-8` for missing blocks
     // https://github.com/zcash/lightwalletd/blob/v0.4.16/common/common.go#L287-L290
-    let block_future = tokio::spawn(rpc.get_block("0".to_string(), Some(0u8)));
+    let block_future = tokio::spawn(async move { rpc.get_block("0".to_string(), Some(0u8)).await });
 
     // Make the mock service respond with no block
     let response_handler = state
@@ -348,11 +558,10 @@ async fn rpc_getblock_missing_error() {
         .await;
     response_handler.respond(zebra_state::ReadResponse::Block(None));
 
-    let block_response = block_future.await;
-    let block_response = block_response
-        .expect("unexpected panic in spawned request future")
-        .expect_err("unexpected success from missing block state response");
-    assert_eq!(block_response.code, ErrorCode::ServerError(-8),);
+    let block_response = block_future.await.expect("block future should not panic");
+    let block_response =
+        block_response.expect_err("unexpected success from missing block state response");
+    assert_eq!(block_response.code(), ErrorCode::ServerError(-8).code());
 
     // Now check the error string the way `lightwalletd` checks it
     assert_eq!(
@@ -390,8 +599,9 @@ async fn rpc_getblockheader() {
         zebra_state::populated_state(blocks.clone(), &Mainnet).await;
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -399,6 +609,8 @@ async fn rpc_getblockheader() {
         Buffer::new(mempool.clone(), 1),
         read_state.clone(),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Make height calls with verbose=false and check response
@@ -448,7 +660,9 @@ async fn rpc_getblockheader() {
             height,
             version: 4,
             merkle_root: block.header.merkle_root,
+            block_commitments: block.header.commitment_bytes.0,
             final_sapling_root: expected_final_sapling_root,
+            sapling_tree_size: sapling_tree.count(),
             time: block.header.time.timestamp(),
             nonce: expected_nonce,
             solution: block.header.solution,
@@ -499,8 +713,9 @@ async fn rpc_getbestblockhash() {
         zebra_state::populated_state(blocks.clone(), &Mainnet).await;
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -508,6 +723,8 @@ async fn rpc_getbestblockhash() {
         Buffer::new(mempool.clone(), 1),
         read_state,
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Get the tip hash using RPC method `get_best_block_hash`
@@ -545,8 +762,9 @@ async fn rpc_getrawtransaction() {
     latest_chain_tip_sender.send_best_tip_height(Height(10));
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -554,6 +772,8 @@ async fn rpc_getrawtransaction() {
         Buffer::new(mempool.clone(), 1),
         read_state.clone(),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Test case where transaction is in mempool.
@@ -576,9 +796,12 @@ async fn rpc_getrawtransaction() {
                         conventional_fee: Amount::zero(),
                     }]));
                 });
-            let get_tx_req = rpc.get_raw_transaction(tx.hash().encode_hex(), Some(0u8));
-            let (response, _) = futures::join!(get_tx_req, mempool_req);
-            let get_tx = response.expect("We should have a GetRawTransaction struct");
+
+            let rpc_req = rpc.get_raw_transaction(tx.hash().encode_hex(), Some(0u8));
+
+            let (rsp, _) = futures::join!(rpc_req, mempool_req);
+            let get_tx = rsp.expect("we should have a `GetRawTransaction` struct");
+
             if let GetRawTransaction::Raw(raw_tx) = get_tx {
                 assert_eq!(raw_tx.as_ref(), tx.zcash_serialize_to_vec().unwrap());
             } else {
@@ -606,12 +829,14 @@ async fn rpc_getrawtransaction() {
 
     let run_state_test_case = |block_idx: usize, block: Arc<Block>, tx: Arc<Transaction>| {
         let read_state = read_state.clone();
-        let tx_hash = tx.hash();
-        let get_tx_verbose_0_req = rpc.get_raw_transaction(tx_hash.encode_hex(), Some(0u8));
-        let get_tx_verbose_1_req = rpc.get_raw_transaction(tx_hash.encode_hex(), Some(1u8));
+        let txid = tx.hash();
+        let hex_txid = txid.encode_hex::<String>();
+
+        let get_tx_verbose_0_req = rpc.get_raw_transaction(hex_txid.clone(), Some(0u8));
+        let get_tx_verbose_1_req = rpc.get_raw_transaction(hex_txid, Some(1u8));
 
         async move {
-            let (response, _) = futures::join!(get_tx_verbose_0_req, make_mempool_req(tx_hash));
+            let (response, _) = futures::join!(get_tx_verbose_0_req, make_mempool_req(txid));
             let get_tx = response.expect("We should have a GetRawTransaction struct");
             if let GetRawTransaction::Raw(raw_tx) = get_tx {
                 assert_eq!(raw_tx.as_ref(), tx.zcash_serialize_to_vec().unwrap());
@@ -619,18 +844,22 @@ async fn rpc_getrawtransaction() {
                 unreachable!("Should return a Raw enum")
             }
 
-            let (response, _) = futures::join!(get_tx_verbose_1_req, make_mempool_req(tx_hash));
-            let GetRawTransaction::Object {
+            let (response, _) = futures::join!(get_tx_verbose_1_req, make_mempool_req(txid));
+
+            let GetRawTransaction::Object(TransactionObject {
                 hex,
                 height,
                 confirmations,
-            } = response.expect("We should have a GetRawTransaction struct")
+            }) = response.expect("We should have a GetRawTransaction struct")
             else {
                 unreachable!("Should return a Raw enum")
             };
 
+            let height = height.expect("state requests should have height");
+            let confirmations = confirmations.expect("state requests should have confirmations");
+
             assert_eq!(hex.as_ref(), tx.zcash_serialize_to_vec().unwrap());
-            assert_eq!(height, block_idx as i32);
+            assert_eq!(height, block_idx as u32);
 
             let depth_response = read_state
                 .oneshot(zebra_state::ReadRequest::Depth(block.hash()))
@@ -712,8 +941,9 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     let (_state, read_state, latest_chain_tip, _chain_tip_change) =
         zebra_state::populated_state(blocks.clone(), &Mainnet).await;
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -721,28 +951,23 @@ async fn rpc_getaddresstxids_invalid_arguments() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // call the method with an invalid address string
-    let address = "11111111".to_string();
-    let addresses = vec![address.clone()];
-    let start: u32 = 1;
-    let end: u32 = 2;
-    let error = rpc
+    let rpc_rsp = rpc
         .get_address_tx_ids(GetAddressTxIdsRequest {
-            addresses: addresses.clone(),
-            start,
-            end,
+            addresses: vec!["t1invalidaddress".to_owned()],
+            start: 1,
+            end: 2,
         })
         .await
         .unwrap_err();
-    assert_eq!(
-        error.message,
-        format!(
-            "invalid address \"{}\": parse error: t-addr decoding error",
-            address.clone()
-        )
-    );
+
+    assert_eq!(rpc_rsp.code(), ErrorCode::ServerError(-5).code());
+
+    mempool.expect_no_requests().await;
 
     // create a valid address
     let address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".to_string();
@@ -760,7 +985,7 @@ async fn rpc_getaddresstxids_invalid_arguments() {
         .await
         .unwrap_err();
     assert_eq!(
-        error.message,
+        error.message(),
         "start Height(2) must be less than or equal to end Height(1)".to_string()
     );
 
@@ -776,7 +1001,7 @@ async fn rpc_getaddresstxids_invalid_arguments() {
         .await
         .unwrap_err();
     assert_eq!(
-        error.message,
+        error.message(),
         "start Height(0) and end Height(1) must both be greater than zero".to_string()
     );
 
@@ -792,7 +1017,7 @@ async fn rpc_getaddresstxids_invalid_arguments() {
         .await
         .unwrap_err();
     assert_eq!(
-        error.message,
+        error.message(),
         "start Height(1) and end Height(11) must both be less than or equal to the chain tip Height(10)".to_string()
     );
 
@@ -868,8 +1093,9 @@ async fn rpc_getaddresstxids_response_with(
 ) {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         network.clone(),
         false,
@@ -877,6 +1103,8 @@ async fn rpc_getaddresstxids_response_with(
         Buffer::new(mempool.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         latest_chain_tip.clone(),
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // call the method with valid arguments
@@ -920,8 +1148,9 @@ async fn rpc_getaddressutxos_invalid_arguments() {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let rpc = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -929,20 +1158,18 @@ async fn rpc_getaddressutxos_invalid_arguments() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(state.clone(), 1),
         NoChainTip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // call the method with an invalid address string
-    let address = "11111111".to_string();
-    let addresses = vec![address.clone()];
     let error = rpc
         .0
-        .get_address_utxos(AddressStrings::new(addresses))
+        .get_address_utxos(AddressStrings::new(vec!["t1invalidaddress".to_owned()]))
         .await
         .unwrap_err();
-    assert_eq!(
-        error.message,
-        format!("invalid address \"{address}\": parse error: t-addr decoding error")
-    );
+
+    assert_eq!(error.code(), ErrorCode::ServerError(-5).code());
 
     mempool.expect_no_requests().await;
     state.expect_no_requests().await;
@@ -969,8 +1196,9 @@ async fn rpc_getaddressutxos_response() {
     let (_state, read_state, latest_chain_tip, _chain_tip_change) =
         zebra_state::populated_state(blocks.clone(), &Mainnet).await;
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let rpc = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "RPC test",
         Mainnet,
         false,
@@ -978,6 +1206,8 @@ async fn rpc_getaddressutxos_response() {
         Buffer::new(mempool.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // call the method with a valid address
@@ -1041,6 +1271,7 @@ async fn rpc_getblockcount() {
         block_verifier_router,
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Get the tip height using RPC method `get_block_count`
@@ -1090,6 +1321,7 @@ async fn rpc_getblockcount_empty_state() {
         block_verifier_router,
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Get the tip height using RPC method `get_block_count
@@ -1099,7 +1331,10 @@ async fn rpc_getblockcount_empty_state() {
     assert!(get_block_count.is_err());
 
     // Check the error we got is the correct one
-    assert_eq!(get_block_count.err().unwrap().message, "No blocks in state");
+    assert_eq!(
+        get_block_count.err().unwrap().message(),
+        "No blocks in state"
+    );
 
     mempool.expect_no_requests().await;
 }
@@ -1155,6 +1390,7 @@ async fn rpc_getpeerinfo() {
         block_verifier_router,
         MockSyncStatus::default(),
         mock_address_book,
+        None,
     );
 
     // Call `get_peer_info`
@@ -1215,6 +1451,7 @@ async fn rpc_getblockhash() {
         tower::ServiceBuilder::new().service(block_verifier_router),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Query the hashes using positive indexes
@@ -1271,6 +1508,7 @@ async fn rpc_getmininginfo() {
         MockService::build().for_unit_tests(),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     get_block_template_rpc
@@ -1307,6 +1545,7 @@ async fn rpc_getnetworksolps() {
         MockService::build().for_unit_tests(),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     let get_network_sol_ps_inputs = [
@@ -1362,7 +1601,6 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         amount::NonNegative,
         block::{Hash, MAX_BLOCK_BYTES, ZCASH_BLOCK_VERSION},
         chain_sync_status::MockSyncStatus,
-        parameters::NetworkKind,
         serialization::DateTime32,
         transaction::{zip317, VerifiedUnminedTx},
         work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
@@ -1394,19 +1632,26 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
 
-    let network = NetworkKind::Mainnet;
+    let network = Network::Mainnet;
     let miner_address = match use_p2pkh {
-        false => Some(transparent::Address::from_script_hash(network, [0x7e; 20])),
-        true => Some(transparent::Address::from_pub_key_hash(network, [0x7e; 20])),
+        false => Some(transparent::Address::from_script_hash(
+            network.kind(),
+            [0x7e; 20],
+        )),
+        true => Some(transparent::Address::from_pub_key_hash(
+            network.kind(),
+            [0x7e; 20],
+        )),
     };
 
     #[allow(clippy::unnecessary_struct_initialization)]
     let mining_config = crate::config::mining::Config {
-        miner_address,
+        miner_address: miner_address.clone(),
         extra_coinbase_data: None,
         debug_like_zcashd: true,
         // TODO: Use default field values when optional features are enabled in tests #8183
-        ..Default::default()
+        #[cfg(feature = "internal-miner")]
+        internal_miner: true,
     };
 
     // nu5 block height
@@ -1437,6 +1682,7 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         block_verifier_router,
         mock_sync_status.clone(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Fake the ChainInfo response
@@ -1485,6 +1731,19 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
     else {
         panic!("this getblocktemplate call without parameters should return the `TemplateMode` variant of the response")
     };
+
+    let coinbase_transaction =
+        Transaction::zcash_deserialize(get_block_template.coinbase_txn.data.as_ref())
+            .expect("coinbase transaction data should be deserializable");
+
+    assert_eq!(
+        coinbase_transaction
+            .outputs()
+            .first()
+            .unwrap()
+            .address(&network),
+        miner_address
+    );
 
     assert_eq!(
         get_block_template.capabilities,
@@ -1542,8 +1801,8 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .expect_err("needs an error when estimated distance to network chain tip is far");
 
     assert_eq!(
-        get_block_template_sync_error.code,
-        ErrorCode::ServerError(-10)
+        get_block_template_sync_error.code(),
+        ErrorCode::ServerError(-10).code()
     );
 
     mock_sync_status.set_is_close_to_tip(false);
@@ -1555,8 +1814,8 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .expect_err("needs an error when syncer is not close to tip");
 
     assert_eq!(
-        get_block_template_sync_error.code,
-        ErrorCode::ServerError(-10)
+        get_block_template_sync_error.code(),
+        ErrorCode::ServerError(-10).code()
     );
 
     mock_chain_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
@@ -1566,8 +1825,8 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .expect_err("needs an error when syncer is not close to tip or estimated distance to network chain tip is far");
 
     assert_eq!(
-        get_block_template_sync_error.code,
-        ErrorCode::ServerError(-10)
+        get_block_template_sync_error.code(),
+        ErrorCode::ServerError(-10).code()
     );
 
     let get_block_template_sync_error = get_block_template_rpc
@@ -1578,7 +1837,10 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .await
         .expect_err("needs an error when called in proposal mode without data");
 
-    assert_eq!(get_block_template_sync_error.code, ErrorCode::InvalidParams);
+    assert_eq!(
+        get_block_template_sync_error.code(),
+        ErrorCode::InvalidParams.code()
+    );
 
     let get_block_template_sync_error = get_block_template_rpc
         .get_block_template(Some(get_block_template::JsonParameters {
@@ -1588,7 +1850,10 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .await
         .expect_err("needs an error when passing in block data in template mode");
 
-    assert_eq!(get_block_template_sync_error.code, ErrorCode::InvalidParams);
+    assert_eq!(
+        get_block_template_sync_error.code(),
+        ErrorCode::InvalidParams.code()
+    );
 
     // The long poll id is valid, so it returns a state error instead
     let get_block_template_sync_error = get_block_template_rpc
@@ -1606,8 +1871,8 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         .expect_err("needs an error when the state is empty");
 
     assert_eq!(
-        get_block_template_sync_error.code,
-        ErrorCode::ServerError(-10)
+        get_block_template_sync_error.code(),
+        ErrorCode::ServerError(-10).code()
     );
 
     // Try getting mempool transactions with a different tip hash
@@ -1634,6 +1899,8 @@ async fn rpc_getblocktemplate_mining_address(use_p2pkh: bool) {
         conventional_actions,
         unpaid_actions: 0,
         fee_weight_ratio: 1.0,
+        time: None,
+        height: None,
     };
 
     let next_fake_tip_hash =
@@ -1706,6 +1973,7 @@ async fn rpc_submitblock_errors() {
         block_verifier_router,
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Try to submit pre-populated blocks and assert that it responds with duplicate.
@@ -1758,6 +2026,7 @@ async fn rpc_validateaddress() {
         MockService::build().for_unit_tests(),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     let validate_address = get_block_template_rpc
@@ -1803,6 +2072,7 @@ async fn rpc_z_validateaddress() {
         MockService::build().for_unit_tests(),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     let z_validate_address = get_block_template_rpc
@@ -1860,7 +2130,8 @@ async fn rpc_getdifficulty() {
         extra_coinbase_data: None,
         debug_like_zcashd: true,
         // TODO: Use default field values when optional features are enabled in tests #8183
-        ..Default::default()
+        #[cfg(feature = "internal-miner")]
+        internal_miner: true,
     };
 
     // nu5 block height
@@ -1890,6 +2161,7 @@ async fn rpc_getdifficulty() {
         block_verifier_router,
         mock_sync_status.clone(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // Fake the ChainInfo response: smallest numeric difficulty
@@ -2011,6 +2283,7 @@ async fn rpc_z_listunifiedreceivers() {
         MockService::build().for_unit_tests(),
         MockSyncStatus::default(),
         MockAddressBookPeers::default(),
+        None,
     );
 
     // invalid address

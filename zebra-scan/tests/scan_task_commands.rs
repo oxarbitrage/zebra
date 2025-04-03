@@ -3,13 +3,13 @@
 //! This test requires a cached chain state that is partially synchronized past the
 //! Sapling activation height and [`REQUIRED_MIN_TIP_HEIGHT`]
 //!
-//! export ZEBRA_CACHED_STATE_DIR="/path/to/zebra/state"
+//! export ZEBRA_CACHE_DIR="/path/to/zebra/state"
 //! cargo test scan_task_commands --features="shielded-scan" -- --ignored --nocapture
-#![allow(dead_code)]
+#![allow(dead_code, non_local_definitions)]
 
 use std::{fs, time::Duration};
 
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::Result;
 use tokio::sync::mpsc::error::TryRecvError;
 use tower::{util::BoxService, Service};
 
@@ -26,6 +26,7 @@ use zebra_scan::{
 
 use zebra_state::{ChainTipChange, LatestChainTip};
 
+/// Boxed state service.
 pub type BoxStateService =
     BoxService<zebra_state::Request, zebra_state::Response, zebra_state::BoxError>;
 
@@ -58,9 +59,9 @@ pub(crate) async fn run() -> Result<()> {
     // This is currently needed for the 'Check startup logs' step in CI to pass.
     tracing::info!("Zcash network: {network}");
 
-    let zebrad_state_path = match std::env::var_os("ZEBRA_CACHED_STATE_DIR") {
+    let zebrad_state_path = match std::env::var_os("ZEBRA_CACHE_DIR") {
         None => {
-            tracing::error!("ZEBRA_CACHED_STATE_DIR is not set");
+            tracing::warn!("env var ZEBRA_CACHE_DIR is not set, skipping test");
             return Ok(());
         }
         Some(path) => std::path::PathBuf::from(path),
@@ -86,9 +87,10 @@ pub(crate) async fn run() -> Result<()> {
 
     let (read_state, _, _) = zebra_state::init_read_only(state_config.clone(), &network);
 
-    let chain_tip_height = latest_chain_tip
-        .best_tip_height()
-        .ok_or_else(|| eyre!("State directory doesn't have a chain tip block"))?;
+    let Some(chain_tip_height) = latest_chain_tip.best_tip_height() else {
+        tracing::warn!("chain could not be loaded from cached state, skipping test");
+        return Ok(());
+    };
 
     let sapling_activation_height = NetworkUpgrade::Sapling
         .activation_height(&network)
@@ -110,7 +112,9 @@ pub(crate) async fn run() -> Result<()> {
     let storage = Storage::new(&scan_config, &network, false);
     let mut scan_task = ScanTask::spawn(storage, read_state, chain_tip_change);
 
-    tracing::info!("started scan task, sending register/subscribe keys messages with zecpages key to start scanning for a new key",);
+    tracing::info!(
+        "started scan task, sending register/subscribe keys messages with zecpages key to start scanning for a new key",
+    );
 
     let keys = [ZECPAGES_SAPLING_VIEWING_KEY.to_string()];
     scan_task.register_keys(
@@ -162,6 +166,7 @@ pub(crate) async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Starts the state service with the provided cache directory.
 pub async fn start_state_service_with_cache_dir(
     network: &Network,
     cache_dir: impl Into<std::path::PathBuf>,

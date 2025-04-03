@@ -5,9 +5,11 @@
 //! cargo insta test --review --release -p zebra-rpc --lib -- test_rpc_response_data
 //! ```
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
+use futures::FutureExt;
 use insta::dynamic_redaction;
+use jsonrpsee::core::RpcResult as Result;
 use tower::buffer::Buffer;
 
 use zebra_chain::{
@@ -23,6 +25,7 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
     subtree::NoteCommitmentSubtreeData,
 };
+use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::BoxError;
 use zebra_state::{ReadRequest, ReadResponse, MAX_ON_DISK_HEIGHT};
 use zebra_test::mock_service::MockService;
@@ -105,6 +108,7 @@ async fn test_z_get_treestate() {
 
     let (_, state, tip, _) = zebra_state::populated_state(blocks.clone(), &testnet).await;
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
         "",
         "",
@@ -114,6 +118,8 @@ async fn test_z_get_treestate() {
         Buffer::new(MockService::build().for_unit_tests::<_, _, BoxError>(), 1),
         state,
         tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Request the treestate by a hash.
@@ -195,8 +201,9 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     .await;
 
     // Init RPC
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _rpc_tx_queue_task_handle) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "/Zebra:RPC test/",
         network.clone(),
         false,
@@ -204,6 +211,8 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         Buffer::new(mempool.clone(), 1),
         read_state,
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // We only want a snapshot of the `getblocksubsidy` and `getblockchaininfo` methods for the non-default Testnet (with an NU6 activation height).
@@ -218,7 +227,10 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     }
 
     // `getinfo`
-    let get_info = rpc.get_info().expect("We should have a GetInfo struct");
+    let get_info = rpc
+        .get_info()
+        .await
+        .expect("We should have a GetInfo struct");
     snapshot_rpc_getinfo(get_info, &settings);
 
     // `getblockchaininfo`
@@ -229,12 +241,10 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     snapshot_rpc_getblockchaininfo("", get_blockchain_info, &settings);
 
     // get the first transaction of the first block which is not the genesis
-    let first_block_first_transaction = &blocks[1].transactions[0];
+    let first_block_first_tx = &blocks[1].transactions[0];
 
     // build addresses
-    let address = &first_block_first_transaction.outputs()[1]
-        .address(network)
-        .unwrap();
+    let address = &first_block_first_tx.outputs()[1].address(network).unwrap();
     let addresses = vec![address.to_string()];
 
     // `getaddressbalance`
@@ -399,16 +409,21 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         });
 
     // make the api call
-    let get_raw_mempool = rpc.get_raw_mempool();
+    let get_raw_mempool = rpc.get_raw_mempool(None);
     let (response, _) = futures::join!(get_raw_mempool, mempool_req);
-    let get_raw_mempool = response.expect("We should have a GetRawTransaction struct");
+    let GetRawMempool::TxIds(get_raw_mempool) =
+        response.expect("We should have a GetRawTransaction struct")
+    else {
+        panic!("should return TxIds for non verbose");
+    };
 
     snapshot_rpc_getrawmempool(get_raw_mempool, &settings);
 
     // `getrawtransaction` verbosity=0
     //
-    // - similar to `getrawmempool` described above, a mempool request will be made to get the requested
-    // transaction from the mempool, response will be empty as we have this transaction in state
+    // - Similarly to `getrawmempool` described above, a mempool request will be made to get the
+    //   requested transaction from the mempool. Response will be empty as we have this transaction
+    //   in the state.
     let mempool_req = mempool
         .expect_request_that(|request| {
             matches!(request, mempool::Request::TransactionsByMinedId(_))
@@ -417,13 +432,12 @@ async fn test_rpc_response_data_for_network(network: &Network) {
             responder.respond(mempool::Response::Transactions(vec![]));
         });
 
-    // make the api call
-    let get_raw_transaction =
-        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), Some(0u8));
-    let (response, _) = futures::join!(get_raw_transaction, mempool_req);
-    let get_raw_transaction = response.expect("We should have a GetRawTransaction struct");
+    let txid = first_block_first_tx.hash().encode_hex::<String>();
 
-    snapshot_rpc_getrawtransaction("verbosity_0", get_raw_transaction, &settings);
+    let rpc_req = rpc.get_raw_transaction(txid.clone(), Some(0u8));
+    let (rsp, _) = futures::join!(rpc_req, mempool_req);
+    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=0"), rsp));
+    mempool.expect_no_requests().await;
 
     // `getrawtransaction` verbosity=1
     let mempool_req = mempool
@@ -434,13 +448,31 @@ async fn test_rpc_response_data_for_network(network: &Network) {
             responder.respond(mempool::Response::Transactions(vec![]));
         });
 
-    // make the api call
-    let get_raw_transaction =
-        rpc.get_raw_transaction(first_block_first_transaction.hash().encode_hex(), Some(1u8));
-    let (response, _) = futures::join!(get_raw_transaction, mempool_req);
-    let get_raw_transaction = response.expect("We should have a GetRawTransaction struct");
+    let rpc_req = rpc.get_raw_transaction(txid, Some(1u8));
+    let (rsp, _) = futures::join!(rpc_req, mempool_req);
+    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=1"), rsp));
+    mempool.expect_no_requests().await;
 
-    snapshot_rpc_getrawtransaction("verbosity_1", get_raw_transaction, &settings);
+    // `getrawtransaction` with unknown txid
+    let mempool_req = mempool
+        .expect_request_that(|request| {
+            matches!(request, mempool::Request::TransactionsByMinedId(_))
+        })
+        .map(|responder| {
+            responder.respond(mempool::Response::Transactions(vec![]));
+        });
+
+    let rpc_req = rpc.get_raw_transaction(transaction::Hash::from([0; 32]).encode_hex(), Some(1));
+    let (rsp, _) = futures::join!(rpc_req, mempool_req);
+    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_unknown_txid"), rsp));
+    mempool.expect_no_requests().await;
+
+    // `getrawtransaction` with an invalid TXID
+    let rsp = rpc
+        .get_raw_transaction("aBadC0de".to_owned(), Some(1))
+        .await;
+    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_invalid_txid"), rsp));
+    mempool.expect_no_requests().await;
 
     // `getaddresstxids`
     let get_address_tx_ids = rpc
@@ -499,8 +531,9 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
     let mut state = MockService::build().for_unit_tests();
     let mempool = MockService::build().for_unit_tests();
 
+    let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
-        "RPC test",
+        "0.0.1",
         "/Zebra:RPC test/",
         network.clone(),
         false,
@@ -508,6 +541,8 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
         mempool,
         state.clone(),
         latest_chain_tip,
+        MockAddressBookPeers::new(vec![]),
+        rx,
     );
 
     // Test the response format from `z_getsubtreesbyindex` for Sapling.
@@ -577,6 +612,9 @@ fn snapshot_rpc_getinfo(info: GetInfo, settings: &insta::Settings) {
                 // replace with:
                 "[SubVersion]"
             }),
+            ".errorstimestamp" => dynamic_redaction(|_value, _path| {
+                "[LastErrorTimestamp]"
+            }),
         })
     });
 }
@@ -594,6 +632,12 @@ fn snapshot_rpc_getblockchaininfo(
                 assert!(u32::try_from(value.as_u64().unwrap()).unwrap() < Height::MAX_AS_U32);
                 // replace with:
                 "[Height]"
+            }),
+            ".verificationprogress" => dynamic_redaction(|value, _path| {
+                // assert that the value looks like a valid verification progress here
+                assert!(value.as_f64().unwrap() <= 1.0);
+                // replace with:
+                "[f64]"
             }),
         })
     });
@@ -664,17 +708,6 @@ fn snapshot_rpc_getbestblockhash(tip_hash: GetBlockHash, settings: &insta::Setti
 /// Snapshot `getrawmempool` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getrawmempool(raw_mempool: Vec<String>, settings: &insta::Settings) {
     settings.bind(|| insta::assert_json_snapshot!("get_raw_mempool", raw_mempool));
-}
-
-/// Snapshot `getrawtransaction` response, using `cargo insta` and JSON serialization.
-fn snapshot_rpc_getrawtransaction(
-    variant: &'static str,
-    raw_transaction: GetRawTransaction,
-    settings: &insta::Settings,
-) {
-    settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_raw_transaction_{variant}"), raw_transaction)
-    });
 }
 
 /// Snapshot valid `getaddressbalance` response, using `cargo insta` and JSON serialization.

@@ -66,18 +66,16 @@ const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 /// This is the version implemented by the Zebra code that's currently running,
 /// the minor and patch versions on disk can be different.
 pub fn state_database_format_version_in_code() -> Version {
-    Version::new(
-        DATABASE_FORMAT_VERSION,
-        DATABASE_FORMAT_MINOR_VERSION,
-        DATABASE_FORMAT_PATCH_VERSION,
-    )
-}
-
-/// Returns the highest database version that modifies the subtree index format.
-///
-/// This version is used by tests to wait for the subtree upgrade to finish.
-pub fn latest_version_for_adding_subtrees() -> Version {
-    Version::parse("25.2.2").expect("Hardcoded version string should be valid.")
+    Version {
+        major: DATABASE_FORMAT_VERSION,
+        minor: DATABASE_FORMAT_MINOR_VERSION,
+        patch: DATABASE_FORMAT_PATCH_VERSION,
+        pre: semver::Prerelease::EMPTY,
+        #[cfg(feature = "indexer")]
+        build: semver::BuildMetadata::new("indexer").expect("hard-coded value should be valid"),
+        #[cfg(not(feature = "indexer"))]
+        build: semver::BuildMetadata::EMPTY,
+    }
 }
 
 /// The name of the file containing the minor and patch database versions.
@@ -111,6 +109,12 @@ pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
 
 /// These database versions can be recreated from their directly preceding versions.
 pub const RESTORABLE_DB_VERSIONS: [u64; 1] = [26];
+
+/// The maximum number of invalidated block records.
+///
+/// This limits the memory use to around:
+/// `100 entries * up to 99 blocks * 2 MB per block = 20 GB`
+pub const MAX_INVALIDATED_BLOCKS: usize = 100;
 
 lazy_static! {
     /// Regex that matches the RocksDB error when its lock file is already open.

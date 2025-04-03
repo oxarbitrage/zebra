@@ -6,22 +6,16 @@ use std::collections::HashSet;
 
 use tokio::sync::oneshot;
 use zebra_chain::{
-    transaction::{self, UnminedTx, UnminedTxId},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
-
-#[cfg(feature = "getblocktemplate-rpcs")]
-use zebra_chain::transaction::VerifiedUnminedTx;
 
 use crate::BoxError;
 
 mod gossip;
-
 mod transaction_dependencies;
 
-pub use transaction_dependencies::TransactionDependencies;
-
-pub use self::gossip::Gossip;
+pub use self::{gossip::Gossip, transaction_dependencies::TransactionDependencies};
 
 /// A mempool service request.
 ///
@@ -60,6 +54,9 @@ pub enum Request {
     ///
     /// Outdated requests are pruned on a regular basis.
     AwaitOutput(transparent::OutPoint),
+
+    /// Request a [`VerifiedUnminedTx`] and its dependencies by its mined id.
+    TransactionWithDepsByMinedId(transaction::Hash),
 
     /// Get all the [`VerifiedUnminedTx`] in the mempool.
     ///
@@ -123,6 +120,14 @@ pub enum Response {
 
     /// Response to [`Request::AwaitOutput`] with the transparent output
     UnspentOutput(transparent::Output),
+
+    /// Response to [`Request::TransactionWithDepsByMinedId`].
+    TransactionWithDeps {
+        /// The queried transaction
+        transaction: VerifiedUnminedTx,
+        /// A list of dependencies of the queried transaction.
+        dependencies: HashSet<transaction::Hash>,
+    },
 
     /// Returns all [`VerifiedUnminedTx`] in the mempool.
     //

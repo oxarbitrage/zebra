@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use zebra_chain::{
     block::{self, Block, Height},
+    serialization::ZcashSerialize as _,
     transaction::{self, Transaction},
     transparent::{self, Utxo},
 };
@@ -29,6 +30,9 @@ use crate::{
     },
     HashOrHeight,
 };
+
+#[cfg(feature = "indexer")]
+use crate::request::Spend;
 
 /// Returns the [`Block`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
@@ -46,6 +50,31 @@ where
         .and_then(|chain| chain.as_ref().block(hash_or_height))
         .map(|contextual| contextual.block.clone())
         .or_else(|| db.block(hash_or_height))
+}
+
+/// Returns the [`Block`] with [`block::Hash`] or
+/// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
+pub fn block_and_size<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<(Arc<Block>, usize)>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // Since blocks are the same in the finalized and non-finalized state, we
+    // check the most efficient alternative first. (`chain` is always in memory,
+    // but `db` stores blocks on disk, with a memory cache.)
+    chain
+        .as_ref()
+        .and_then(|chain| chain.as_ref().block(hash_or_height))
+        .map(|contextual| {
+            let size = contextual.block.zcash_serialize_to_vec().unwrap().len();
+            (contextual.block.clone(), size)
+        })
+        .or_else(|| db.block_and_size(hash_or_height))
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
@@ -176,9 +205,27 @@ where
     C: AsRef<Chain>,
 {
     match chain {
-        Some(chain) if chain.as_ref().spent_utxos.contains(&outpoint) => None,
+        Some(chain) if chain.as_ref().spent_utxos.contains_key(&outpoint) => None,
         chain => utxo(chain, db, outpoint),
     }
+}
+
+/// Returns the [`Hash`](transaction::Hash) of the transaction that spent an output at
+/// the provided [`transparent::OutPoint`] or revealed the provided nullifier, if it exists
+/// and is spent or revealed in the non-finalized `chain` or finalized `db` and its
+/// spending transaction hash has been indexed.
+#[cfg(feature = "indexer")]
+pub fn spending_transaction_hash<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    spend: Spend,
+) -> Option<transaction::Hash>
+where
+    C: AsRef<Chain>,
+{
+    chain
+        .and_then(|chain| chain.as_ref().spending_transaction_hash(&spend))
+        .or_else(|| db.spending_transaction_hash(&spend))
 }
 
 /// Returns the [`Utxo`] for [`transparent::OutPoint`], if it exists in any chain
