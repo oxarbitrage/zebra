@@ -1,8 +1,10 @@
 //! Randomised property tests for RPC methods.
 
-#[cfg(feature = "getblocktemplate-rpcs")]
-use std::collections::HashMap;
-use std::{collections::HashSet, fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+};
 
 use futures::{join, FutureExt, TryFutureExt};
 use hex::{FromHex, ToHex};
@@ -14,27 +16,28 @@ use tower::buffer::Buffer;
 
 use zebra_chain::{
     amount::{Amount, NonNegative},
-    block::{Block, Height},
+    block::{self, Block, Height},
+    chain_sync_status::MockSyncStatus,
     chain_tip::{mock::MockChainTip, ChainTip, NoChainTip},
+    history_tree::HistoryTree,
     parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, Transaction, UnminedTx, VerifiedUnminedTx},
     transparent,
     value_balance::ValueBalance,
 };
-
 use zebra_consensus::ParameterCheckpoint;
 use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::mempool;
 use zebra_state::{BoxError, GetBlockTemplateChainInfo};
-
 use zebra_test::mock_service::MockService;
 
-#[cfg(feature = "getblocktemplate-rpcs")]
-use crate::methods::types::MempoolObject;
 use crate::methods::{
     self,
-    types::{Balance, GetRawMempool},
+    types::{
+        get_blockchain_info,
+        get_raw_mempool::{GetRawMempool, MempoolObject},
+    },
 };
 
 use super::super::{
@@ -246,50 +249,10 @@ proptest! {
         tokio::time::pause();
 
         runtime.block_on(async move {
-            #[cfg(not(feature = "getblocktemplate-rpcs"))]
-            let (expected_response, mempool_query) = {
-                let transaction_ids: HashSet<_> = transactions
-                    .iter()
-                    .map(|tx| tx.transaction.id)
-                    .collect();
-
-                let mut expected_response: Vec<String> = transaction_ids
-                    .iter()
-                    .map(|id| id.mined_id().encode_hex())
-                    .collect();
-                expected_response.sort();
-
-                let mempool_query = mempool
-                    .expect_request(mempool::Request::TransactionIds)
-                    .map_ok(|r|r.respond(mempool::Response::TransactionIds(transaction_ids)));
-
-                (GetRawMempool::TxIds(expected_response), mempool_query)
-            };
-
-            // Note: this depends on `SHOULD_USE_ZCASHD_ORDER` being true.
-            #[cfg(feature = "getblocktemplate-rpcs")]
-            let (expected_response, mempool_query) = {
-                let mut expected_response = transactions.clone();
-
-                expected_response.sort_by_cached_key(|tx| {
-                    // zcashd uses modified fee here but Zebra doesn't currently
-                    // support prioritizing transactions
-                    std::cmp::Reverse((
-                        i64::from(tx.miner_fee) as u128 * zebra_chain::block::MAX_BLOCK_BYTES as u128
-                            / tx.transaction.size as u128,
-                        // transaction hashes are compared in their serialized byte-order.
-                        tx.transaction.id.mined_id(),
-                    ))
-                });
-
-                let expected_response = expected_response
-                    .iter()
-                    .map(|tx| tx.transaction.id.mined_id().encode_hex::<String>())
-                    .collect::<Vec<_>>();
-
-                let transaction_dependencies = Default::default();
-                let expected_response = if verbose.unwrap_or(false) {
-                    let map = transactions
+            if verbose.unwrap_or(false) {
+                let (expected_response, mempool_query) = {
+                    let transaction_dependencies = Default::default();
+                    let txs = transactions
                         .iter()
                         .map(|unmined_tx| {
                             (
@@ -302,25 +265,42 @@ proptest! {
                             )
                         })
                         .collect::<HashMap<_, _>>();
-                    GetRawMempool::Verbose(map)
-                } else {
-                    GetRawMempool::TxIds(expected_response)
+
+                    let mempool_query = mempool.expect_request(mempool::Request::FullTransactions)
+                        .map_ok(|r| r.respond(mempool::Response::FullTransactions {
+                            transactions,
+                            transaction_dependencies,
+                            last_seen_tip_hash: [0; 32].into(),
+                        }));
+
+                    (GetRawMempool::Verbose(txs), mempool_query)
                 };
 
-                let mempool_query = mempool
-                    .expect_request(mempool::Request::FullTransactions)
-                    .map_ok(|r| r.respond(mempool::Response::FullTransactions {
-                        transactions,
-                        transaction_dependencies,
-                        last_seen_tip_hash: [0; 32].into(),
-                    }));
+                let (rpc_rsp, _) = tokio::join!(rpc.get_raw_mempool(verbose), mempool_query);
+                prop_assert_eq!(rpc_rsp?, expected_response);
+            } else {
+                let (expected_rsp, mempool_query) = {
+                    let mut tx_ids = transactions
+                        .iter()
+                        .map(|tx| tx.transaction.id.mined_id().encode_hex::<String>())
+                        .collect::<Vec<_>>();
 
-                (expected_response, mempool_query)
-            };
+                    tx_ids.sort();
 
-            let (rpc_rsp, _) = tokio::join!(rpc.get_raw_mempool(verbose), mempool_query);
+                    let mempool_rsp = transactions
+                        .iter()
+                        .map(|tx| tx.transaction.id)
+                        .collect::<HashSet<_>>();
 
-            prop_assert_eq!(rpc_rsp?, expected_response);
+                    let mempool_query = mempool.expect_request(mempool::Request::TransactionIds)
+                            .map_ok(|r| r.respond(mempool::Response::TransactionIds(mempool_rsp)));
+
+                    (GetRawMempool::TxIds(tx_ids), mempool_query,)
+                };
+
+                let (rpc_rsp, _) = tokio::join!(rpc.get_raw_mempool(verbose), mempool_query);
+                prop_assert_eq!(rpc_rsp?, expected_rsp);
+            }
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -417,7 +397,7 @@ proptest! {
                         .respond(zebra_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
                             tip_hash: genesis_hash,
                             tip_height: Height::MIN,
-                            history_tree: Default::default(),
+                            chain_history_root: HistoryTree::default().hash(),
                             expected_difficulty: Default::default(),
                             cur_time: DateTime32::now(),
                             min_time: DateTime32::now(),
@@ -491,7 +471,7 @@ proptest! {
                         .respond(zebra_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
                             tip_hash: block_hash,
                             tip_height: block_height,
-                            history_tree: Default::default(),
+                            chain_history_root: HistoryTree::default().hash(),
                             expected_difficulty: Default::default(),
                             cur_time: DateTime32::now(),
                             min_time: DateTime32::now(),
@@ -605,7 +585,7 @@ proptest! {
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);
-            prop_assert_eq!(response.value_pools, Balance::value_pools(ValueBalance::zero()));
+            prop_assert_eq!(response.value_pools, get_blockchain_info::Balance::value_pools(ValueBalance::zero()));
 
             let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
             let next_height = (Height::MIN + 1).expect("genesis height plus one is next height and valid");
@@ -665,7 +645,7 @@ proptest! {
             let state_query = state
                 .expect_request(zebra_state::ReadRequest::AddressBalance(addresses))
                 .map_ok(|responder| {
-                    responder.respond(zebra_state::ReadResponse::AddressBalance(balance))
+                    responder.respond(zebra_state::ReadResponse::AddressBalance { balance, received: balance.into() })
                 });
 
             // Await the RPC call and the state query
@@ -676,7 +656,7 @@ proptest! {
             // Check that response contains the expected balance
             let received_balance = response?;
 
-            prop_assert_eq!(received_balance, AddressBalance { balance: balance.into() });
+            prop_assert_eq!(received_balance, AddressBalance { balance: balance.into(), received: balance.into() });
 
             // Check no further requests were made during this test
             mempool.expect_no_requests().await?;
@@ -970,6 +950,12 @@ fn mock_services<Tip>(
         >,
         Tip,
         MockAddressBookPeers,
+        zebra_test::mock_service::MockService<
+            zebra_consensus::Request,
+            block::Hash,
+            zebra_test::mock_service::PropTestAssertion,
+        >,
+        MockSyncStatus,
     >,
     tokio::task::JoinHandle<()>,
 )
@@ -978,19 +964,23 @@ where
 {
     let mempool = MockService::build().for_prop_tests();
     let state = MockService::build().for_prop_tests();
+    let block_verifier_router = MockService::build().for_prop_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, mempool_tx_queue) = RpcImpl::new(
+        network,
+        Default::default(),
+        Default::default(),
         "0.0.1",
         "RPC test",
-        network,
-        false,
-        true,
         mempool.clone(),
         Buffer::new(state.clone(), 1),
+        block_verifier_router,
+        MockSyncStatus::default(),
         chain_tip,
-        MockAddressBookPeers::new(vec![]),
+        MockAddressBookPeers::default(),
         rx,
+        None,
     );
 
     (mempool, state, rpc, mempool_tx_queue)

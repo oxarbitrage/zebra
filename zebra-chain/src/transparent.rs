@@ -1,21 +1,22 @@
 //! Transparent-related (Bitcoin-inherited) functionality.
 
-use std::{collections::HashMap, fmt, iter};
-
-use crate::{
-    amount::{Amount, NonNegative},
-    block,
-    parameters::Network,
-    primitives::zcash_primitives,
-    transaction,
-};
-
 mod address;
 mod keys;
 mod opcodes;
 mod script;
 mod serialize;
 mod utxo;
+
+use std::{collections::HashMap, fmt, iter};
+
+use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
+
+use crate::{
+    amount::{Amount, NonNegative},
+    block,
+    parameters::Network,
+    transaction,
+};
 
 pub use address::Address;
 pub use script::Script;
@@ -218,14 +219,22 @@ impl Input {
     /// # Panics
     ///
     /// If the coinbase data is greater than [`MAX_COINBASE_DATA_LEN`].
-    #[cfg(feature = "getblocktemplate-rpcs")]
     pub fn new_coinbase(
         height: block::Height,
         data: Option<Vec<u8>>,
         sequence: Option<u32>,
     ) -> Input {
-        // "No extra coinbase data" is the default.
-        let data = data.unwrap_or_default();
+        // `zcashd` includes an extra byte after the coinbase height in the coinbase data. We do
+        // that only if the data is empty to stay compliant with the following consensus rule:
+        //
+        // > A coinbase transaction script MUST have length in {2 .. 100} bytes.
+        //
+        // ## Rationale
+        //
+        // Coinbase heights < 17 are serialized as a single byte, and if there is no coinbase data,
+        // the script of a coinbase tx with such a height would consist only of this single byte,
+        // violating the consensus rule.
+        let data = data.map_or(vec![0], |d| if d.is_empty() { vec![0] } else { d });
         let height_size = height.coinbase_zcash_serialized_size();
 
         assert!(
@@ -239,9 +248,8 @@ impl Input {
         Input::Coinbase {
             height,
             data: CoinbaseData(data),
-
-            // If the caller does not specify the sequence number,
-            // use a sequence number that activates the LockTime.
+            // If the caller does not specify the sequence number, use a sequence number that
+            // activates the LockTime.
             sequence: sequence.unwrap_or(0),
         }
     }
@@ -251,6 +259,22 @@ impl Input {
         match self {
             Input::PrevOut { .. } => None,
             Input::Coinbase { data, .. } => Some(data),
+        }
+    }
+
+    /// Returns the full coinbase script (the encoded height along with the
+    /// extra data) if this is an [`Input::Coinbase`]. Also returns `None` if
+    /// the coinbase is for the genesis block but does not match the expected
+    /// genesis coinbase data.
+    pub fn coinbase_script(&self) -> Option<Vec<u8>> {
+        match self {
+            Input::PrevOut { .. } => None,
+            Input::Coinbase { height, data, .. } => {
+                let mut height_and_data = Vec::new();
+                serialize::write_coinbase_height(*height, data, &mut height_and_data).ok()?;
+                height_and_data.extend(&data.0);
+                Some(height_and_data)
+            }
         }
     }
 
@@ -409,7 +433,6 @@ pub struct Output {
 
 impl Output {
     /// Returns a new coinbase output that pays `amount` using `lock_script`.
-    #[cfg(feature = "getblocktemplate-rpcs")]
     pub fn new_coinbase(amount: Amount<NonNegative>, lock_script: Script) -> Output {
         Output {
             value: amount,
@@ -426,7 +449,14 @@ impl Output {
     /// Return the destination address from a transparent output.
     ///
     /// Returns None if the address type is not valid or unrecognized.
-    pub fn address(&self, network: &Network) -> Option<Address> {
-        zcash_primitives::transparent_output_address(self, network)
+    pub fn address(&self, net: &Network) -> Option<Address> {
+        match TxOut::try_from(self).ok()?.recipient_address()? {
+            TransparentAddress::PublicKeyHash(pkh) => {
+                Some(Address::from_pub_key_hash(net.t_addr_kind(), pkh))
+            }
+            TransparentAddress::ScriptHash(sh) => {
+                Some(Address::from_script_hash(net.t_addr_kind(), sh))
+            }
+        }
     }
 }

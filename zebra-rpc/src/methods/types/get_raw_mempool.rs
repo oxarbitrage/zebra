@@ -1,23 +1,18 @@
 //! Types used in `getrawmempool` RPC method.
 
-use std::collections::HashMap;
-#[cfg(feature = "getblocktemplate-rpcs")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-#[cfg(feature = "getblocktemplate-rpcs")]
 use hex::ToHex as _;
 
-use super::Zec;
-#[cfg(feature = "getblocktemplate-rpcs")]
-use zebra_chain::transaction::VerifiedUnminedTx;
-use zebra_chain::{amount::NonNegative, block::Height};
-#[cfg(feature = "getblocktemplate-rpcs")]
+use zebra_chain::{amount::NonNegative, block::Height, transaction::VerifiedUnminedTx};
 use zebra_node_services::mempool::TransactionDependencies;
+
+use super::zec::Zec;
 
 /// Response to a `getrawmempool` RPC request.
 ///
 /// See the notes for the [`Rpc::get_raw_mempool` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum GetRawMempool {
     /// The transaction IDs, as hex strings (verbose=0)
@@ -29,7 +24,7 @@ pub enum GetRawMempool {
 
 /// A mempool transaction details object as returned by `getrawmempool` in
 /// verbose mode.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MempoolObject {
     /// Transaction size in bytes.
     pub(crate) size: u64,
@@ -55,7 +50,6 @@ pub struct MempoolObject {
 }
 
 impl MempoolObject {
-    #[cfg(feature = "getblocktemplate-rpcs")]
     pub(crate) fn from_verified_unmined_tx(
         unmined_tx: &VerifiedUnminedTx,
         transactions: &[VerifiedUnminedTx],

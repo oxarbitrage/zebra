@@ -34,8 +34,14 @@ pub enum NetworkKind {
 }
 
 impl From<Network> for NetworkKind {
-    fn from(network: Network) -> Self {
-        network.kind()
+    fn from(net: Network) -> Self {
+        NetworkKind::from(&net)
+    }
+}
+
+impl From<&Network> for NetworkKind {
+    fn from(net: &Network) -> Self {
+        net.kind()
     }
 }
 
@@ -82,6 +88,16 @@ impl NetworkKind {
             "main".to_string()
         } else {
             "test".to_string()
+        }
+    }
+
+    /// Returns the 2 bytes prefix for Bech32m-encoded transparent TEX
+    /// payment addresses for the network as defined in [ZIP-320](https://zips.z.cash/zip-0320.html).
+    pub fn tex_address_prefix(self) -> [u8; 2] {
+        // TODO: Add this bytes to `zcash_primitives::constants`?
+        match self {
+            Self::Mainnet => [0x1c, 0xb8],
+            Self::Testnet | Self::Regtest => [0x1d, 0x25],
         }
     }
 }
@@ -149,12 +165,10 @@ impl Network {
 
     /// Creates a new [`Network::Testnet`] with `Regtest` parameters and the provided network upgrade activation heights.
     pub fn new_regtest(
-        nu5_activation_height: Option<u32>,
-        nu6_activation_height: Option<u32>,
+        configured_activation_heights: testnet::ConfiguredActivationHeights,
     ) -> Self {
         Self::new_configured_testnet(testnet::Parameters::new_regtest(
-            nu5_activation_height,
-            nu6_activation_height,
+            configured_activation_heights,
         ))
     }
 
@@ -286,7 +300,7 @@ impl FromStr for Network {
 pub struct InvalidNetworkError(String);
 
 impl zcash_protocol::consensus::Parameters for Network {
-    fn network_type(&self) -> zcash_address::Network {
+    fn network_type(&self) -> zcash_protocol::consensus::NetworkType {
         self.kind().into()
     }
 

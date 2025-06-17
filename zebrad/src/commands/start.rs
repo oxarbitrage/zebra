@@ -84,10 +84,10 @@ use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
 use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
-use zebra_rpc::server::RpcServer;
-
-#[cfg(feature = "getblocktemplate-rpcs")]
-use zebra_rpc::methods::get_block_template_rpcs::types::submit_block::SubmitBlockChannel;
+use zebra_rpc::{
+    methods::{types::submit_block::SubmitBlockChannel, RpcImpl},
+    server::RpcServer,
+};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
@@ -101,6 +101,9 @@ use crate::{
     config::ZebradConfig,
     prelude::*,
 };
+
+#[cfg(feature = "internal-miner")]
+use crate::components;
 
 /// Start the application (default command)
 #[derive(Command, Debug, Default, clap::Parser)]
@@ -240,49 +243,33 @@ impl StartCmd {
         // And give it time to clear its queue
         tokio::task::yield_now().await;
 
-        #[cfg(not(feature = "getblocktemplate-rpcs"))]
-        if config.mining != zebra_rpc::config::mining::Config::default() {
-            warn!(
-                "Unused mining section in config,\
-                 compile with 'getblocktemplate-rpcs' feature to use mining RPCs"
-            );
-        }
-
-        #[cfg(feature = "getblocktemplate-rpcs")]
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_task_handle, mut rpc_tx_queue_task_handle) =
-            if let Some(listen_addr) = config.rpc.listen_addr {
-                info!("spawning RPC server");
-                info!("Trying to open RPC endpoint at {}...", listen_addr,);
-                let rpc_task_handle = RpcServer::spawn(
-                    config.rpc.clone(),
-                    config.mining.clone(),
-                    build_version(),
-                    user_agent(),
-                    mempool.clone(),
-                    read_only_state_service.clone(),
-                    block_verifier_router.clone(),
-                    sync_status.clone(),
-                    address_book.clone(),
-                    latest_chain_tip.clone(),
-                    config.network.network.clone(),
-                    #[cfg(feature = "getblocktemplate-rpcs")]
-                    Some(submit_block_channel.sender()),
-                    #[cfg(not(feature = "getblocktemplate-rpcs"))]
-                    None,
-                    LAST_WARN_ERROR_LOG_SENDER.subscribe(),
-                );
-                rpc_task_handle.await.unwrap()
-            } else {
-                info!("configure a listen_addr to start the RPC server");
-                (
-                    tokio::spawn(std::future::pending().in_current_span()),
-                    tokio::spawn(std::future::pending().in_current_span()),
-                )
-            };
+        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
+            config.network.network.clone(),
+            config.mining.clone(),
+            config.rpc.debug_force_finished_sync,
+            build_version(),
+            user_agent(),
+            mempool.clone(),
+            read_only_state_service.clone(),
+            block_verifier_router.clone(),
+            sync_status.clone(),
+            latest_chain_tip.clone(),
+            address_book.clone(),
+            LAST_WARN_ERROR_LOG_SENDER.subscribe(),
+            Some(submit_block_channel.sender()),
+        );
+
+        let rpc_task_handle = if config.rpc.listen_addr.is_some() {
+            RpcServer::start(rpc_impl.clone(), config.rpc.clone())
+                .await
+                .expect("server should start")
+        } else {
+            tokio::spawn(std::future::pending().in_current_span())
+        };
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
@@ -316,10 +303,7 @@ impl StartCmd {
                 sync_status.clone(),
                 chain_tip_change.clone(),
                 peer_set.clone(),
-                #[cfg(feature = "getblocktemplate-rpcs")]
                 Some(submit_block_channel.receiver()),
-                #[cfg(not(feature = "getblocktemplate-rpcs"))]
-                None,
             )
             .in_current_span(),
         );
@@ -401,20 +385,7 @@ impl StartCmd {
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
-
-            let rpc = zebra_rpc::methods::get_block_template_rpcs::GetBlockTemplateRpcImpl::new(
-                &config.network.network,
-                config.mining.clone(),
-                mempool,
-                read_only_state_service,
-                latest_chain_tip,
-                block_verifier_router,
-                sync_status,
-                address_book,
-                Some(submit_block_channel.sender()),
-            );
-
-            crate::components::miner::spawn_init(&config.network.network, &config.mining, rpc)
+            components::miner::spawn_init(rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };
@@ -463,7 +434,7 @@ impl StartCmd {
                     Ok(())
                 }
 
-                rpc_tx_queue_result = &mut rpc_tx_queue_task_handle => {
+                rpc_tx_queue_result = &mut rpc_tx_queue_handle => {
                     rpc_tx_queue_result
                         .expect("unexpected panic in the rpc transaction queue task");
                     info!("rpc transaction queue task exited");
@@ -553,7 +524,7 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
-        rpc_tx_queue_task_handle.abort();
+        rpc_tx_queue_handle.abort();
         syncer_task_handle.abort();
         block_gossip_task_handle.abort();
         mempool_crawler_task_handle.abort();
@@ -567,7 +538,9 @@ impl StartCmd {
         state_checkpoint_verify_handle.abort();
         old_databases_task_handle.abort();
 
-        info!("exiting Zebra: all tasks have been asked to stop, waiting for remaining tasks to finish");
+        info!(
+            "exiting Zebra: all tasks have been asked to stop, waiting for remaining tasks to finish"
+        );
 
         exit_status
     }
