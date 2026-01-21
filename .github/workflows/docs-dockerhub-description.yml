@@ -18,12 +18,12 @@ jobs:
     if: github.repository_owner == 'ZcashFoundation'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.1
         with:
           persist-credentials: false
 
       - name: Docker Hub Description
-        uses: peter-evans/dockerhub-description@v4.0.2
+        uses: peter-evans/dockerhub-description@v5.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
