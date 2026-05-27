@@ -420,6 +420,7 @@ where
             %hash,
             height = tracing::field::Empty,
             peer = tracing::field::Empty,
+            peer_label = tracing::field::Empty,
             request_command = "BlocksByHash",
             result = tracing::field::Empty,
             error_kind = tracing::field::Empty,
@@ -515,10 +516,16 @@ where
                 metrics::counter!("sync.downloaded.block.count").increment(1);
                 metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
                     .record(download_start.elapsed().as_secs_f64());
-                tracing::Span::current().record(
-                    "peer",
-                    tracing::field::display(advertiser_addr.unwrap_or_else(PeerSocketAddr::unspecified)),
-                );
+                if let Some(peer) = advertiser_addr {
+                    tracing::Span::current().record("peer", tracing::field::display(peer));
+                    tracing::Span::current()
+                        .record("peer_label", tracing::field::display(peer.telemetry_label()));
+                } else {
+                    tracing::Span::current().record(
+                        "peer",
+                        tracing::field::display(PeerSocketAddr::unspecified()),
+                    );
+                }
 
                 // Security & Performance: reject blocks that are too far ahead of our tip.
                 // Avoids denial of service attacks, and reduces wasted work on high blocks

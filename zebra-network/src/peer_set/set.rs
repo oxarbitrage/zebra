@@ -1063,6 +1063,7 @@ where
 
             let user_agent_family = svc.user_agent_family();
             let source = svc.source_label();
+            let peer_label = p2c_key.telemetry_label();
             let track_stalls = matches!(
                 &req,
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
@@ -1074,6 +1075,7 @@ where
             let span = tracing::debug_span!(
                 "peer.route_p2c",
                 ?p2c_key,
+                peer_label = %peer_label,
                 command,
                 source,
                 user_agent_family,
@@ -1154,6 +1156,7 @@ where
             let peer = peer.expect("just checked peer is Some");
             let user_agent_family = svc.user_agent_family();
             let source = svc.source_label();
+            let peer_label = peer.telemetry_label();
             tracing::trace!(?hash, ?peer, "routing to a peer which advertised inventory");
             let fut = svc.call(req);
             self.push_unready(peer, svc);
@@ -1162,6 +1165,7 @@ where
                 route = "advertised",
                 ?hash,
                 ?peer,
+                peer_label = %peer_label,
                 command,
                 source,
                 user_agent_family,
@@ -1201,6 +1205,7 @@ where
             let peer = peer.expect("just checked peer is Some");
             let user_agent_family = svc.user_agent_family();
             let source = svc.source_label();
+            let peer_label = peer.telemetry_label();
             tracing::trace!(?hash, ?peer, "routing to a peer that might have inventory");
             let fut = svc.call(req);
             self.push_unready(peer, svc);
@@ -1209,6 +1214,7 @@ where
                 route = "fallback",
                 ?hash,
                 ?peer,
+                peer_label = %peer_label,
                 command,
                 source,
                 user_agent_family,
