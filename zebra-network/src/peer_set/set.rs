@@ -1135,6 +1135,8 @@ where
         hash: InventoryHash,
     ) -> <Self as tower::Service<Request>>::Future {
         let command = req.command();
+        let ready_peers = self.ready_services.len();
+        let unready_peers = self.unready_services.len();
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
@@ -1170,6 +1172,9 @@ where
                 source,
                 user_agent_family,
                 advertising_peers = advertising_peer_list.len(),
+                ready_peers,
+                unready_peers,
+                fallback_candidates = tracing::field::Empty,
                 missing_peers = 0,
                 outcome = tracing::field::Empty,
                 error_kind = tracing::field::Empty,
@@ -1191,12 +1196,13 @@ where
             .missing_peers(hash)
             .copied()
             .collect();
-        let maybe_peer_list = self
+        let maybe_peer_list: HashSet<PeerSocketAddr> = self
             .ready_services
             .keys()
             .filter(|addr| !missing_peer_list.contains(addr))
             .copied()
             .collect();
+        let fallback_candidates = maybe_peer_list.len();
 
         // Security: choose a random, less-loaded peer that might have the inventory.
         let peer = self.select_p2c_peer_from_list(&maybe_peer_list);
@@ -1219,6 +1225,9 @@ where
                 source,
                 user_agent_family,
                 advertising_peers = advertising_peer_list.len(),
+                ready_peers,
+                unready_peers,
+                fallback_candidates,
                 missing_peers = missing_peer_list.len(),
                 outcome = tracing::field::Empty,
                 error_kind = tracing::field::Empty,
@@ -1265,6 +1274,9 @@ where
             source = "none",
             user_agent_family = "unknown",
             advertising_peers = advertising_peer_list.len(),
+            ready_peers,
+            unready_peers,
+            fallback_candidates,
             missing_peers = missing_peer_list.len(),
             outcome = "error",
             error_kind = "not_found_registry",
