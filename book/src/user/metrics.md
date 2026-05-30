@@ -69,8 +69,6 @@ Zebra exposes low-cardinality metrics for diagnosing stalled or slow syncs:
 - `sync.block_verify.error.count{kind}`
 - `sync.validation_request.elapsed.count`
 - `sync.state_request.timeout.count{request}`
-- `sync.missing_inventory.retry.count`
-- `sync.missing_inventory.retry.exhausted.count`
 - `sync.download.slot.age.seconds`
 - `sync.download.slots{state}`
 - `sync.pending_hashes.count{source}`
@@ -84,6 +82,8 @@ Zebra exposes low-cardinality metrics for diagnosing stalled or slow syncs:
 - `peer.discovery.candidate.count{source}`
 - `peer.handshake.count{source,outcome,error_kind}`
 - `peer.ready.count{source,user_agent_family}`
+- `pool.inventory.retry.count`
+- `pool.inventory.retry.exhausted.count`
 
 Peer `source` labels are bounded values such as `dnsseed_str4d`,
 `dnsseed_zcash`, `dnsseed_shieldedinfra`, `dnsseed_zfnd`, `peer_cache`,

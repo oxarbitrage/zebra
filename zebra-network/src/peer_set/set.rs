@@ -1224,7 +1224,7 @@ where
             )
             .increment(1);
             if !missing_peer_list.is_empty() {
-                metrics::counter!("sync.missing_inventory.retry.count").increment(1);
+                metrics::counter!("pool.inventory.retry.count").increment(1);
             }
             return observe_peer_request(command, source, user_agent_family, fut)
                 .instrument(span)
@@ -1242,7 +1242,7 @@ where
             "command" => command,
         )
         .increment(1);
-        metrics::counter!("sync.missing_inventory.retry.exhausted.count").increment(1);
+        metrics::counter!("pool.inventory.retry.exhausted.count").increment(1);
         metrics::counter!(
             "peer.request.error.count",
             "command" => command,
