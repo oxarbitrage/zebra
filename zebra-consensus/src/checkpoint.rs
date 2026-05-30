@@ -468,10 +468,16 @@ where
 
         if let Some(block::Height(target_checkpoint)) = target_checkpoint {
             metrics::gauge!("checkpoint.processing.next.height").set(target_checkpoint as f64);
+            // A checkpoint range is ready to verify: no contiguity gap.
+            metrics::gauge!("checkpoint.contiguity.gap.height").set(0.0);
         } else {
             // Use the start height if there is no potential next checkpoint
             metrics::gauge!("checkpoint.processing.next.height").set(start_height.0 as f64);
             metrics::counter!("checkpoint.waiting.count").increment(1);
+            // No range is ready: the verifier has a contiguous run up to
+            // `pending_height` and is waiting on the next block to extend it.
+            // Non-zero only while wedged, so a persistent value names a stall.
+            metrics::gauge!("checkpoint.contiguity.gap.height").set(pending_height.0 as f64 + 1.0);
         }
 
         target_checkpoint

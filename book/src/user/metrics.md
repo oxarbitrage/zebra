@@ -73,6 +73,7 @@ Zebra exposes low-cardinality metrics for diagnosing stalled or slow syncs:
 - `sync.download.slots{state}`
 - `sync.pending_hashes.count{source}`
 - `sync.checkpoint.range.duration.seconds{result}`
+- `checkpoint.contiguity.gap.height`
 - `sync.exhausted_prospective_tips.count`
 - `peer.request.error.count{command,error_kind,user_agent_family}`
 - `peer.request.duration.seconds{command,outcome}`
