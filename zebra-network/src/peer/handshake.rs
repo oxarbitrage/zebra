@@ -1257,17 +1257,24 @@ pub(crate) async fn register_inventory_status(
                         .send(InventoryChange::new_available(*advertised, transient_addr));
                 }
                 advertised => {
-                    let advertised = advertised
-                        .iter()
-                        .filter(|advertised| advertised.unmined_tx_id().is_some());
-
+                    // Register availability for every advertised item, including blocks.
+                    //
+                    // A multi-block `inv` is almost always a `getblocks` (FindBlocks)
+                    // response — the recent blocks this peer has and can serve. Without
+                    // registering them, `route_inv` has no advertiser for sync blocks and
+                    // load-balances each `getdata` onto arbitrary peers that don't have the
+                    // block yet, producing a `notfound` storm that poisons the inventory
+                    // registry and stalls the syncer near the tip (#5709, #10629).
+                    //
+                    // `new_available_multi` truncates at `MAX_INV_PER_MAP` and the registry
+                    // rotates its maps, so this stays bounded in memory.
                     debug!(
                         ?advertised,
-                        "registering advertised unmined transaction inventory for peer",
+                        "registering advertised block and transaction inventory for peer",
                     );
 
                     if let Some(change) =
-                        InventoryChange::new_available_multi(advertised, transient_addr)
+                        InventoryChange::new_available_multi(advertised.iter(), transient_addr)
                     {
                         // Ignore channel errors that should only happen during shutdown.
                         let _ = inv_collector.send(change);
