@@ -338,6 +338,10 @@ pub(crate) struct Cached<S> {
     /// Test-only. See [`Self::inner_calls_for`].
     #[cfg(test)]
     inner_calls: Arc<Mutex<Vec<CacheKey>>>,
+
+    /// Bench #11673: never read or record keys, so duplicate items always reach `inner`.
+    #[cfg(test)]
+    bypass: bool,
 }
 
 impl<S: Clone> Clone for Cached<S> {
@@ -348,6 +352,8 @@ impl<S: Clone> Clone for Cached<S> {
             metrics: self.metrics.clone(),
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
+            #[cfg(test)]
+            bypass: self.bypass,
         }
     }
 }
@@ -362,6 +368,8 @@ impl<S> Cached<S> {
             metrics: CacheMetrics::new(verifier_name),
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            bypass: false,
         }
     }
 
@@ -376,6 +384,19 @@ impl<S> Cached<S> {
             verified: Arc::new(Mutex::new(VerifiedBundles::new(CACHE_CAPACITY))),
             metrics: self.metrics.clone(),
             inner_calls: Arc::new(Mutex::new(Vec::new())),
+            bypass: false,
+        }
+    }
+
+    /// Bench #11673: a copy of this cache that never hits, so every item is verified.
+    #[cfg(test)]
+    pub(crate) fn bench_uncached(&self) -> Self
+    where
+        S: Clone,
+    {
+        Self {
+            bypass: true,
+            ..self.isolated()
         }
     }
 
@@ -422,6 +443,7 @@ impl<S> Cached<S> {
             verified: self.verified.clone(),
             metrics: self.metrics.clone(),
             inner_calls: self.inner_calls.clone(),
+            bypass: self.bypass,
         }
     }
 }
@@ -460,6 +482,8 @@ where
     fn call(&mut self, item: I) -> Self::Future {
         // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
+        #[cfg(test)]
+        let key = if self.bypass { None } else { key };
 
         // A poisoned cache is bypassed: its set and eviction queue may disagree.
         // Verification remains authoritative even when caching is unavailable.

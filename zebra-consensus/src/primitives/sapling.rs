@@ -117,7 +117,16 @@ pub struct Verifier {
     /// Each batch gets a newly created channel, so there is only ever one result sent per channel.
     /// Tokio doesn't have a oneshot multi-consumer channel, so we use a watch channel.
     tx: watch::Sender<Option<bool>>,
+
+    /// Bench #11673: items queued in the pending batch.
+    #[cfg(test)]
+    queued: usize,
 }
+
+/// Bench #11673: (flush instant, items) for every flushed Sapling batch.
+#[cfg(test)]
+pub(crate) static BENCH_BATCHES: std::sync::Mutex<Vec<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl fmt::Debug for Verifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,6 +169,10 @@ impl Service<BatchControl<Item>> for Verifier {
     fn call(&mut self, req: BatchControl<Item>) -> Self::Future {
         match req {
             BatchControl::Item(item) => {
+                #[cfg(test)]
+                {
+                    self.queued += 1;
+                }
                 let mut rx = self.tx.subscribe();
 
                 let bundle_check = self
@@ -193,6 +206,11 @@ impl Service<BatchControl<Item>> for Verifier {
             }
 
             BatchControl::Flush => {
+                #[cfg(test)]
+                BENCH_BATCHES
+                    .lock()
+                    .expect("unpoisoned")
+                    .push((std::time::Instant::now(), mem::take(&mut self.queued)));
                 let batch = mem::take(&mut self.batch);
                 let tx = mem::take(&mut self.tx);
 

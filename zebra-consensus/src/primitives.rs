@@ -22,7 +22,7 @@ const MAX_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(
 ///
 /// Five milliseconds accommodates microsecond-spaced bursts; continuous input extends the batch
 /// until the size or latency bound, preserving batching during sync.
-const MAX_BATCH_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
+pub(crate) const MAX_BATCH_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Fires off a task into the Rayon threadpool, awaits the result through a oneshot channel,
 /// then converts the error to a [`BoxError`].

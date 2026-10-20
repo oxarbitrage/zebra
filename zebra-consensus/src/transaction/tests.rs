@@ -46,6 +46,8 @@ use super::{check, BlockRequest, BlockTxVerifier, MempoolRequest, MempoolTxVerif
 #[cfg(test)]
 mod prop;
 
+mod bench_11673;
+
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
 fn test_timeout() -> std::time::Duration {

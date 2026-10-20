@@ -471,7 +471,16 @@ pub struct Verifier {
     /// Each batch gets a newly created channel, so there is only ever one result sent per channel.
     /// Tokio doesn't have a oneshot multi-consumer channel, so we use a watch channel.
     tx: Sender,
+
+    /// Bench #11673: (items, actions) queued in the pending batch.
+    #[cfg(test)]
+    queued: (usize, usize),
 }
+
+/// Bench #11673: (flush instant, items, actions) for every flushed halo2 batch.
+#[cfg(test)]
+pub(crate) static BENCH_BATCHES: std::sync::Mutex<Vec<(std::time::Instant, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl Verifier {
     /// Creates a verifier that validates every item against `vk`.
@@ -481,6 +490,8 @@ impl Verifier {
             vk,
             batch: BatchValidator::new(vk),
             tx,
+            #[cfg(test)]
+            queued: (0, 0),
         }
     }
 
@@ -569,6 +580,8 @@ impl Service<BatchControl<Item>> for Verifier {
         match req {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
+                #[cfg(test)]
+                let bench_weight = item.request_weight();
                 match self.batch.queue(item) {
                     Ok(()) => {}
                     // Reject the item on its own without poisoning the rest of the batch. In
@@ -585,6 +598,11 @@ impl Service<BatchControl<Item>> for Verifier {
                             Err(format!("could not validate halo2 proof: {other}").into())
                         });
                     }
+                }
+                #[cfg(test)]
+                {
+                    self.queued.0 += 1;
+                    self.queued.1 += bench_weight;
                 }
                 let mut rx = self.tx.subscribe();
                 Box::pin(async move {
@@ -614,6 +632,15 @@ impl Service<BatchControl<Item>> for Verifier {
 
             BatchControl::Flush => {
                 tracing::trace!("got halo2 flush command");
+                #[cfg(test)]
+                {
+                    let (items, actions) = std::mem::take(&mut self.queued);
+                    BENCH_BATCHES.lock().expect("unpoisoned").push((
+                        std::time::Instant::now(),
+                        items,
+                        actions,
+                    ));
+                }
 
                 let (batch, tx) = self.take();
 
