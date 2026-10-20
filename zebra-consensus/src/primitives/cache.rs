@@ -460,6 +460,8 @@ where
     fn call(&mut self, item: I) -> Self::Future {
         // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
+        #[cfg(feature = "bench")]
+        let key = key.filter(|_| !crate::bench::proof_cache_bypassed());
 
         // A poisoned cache is bypassed: its set and eviction queue may disagree.
         // Verification remains authoritative even when caching is unavailable.

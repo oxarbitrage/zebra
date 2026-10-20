@@ -613,6 +613,9 @@ impl Service<BatchControl<Item>> for Verifier {
 
             BatchControl::Flush => {
                 tracing::trace!("got halo2 flush command");
+                // Each queued item holds one receiver until its result arrives.
+                #[cfg(feature = "bench")]
+                crate::bench::record_halo2_batch(self.tx.receiver_count());
 
                 let (batch, tx) = self.take();
 

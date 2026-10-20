@@ -35,6 +35,9 @@ proptest-impl = ["proptest", "proptest-derive", "zebra-chain/proptest-impl", "ze
 # Exposes `block` (equihash + block::check) to fuzz harnesses; private in normal builds.
 fuzzing = []
 
+# Exposes hidden hooks for `benches/batch_latency.rs`: a proof-cache bypass and Halo2 batch sizes.
+bench = []
+
 [dependencies]
 blake2b_simd = { workspace = true }
 bellman = { workspace = true }
@@ -116,6 +119,11 @@ harness = false
 [[bench]]
 name = "sapling"
 harness = false
+
+[[bench]]
+name = "batch_latency"
+harness = false
+required-features = ["bench"]
 
 [lints]
 workspace = true

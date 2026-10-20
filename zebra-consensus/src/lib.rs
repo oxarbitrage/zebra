@@ -44,6 +44,9 @@ mod checkpoint;
 mod primitives;
 mod script;
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench;
 pub mod config;
 pub mod error;
 pub mod router;
