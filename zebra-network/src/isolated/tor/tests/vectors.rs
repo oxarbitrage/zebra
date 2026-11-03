@@ -54,14 +54,14 @@ async fn connect_isolated_run_tor_multi() {
     let mut isolated_conns = FuturesUnordered::new();
 
     // Use all the seeder hostnames for each network
-    for network in [Mainnet, Testnet] {
+    for network in [Mainnet, Network::new_default_testnet()] {
         let config = Config {
-            network,
+            network: network.clone(),
             ..Config::default()
         };
 
         for seeder_hostname in config.initial_peer_hostnames().iter().cloned() {
-            let conn = connect_isolated_run_tor_once_with(network, seeder_hostname);
+            let conn = connect_isolated_run_tor_once_with(network.clone(), seeder_hostname);
             isolated_conns.push(conn);
         }
     }
@@ -89,4 +89,29 @@ async fn connect_isolated_run_tor_once_with(network: Network, hostname: String) 
     assert!(matches!(outbound_result, Ok(Ok(_)) | Err(_)));
 
     outbound_join_handle.abort();
+}
+
+/// Throwaway probe (tor-arti-check): does a Zebra handshake over Tor actually complete?
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn tor_probe_handshake() {
+    let _init_guard = zebra_test::init();
+    let config = Config::default();
+    for hostname in config.initial_peer_hostnames().iter().cloned() {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(180),
+            connect_isolated_tor(Mainnet, hostname.clone(), "".to_string()),
+        )
+        .await;
+        let outcome = match result {
+            Ok(Ok(_client)) => "HANDSHAKE OK".to_string(),
+            Ok(Err(e)) => format!("ERROR: {e}"),
+            Err(_) => "TIMEOUT after 180s".to_string(),
+        };
+        println!("TOR-PROBE {hostname}: {outcome} ({:.1}s)", started.elapsed().as_secs_f64());
+        if outcome == "HANDSHAKE OK" {
+            break;
+        }
+    }
 }

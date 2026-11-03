@@ -3,15 +3,13 @@
 use std::sync::{Arc, Mutex};
 
 use arti_client::{DataStream, TorAddr, TorClient, TorClientConfig};
-use tor_rtcompat::tokio::TokioRuntimeHandle;
+use tor_rtcompat::PreferredRuntime;
 use tower::Service;
 
 use zebra_chain::parameters::Network;
 
-use crate::{
-    connect_isolated, connect_isolated_with_inbound, peer::Client as ZebraClient, BoxError,
-    Request, Response,
-};
+use super::{connect_isolated, connect_isolated_with_inbound};
+use crate::{peer::Client as ZebraClient, BoxError, Request, Response};
 
 #[cfg(test)]
 mod tests;
@@ -21,7 +19,7 @@ lazy_static::lazy_static! {
     ///
     /// TODO: turn this into a tower service that takes a hostname, and returns an [`arti_client::DataStream`]
     ///       (or a task that updates a watch channel when it's done?)
-    pub static ref SHARED_TOR_CLIENT: Arc<Mutex<Option<TorClient<TokioRuntimeHandle>>>> =
+    pub static ref SHARED_TOR_CLIENT: Arc<Mutex<Option<Arc<TorClient<PreferredRuntime>>>>> =
         Arc::new(Mutex::new(None));
 }
 
@@ -54,7 +52,7 @@ pub async fn connect_isolated_tor(
     //
     // TODO: fix the lifetime issues, and call connect_isolated_tor_with_inbound
     //       so the behaviour of both functions is consistent.
-    connect_isolated(network, tor_stream, user_agent).await
+    connect_isolated(&network, tor_stream, user_agent).await
 }
 
 /// Creates an isolated Zcash peer connection to `hostname` via Tor.
@@ -79,7 +77,7 @@ where
 {
     let tor_stream = new_tor_stream(hostname).await?;
 
-    connect_isolated_with_inbound(network, tor_stream, user_agent, inbound_service).await
+    connect_isolated_with_inbound(&network, tor_stream, user_agent, inbound_service).await
 }
 
 /// Creates a Zcash peer connection to `hostname` via Tor, and returns a tor stream.
@@ -94,7 +92,7 @@ async fn new_tor_stream(hostname: String) -> Result<DataStream, BoxError> {
         None => new_tor_client().await?,
     };
 
-    let tor_stream = tor_client.connect(addr, None).await?;
+    let tor_stream = tor_client.connect(addr).await?;
 
     Ok(tor_stream)
 }
@@ -102,10 +100,9 @@ async fn new_tor_stream(hostname: String) -> Result<DataStream, BoxError> {
 /// Returns a new tor client instance, and updates [`struct@SHARED_TOR_CLIENT`].
 ///
 /// If there is a bootstrap error, [`struct@SHARED_TOR_CLIENT`] is not modified.
-async fn new_tor_client() -> Result<TorClient<TokioRuntimeHandle>, BoxError> {
-    let runtime = tokio::runtime::Handle::current();
-    let runtime = TokioRuntimeHandle::new(runtime);
-    let tor_client = TorClient::bootstrap(runtime, TorClientConfig::default()).await?;
+async fn new_tor_client() -> Result<Arc<TorClient<PreferredRuntime>>, BoxError> {
+    // Uses the current tokio runtime.
+    let tor_client = TorClient::create_bootstrapped(TorClientConfig::default()).await?;
 
     // # Correctness
     //
@@ -123,10 +120,10 @@ async fn new_tor_client() -> Result<TorClient<TokioRuntimeHandle>, BoxError> {
 /// Returns an isolated tor client instance by cloning [`struct@SHARED_TOR_CLIENT`].
 ///
 /// If [`new_tor_client`] has not run successfully yet, returns `None`.
-fn cloned_tor_client() -> Option<TorClient<TokioRuntimeHandle>> {
+fn cloned_tor_client() -> Option<Arc<TorClient<PreferredRuntime>>> {
     SHARED_TOR_CLIENT
         .lock()
         .expect("panic in shared tor client mutex guard")
         .as_ref()
-        .map(TorClient::isolated_client)
+        .map(|tor_client| tor_client.isolated_client())
 }
