@@ -1,0 +1,4 @@
+project: zebra-utils
+kind: Added
+body: 'Added the `known-hashes` tool (feature `known-hashes`), which sweeps block hashes and sizes from a synced node over JSON-RPC, checks them against the checkpoint list, and emits known-hash list chunk files with the `KnownHashListSpec` that pins them.'
+time: 2026-11-05T12:00:00.000000000-03:00

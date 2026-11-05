@@ -3,6 +3,7 @@
 Tools for maintaining and testing Zebra:
 
 - [zebra-checkpoints](#zebra-checkpoints)
+- [known-hashes](#known-hashes)
 - [zebrad-hash-lookup](#zebrad-hash-lookup)
 - [zebrad-log-filter](#zebrad-log-filter)
 - [zcash-rpc-diff](#zcash-rpc-diff)
@@ -95,6 +96,41 @@ Then use the commands above to regenerate the checkpoints.
   of the existing checkpoint file. If you started from genesis, replace the entire file.
 - Open a pull request with the updated Mainnet and Testnet lists at:
   <https://github.com/ZcashFoundation/zebra/pulls>
+
+## known-hashes
+
+This command builds a known-hash list: chunk files holding the hash and a size hint for every
+block from genesis up to a checkpoint height, and the `KnownHashListSpec` constant that pins
+each chunk's SHA-256. Zebra doesn't use known-hash lists yet.
+
+It sweeps every block hash and serialized block size from a synced local `zebrad` or `zcashd`
+node over JSON-RPC, and checks the swept hashes against the network's checkpoint list: every
+checkpointed height must match exactly, and a single mismatch fails the run. Before printing
+the spec, it re-reads the emitted chunks with the same loader Zebra uses.
+
+`known-hashes` is a standalone rust binary, you can compile it using:
+
+```sh
+cargo install --locked --features known-hashes --git https://github.com/ZcashFoundation/zebra zebra-utils
+```
+
+To sweep a synced local node, then emit the chunks and the spec constant:
+
+```sh
+known-hashes --network mainnet --out-dir assets/
+known-hashes --network mainnet --out-dir assets/ --emit-chunks --end-height <checkpoint-height>
+```
+
+The end height must be a height in the network's checkpoint list. Sweeps are resumable: heights
+already present in the sweep files are skipped, so an interrupted sweep continues where it left
+off. By default the sweep stops 100 blocks below the node tip, so it never records blocks that
+could still be reorged away.
+
+You can see all the `known-hashes` options using:
+
+```sh
+target/release/known-hashes --help
+```
 
 ## zebrad-hash-lookup
 
