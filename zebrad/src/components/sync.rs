@@ -44,6 +44,7 @@ mod downloads;
 pub mod end_of_support;
 mod gossip;
 mod hedge;
+mod known_hash;
 pub(crate) mod progress;
 mod recent_sync_lengths;
 mod status;
@@ -306,6 +307,40 @@ pub struct Config {
     /// If the number of logical cores can't be detected, Zebra uses one thread.
     /// For details, see [the `rayon` documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
     pub parallel_cpu_threads: usize,
+
+    /// PROTOTYPE: download blocks below the max height of the known-hash list
+    /// in `known_hash_dir` by known hash, instead of discovering them from
+    /// peers. When `false` (the default), sync behaves exactly as before.
+    pub known_hash_ibd: bool,
+
+    /// PROTOTYPE: the directory holding `known-hashes.spec` and its chunk files.
+    /// Required when `known_hash_ibd` is `true`.
+    pub known_hash_dir: Option<std::path::PathBuf>,
+
+    /// PROTOTYPE: the maximum number of uncommitted heights in the download window.
+    pub known_hash_window_blocks: usize,
+
+    /// PROTOTYPE: the maximum sum of size-hint upper bounds of uncommitted
+    /// heights in the download window, in bytes.
+    pub known_hash_window_bytes: u64,
+
+    /// PROTOTYPE: the maximum number of hashes in one `getdata` request.
+    pub known_hash_batch_blocks: usize,
+
+    /// PROTOTYPE: the maximum sum of size-hint upper bounds in one `getdata`
+    /// request, in bytes (a single larger block is always allowed).
+    pub known_hash_batch_bytes: u64,
+
+    /// PROTOTYPE: the maximum number of `getdata` requests in flight.
+    pub known_hash_max_batches: usize,
+
+    /// PROTOTYPE: the maximum number of blocks sent to the verifier and not yet
+    /// committed. Raised to at least two checkpoint gaps.
+    pub known_hash_verify_ahead: usize,
+
+    /// PROTOTYPE: re-request blocks just above the commit frontier that have
+    /// been in flight for this many milliseconds.
+    pub known_hash_hedge_after_ms: u64,
 }
 
 impl Default for Config {
@@ -334,6 +369,16 @@ impl Default for Config {
             // If this causes tokio executor starvation, move CPU-intensive tasks to rayon threads,
             // or reserve a few cores for tokio threads, based on `num_cpus()`.
             parallel_cpu_threads: 0,
+
+            known_hash_ibd: false,
+            known_hash_dir: None,
+            known_hash_window_blocks: 10_000,
+            known_hash_window_bytes: 1_000_000_000,
+            known_hash_batch_blocks: 16,
+            known_hash_batch_bytes: 800_000,
+            known_hash_max_batches: 48,
+            known_hash_verify_ahead: 2_000,
+            known_hash_hedge_after_ms: 4_000,
         }
     }
 }
@@ -371,7 +416,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZV::Future: Send,
+    ZV::Future: Send + 'static,
     ZSTip: ChainTip + Clone + Send + 'static,
 {
     // Configuration
@@ -447,6 +492,9 @@ where
 
     /// Publishes the syncer state that the progress task logs when sync stalls.
     diagnostics: watch::Sender<SyncDiagnostics>,
+
+    /// PROTOTYPE: the known-hash IBD engine, run once before the regular syncer.
+    known_hash: Option<known_hash::KnownHashIbd<ZN, ZV, ZSTip>>,
 }
 
 /// A sync round that ended early, and why.
@@ -498,7 +546,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZV::Future: Send,
+    ZV::Future: Send + 'static,
     ZSTip: ChainTip + Clone + Send + 'static,
 {
     /// Returns a new syncer instance, using:
@@ -554,6 +602,23 @@ where
         }
 
         let tip_network = Timeout::new(peers.clone(), TIPS_RESPONSE_TIMEOUT);
+
+        let known_hash = config.sync.known_hash_ibd.then(|| {
+            let dir = config
+                .sync
+                .known_hash_dir
+                .as_ref()
+                .expect("sync.known_hash_ibd requires sync.known_hash_dir");
+            let list = known_hash::load_list(&config.network.network, dir)
+                .expect("the known-hash list must load and verify");
+            known_hash::KnownHashIbd::new(
+                &config.sync,
+                list,
+                peers.clone(),
+                verifier.clone(),
+                latest_chain_tip.clone(),
+            )
+        });
 
         // Capacity waiting stays inside the network request and does not consume a retry.
         // Connections start response deadlines at wire dispatch; Downloads bounds readiness
@@ -615,6 +680,7 @@ where
             block_reobtain_retries: HashMap::new(),
             utxo_race_drops: 0,
             diagnostics,
+            known_hash,
         };
 
         (new_syncer, sync_status)
@@ -623,6 +689,16 @@ where
     /// Runs the syncer to synchronize the chain and keep it synchronized.
     #[instrument(skip(self))]
     pub async fn sync(mut self) -> Result<(), Report> {
+        // PROTOTYPE: download blocks by known hash below the list's max height.
+        if let Some(engine) = self.known_hash.take() {
+            if let Err(error) = engine.run().await {
+                warn!(
+                    ?error,
+                    "known-hash IBD failed, falling back to the regular syncer"
+                );
+            }
+        }
+
         // We can't download the genesis block using our normal algorithm,
         // due to protocol limitations
         self.request_genesis().await?;
