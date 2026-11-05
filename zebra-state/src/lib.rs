@@ -70,9 +70,11 @@ pub use service::{
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
 
-// Allow use in the scanner and external tests
+// Allow use in the scanner, external tests and benchmarks
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
+pub use service::finalized_state::{
+    DiskDb, ReadDisk, TypedColumnFamily, WriteTypedBatch, STATE_COLUMN_FAMILIES_IN_CODE,
+};
 
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZebraDb},

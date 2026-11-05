@@ -99,5 +99,12 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 zebra-chain = { path = "../zebra-chain", features = ["proptest-impl"] }
 zebra-test = { path = "../zebra-test/" }
 
+criterion = { workspace = true }
+
+[[bench]]
+name = "finalized_write"
+harness = false
+required-features = ["proptest-impl"]
+
 [lints]
 workspace = true
