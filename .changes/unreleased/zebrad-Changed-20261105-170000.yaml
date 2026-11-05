@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: Sized the state database's RocksDB background flush and compaction pool from the available CPU cores (2 to 16 jobs) instead of RocksDB's default of two, so compaction can keep up with the block writer during initial sync.
+time: 2026-11-05T17:00:00.000000000+00:00

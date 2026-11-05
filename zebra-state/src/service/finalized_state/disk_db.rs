@@ -958,6 +958,17 @@ impl DiskDb {
     /// <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning>
     const MEMTABLE_RAM_CACHE_MEGABYTES: usize = 128;
 
+    /// The fewest RocksDB background flush and compaction jobs to run.
+    ///
+    /// This is RocksDB's default.
+    const MIN_BACKGROUND_JOBS: usize = 2;
+
+    /// The most RocksDB background flush and compaction jobs to run.
+    const MAX_BACKGROUND_JOBS: usize = 16;
+
+    /// The most threads a single RocksDB compaction can be split across.
+    const MAX_SUBCOMPACTIONS: u32 = 4;
+
     /// Build a vector of current column families on the disk and optionally any new column families.
     /// Returns an iterable collection of all column families.
     fn construct_column_families(
@@ -1318,6 +1329,19 @@ impl DiskDb {
         //
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
+
+        // Let flushes and compactions use the machine's cores. RocksDB defaults to two
+        // background jobs, so during sync compaction can fall behind the single state writer,
+        // and RocksDB then stalls writes until it catches up.
+        let background_jobs = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(Self::MIN_BACKGROUND_JOBS)
+            .clamp(Self::MIN_BACKGROUND_JOBS, Self::MAX_BACKGROUND_JOBS);
+        let background_jobs = i32::try_from(background_jobs)
+            .expect("background job count is clamped to MAX_BACKGROUND_JOBS, which fits in i32");
+        opts.increase_parallelism(background_jobs);
+        opts.set_max_background_jobs(background_jobs);
+        opts.set_max_subcompactions(Self::MAX_SUBCOMPACTIONS);
 
         // Increase the process open file limit if needed,
         // then use it to set RocksDB's limit.
