@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: Added
+body: 'Added `parameters::known_hashes`: the known-hash list chunk format (`Chunk`), size hints (`size_hint`, `SIZE_HINT_UNIT`), and `KnownHashList`, a loader that checks every chunk against a SHA-256 pinned in a `KnownHashListSpec` and against the checkpoint list. Nothing reads a known-hash list yet.'
+time: 2026-11-05T12:00:00.000000000-03:00
