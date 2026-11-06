@@ -90,6 +90,20 @@ pub struct ZebraDb {
 }
 
 impl ZebraDb {
+    /// Returns every key and value in the column family `cf_name`, in key order.
+    #[cfg(test)]
+    pub(crate) fn raw_column_family_contents(
+        &self,
+        cf_name: &str,
+    ) -> Vec<(super::disk_format::RawBytes, super::disk_format::RawBytes)> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("column family was created when database was created");
+
+        self.db.zs_forward_range_iter(&cf, ..).collect()
+    }
+
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
     /// and returns a shared high-level typed database wrapper.

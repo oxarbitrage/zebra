@@ -43,7 +43,7 @@ use crate::{
         },
         record_phase,
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, RawBytes,
+        CheckpointCommitOverlay, FromDisk, OverlayLookups, RawBytes,
     },
     HashOrHeight,
 };
@@ -440,6 +440,9 @@ impl ZebraDb {
     /// - `source`: the source of the block in log messages
     /// - `phase_timer`: if `Some`, the start of the next checkpoint commit phase, used to record
     ///   the time spent in each phase of this method
+    /// - `overlay`: if `Some`, recently written outputs and address balances, which are used
+    ///   instead of database reads, then updated with this block's writes. Only checkpoint
+    ///   commits pass it, after format upgrades have finished (see [`CheckpointCommitOverlay`]).
     ///
     /// Returns the block hash and the new chain value pools.
     ///
@@ -457,7 +460,18 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         mut phase_timer: Option<Instant>,
+        mut overlay: Option<&mut CheckpointCommitOverlay>,
     ) -> Result<(block::Hash, ValueBalance<NonNegative>), CommitCheckpointVerifiedError> {
+        // Format upgrades can rewrite address balances, so the overlay is only used once they
+        // have finished. (This flag never goes back to `false`.)
+        let finished_format_upgrades = self.finished_format_upgrades();
+        assert!(
+            overlay.is_none() || finished_format_upgrades,
+            "the checkpoint commit overlay must only be used after format upgrades have finished",
+        );
+
+        let mut lookups = OverlayLookups::default();
+
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -490,6 +504,31 @@ impl ZebraDb {
                 .flat_map(|tx| tx.inputs().into_iter())
                 .flat_map(|input| input.outpoint())
                 .map(|outpoint| {
+                    if let Some((out_loc, utxo)) = overlay
+                        .as_deref()
+                        .and_then(|overlay| overlay.utxo(&outpoint))
+                    {
+                        lookups.output_hits += 1;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            assert_eq!(
+                                self.output_location(&outpoint),
+                                Some(out_loc),
+                                "overlay output location must match the database",
+                            );
+                            assert_eq!(
+                                self.utxo_by_location(out_loc)
+                                    .map(|ordered_utxo| ordered_utxo.utxo),
+                                Some(utxo.clone()),
+                                "overlay output must match the database",
+                            );
+                        }
+
+                        return (outpoint, out_loc, utxo);
+                    }
+                    lookups.output_misses += 1;
+
                     (
                         outpoint,
                         // Some utxos are spent in the same block, so they will be in
@@ -509,6 +548,25 @@ impl ZebraDb {
                     )
                 })
                 .collect();
+
+        // The outputs this block spends, which the overlay drops after the block is written.
+        let spent_outpoints: Vec<transparent::OutPoint> = if overlay.is_some() {
+            spent_utxos
+                .iter()
+                .map(|(outpoint, _out_loc, _utxo)| *outpoint)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Spends of this block's own outputs can never be in the overlay, so they are counted
+        // separately from spends that fell outside the overlay.
+        if overlay.is_some() {
+            lookups.output_same_block = spent_outpoints
+                .iter()
+                .filter(|outpoint| finalized.new_outputs.contains_key(outpoint))
+                .count() as u64;
+        }
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -543,9 +601,9 @@ impl ZebraDb {
 
         // Get the current address balances, before the transactions in this block
 
-        fn read_addr_locs<T, F: Fn(&transparent::Address) -> Option<T>>(
+        fn read_addr_locs<T, F: FnMut(&transparent::Address) -> Option<T>>(
             changed_addresses: HashSet<transparent::Address>,
-            f: F,
+            mut f: F,
         ) -> HashMap<transparent::Address, T> {
             changed_addresses
                 .into_iter()
@@ -563,8 +621,25 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
+        let address_balances: AddressBalanceLocationUpdates = if finished_format_upgrades {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                if let Some(balance) = overlay
+                    .as_deref()
+                    .and_then(|overlay| overlay.address_balance_location(addr))
+                {
+                    lookups.balance_hits += 1;
+
+                    #[cfg(debug_assertions)]
+                    assert_eq!(
+                        self.address_balance_location(addr),
+                        Some(balance),
+                        "overlay address balance must match the database",
+                    );
+
+                    return Some(balance);
+                }
+                lookups.balance_misses += 1;
+
                 self.address_balance_location(addr)
             }))
         } else {
@@ -577,19 +652,20 @@ impl ZebraDb {
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
-        let new_value_pool = batch.prepare_block_batch_with_value_pool(
-            self,
-            network,
-            &finalized,
-            new_outputs_by_out_loc,
-            spent_utxos_by_outpoint,
-            spent_utxos_by_out_loc,
-            #[cfg(feature = "indexer")]
-            out_loc_by_outpoint,
-            address_balances,
-            value_pool,
-            prev_note_commitment_trees,
-        )?;
+        let (new_value_pool, written_address_balances) = batch
+            .prepare_block_batch_with_value_pool(
+                self,
+                network,
+                &finalized,
+                new_outputs_by_out_loc,
+                spent_utxos_by_outpoint,
+                spent_utxos_by_out_loc,
+                #[cfg(feature = "indexer")]
+                out_loc_by_outpoint,
+                address_balances,
+                value_pool,
+                prev_note_commitment_trees,
+            )?;
         record_phase!(phase_timer, "checkpoint_batch_build");
 
         // Track batch commit latency for observability
@@ -600,6 +676,40 @@ impl ZebraDb {
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
         record_phase!(phase_timer, "checkpoint_db_write");
+
+        if let Some(overlay) = overlay.as_mut() {
+            overlay.add_lookups(lookups);
+
+            // The database ignores genesis outputs and doesn't index genesis addresses, so the
+            // overlay doesn't either.
+            if !finalized.height.is_min() {
+                let new_outputs = finalized
+                    .new_outputs
+                    .iter()
+                    .map(|(outpoint, ordered_utxo)| {
+                        (
+                            *outpoint,
+                            lookup_out_loc(finalized.height, outpoint, &tx_hash_indexes),
+                            ordered_utxo.utxo.clone(),
+                        )
+                    });
+                let written_balances = match written_address_balances {
+                    Some(AddressBalanceLocationUpdates::Insert(balances)) => balances,
+                    _ => unreachable!(
+                        "the overlay is only used after format upgrades, which use inserts, \
+                         and the transparent batch is only skipped for genesis"
+                    ),
+                };
+
+                overlay.apply_block(
+                    finalized.height,
+                    spent_outpoints,
+                    new_outputs,
+                    written_balances,
+                );
+            }
+            record_phase!(phase_timer, "checkpoint_overlay_update");
+        }
 
         tracing::trace!(?source, "committed block from");
 
@@ -672,11 +782,12 @@ impl DiskWriteBatch {
             value_pool,
             prev_note_commitment_trees,
         )
-        .map(|_new_value_pool| ())
+        .map(|_| ())
     }
 
     /// Prepare a database batch containing `finalized.block`, like [`Self::prepare_block_batch`],
-    /// and return the chain value pools after the block.
+    /// and return the chain value pools after the block, and the address balances written to the
+    /// batch (`None` for the genesis block, which doesn't update address balances).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_block_batch_with_value_pool(
         &mut self,
@@ -693,7 +804,13 @@ impl DiskWriteBatch {
         address_balances: AddressBalanceLocationUpdates,
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-    ) -> Result<ValueBalance<NonNegative>, CommitCheckpointVerifiedError> {
+    ) -> Result<
+        (
+            ValueBalance<NonNegative>,
+            Option<AddressBalanceLocationUpdates>,
+        ),
+        CommitCheckpointVerifiedError,
+    > {
         let db = &zebra_db.db;
 
         // Commit block, transaction, and note commitment tree data.
@@ -717,19 +834,21 @@ impl DiskWriteBatch {
         //
         // Ignore genesis UTXOs and the transparent address index. The shared block value-pool
         // calculation also excludes these unspendable outputs; shielded updates are retained.
+        let mut written_address_balances = None;
         if !finalized.height.is_min() {
             // Commit transaction indexes
-            self.prepare_transparent_transaction_batch(
-                zebra_db,
-                network,
-                finalized,
-                &new_outputs_by_out_loc,
-                &spent_utxos_by_outpoint,
-                &spent_utxos_by_out_loc,
-                #[cfg(feature = "indexer")]
-                &out_loc_by_outpoint,
-                address_balances,
-            );
+            written_address_balances =
+                Some(self.prepare_transparent_transaction_batch_with_balances(
+                    zebra_db,
+                    network,
+                    finalized,
+                    &new_outputs_by_out_loc,
+                    &spent_utxos_by_outpoint,
+                    &spent_utxos_by_out_loc,
+                    #[cfg(feature = "indexer")]
+                    &out_loc_by_outpoint,
+                    address_balances,
+                ));
         }
 
         // Commit UTXOs and value pools
@@ -743,7 +862,7 @@ impl DiskWriteBatch {
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
 
-        Ok(new_value_pool)
+        Ok((new_value_pool, written_address_balances))
     }
 
     /// Prepare a database batch containing the block header and transaction data

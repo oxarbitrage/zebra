@@ -262,3 +262,123 @@ fn checkpoint_tip_cache_matches_database() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that the overlay of recently written outputs and address balances carried between
+/// checkpoint commits always matches the database, and doesn't change what is written, with
+/// budgets small enough to evict entries every block, and after failed commits.
+///
+/// Debug builds also check every overlay hit against the database during the commit.
+#[test]
+fn checkpoint_commit_overlay_matches_database() -> Result<()> {
+    use crate::service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE;
+
+    let _init_guard = zebra_test::init();
+
+    let (network, _) = fake_activation_heights_network();
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy).with_valid_commitments().no_shrink(),
+          budget_bytes in 1..20_000usize)| {
+            // Skip format upgrades, so the upgrade task can't mark them as finished on its own.
+            let mut state = FinalizedState::new_with_debug(&Config::ephemeral(), &network, true, false)
+                .expect("opening an ephemeral database should succeed");
+            state.checkpoint_commit_cache_bytes = budget_bytes;
+
+            // The same chain, committed without an overlay.
+            let mut reference_state = FinalizedState::new_with_debug(&Config::ephemeral(), &network, true, false)
+                .expect("opening an ephemeral database should succeed");
+            reference_state.checkpoint_commit_cache_bytes = 0;
+
+            let mut note_commitment_trees = None;
+            let mut tip_cache = None;
+            let mut reference_note_commitment_trees = None;
+            let mut reference_tip_cache = None;
+            let mut lookups = Vec::new();
+
+            let heartwood_height = NetworkUpgrade::Heartwood.activation_height(&network).unwrap();
+            let nu5_height = NetworkUpgrade::Nu5.activation_height(&network).unwrap();
+
+            for block in chain.iter() {
+                let current_height = block.block.coinbase_height().unwrap();
+
+                // A failed commit drops the overlay, like the block write task does.
+                if current_height == heartwood_height || current_height == nu5_height {
+                    let block = block.block.clone().set_block_commitment([0x42; 32]);
+                    let (rsp_tx, _rsp_rx) = oneshot::channel();
+                    let failed_tip_cache: Option<crate::service::finalized_state::CheckpointTipCache> = tip_cache.take();
+                    if let Some(overlay) = failed_tip_cache.as_ref().and_then(|cache| cache.overlay.as_ref()) {
+                        lookups.push(overlay.lookups());
+                    }
+                    state.commit_checkpoint_verified(
+                        (CheckpointVerifiedBlock::from(block), rsp_tx),
+                        note_commitment_trees.clone(),
+                        failed_tip_cache,
+                    ).expect_err("Must fail commitment check");
+                }
+
+                let (rsp_tx, _rsp_rx) = oneshot::channel();
+                let (tip, trees, new_tip_cache) = state.commit_checkpoint_verified(
+                    (CheckpointVerifiedBlock::from(block.block.clone()), rsp_tx),
+                    note_commitment_trees.take(),
+                    tip_cache.take(),
+                ).unwrap();
+                note_commitment_trees = Some(trees);
+                prop_assert_eq!(tip.hash, block.hash);
+
+                let (rsp_tx, _rsp_rx) = oneshot::channel();
+                let (reference_tip, trees, new_reference_tip_cache) = reference_state.commit_checkpoint_verified(
+                    (CheckpointVerifiedBlock::from(block.block.clone()), rsp_tx),
+                    reference_note_commitment_trees.take(),
+                    reference_tip_cache.take(),
+                ).unwrap();
+                reference_note_commitment_trees = Some(trees);
+                prop_assert_eq!(reference_tip.hash, block.hash);
+
+                // The overlay doesn't change anything written to the database.
+                for cf_name in STATE_COLUMN_FAMILIES_IN_CODE {
+                    prop_assert_eq!(
+                        state.db.raw_column_family_contents(cf_name),
+                        reference_state.db.raw_column_family_contents(cf_name),
+                        "column family {} differs at height {:?}",
+                        cf_name,
+                        current_height,
+                    );
+                }
+
+                if current_height.is_min() {
+                    // There's no overlay while format upgrades might be running.
+                    prop_assert!(new_tip_cache.is_none());
+                    state.db.mark_finished_format_upgrades();
+                    reference_state.db.mark_finished_format_upgrades();
+                } else {
+                    let new_tip_cache = new_tip_cache.expect("format upgrades have finished");
+                    new_tip_cache.assert_overlay_matches_db(&state.db);
+
+                    let overlay = new_tip_cache.overlay.as_ref().expect("the overlay is enabled");
+                    prop_assert!(overlay.bytes() <= budget_bytes);
+
+                    let new_reference_tip_cache = new_reference_tip_cache.expect("format upgrades have finished");
+                    prop_assert!(new_reference_tip_cache.overlay.is_none(), "a zero budget disables the overlay");
+
+                    tip_cache = Some(new_tip_cache);
+                    reference_tip_cache = Some(new_reference_tip_cache);
+                }
+            }
+
+            if let Some(overlay) = tip_cache.as_ref().and_then(|cache| cache.overlay.as_ref()) {
+                lookups.push(overlay.lookups());
+            }
+            let lookups: u64 = lookups
+                .iter()
+                .map(|lookups| lookups.output_hits + lookups.output_misses + lookups.balance_hits + lookups.balance_misses)
+                .sum();
+            prop_assert!(lookups > 0, "the overlay must be used");
+    });
+
+    Ok(())
+}

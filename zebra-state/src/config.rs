@@ -16,7 +16,7 @@ use zebra_chain::{common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{DATABASE_FORMAT_VERSION_FILE_NAME, STATE_DATABASE_KIND},
-    service::finalized_state::restorable_db_versions,
+    service::finalized_state::{restorable_db_versions, DEFAULT_CHECKPOINT_COMMIT_CACHE_MIB},
     state_database_format_version_in_code, BoxError,
 };
 
@@ -99,6 +99,16 @@ pub struct Config {
     /// no check for old database versions will be made and nothing will be
     /// deleted.
     pub delete_old_database: bool,
+
+    /// The memory budget, in MiB, of the in-memory copy of recently written transparent outputs
+    /// and address balances, which checkpoint sync uses instead of reading them from the
+    /// database.
+    ///
+    /// The database stays authoritative: the copy only skips database reads, and doesn't change
+    /// what is written. Set to `0` to disable it.
+    ///
+    /// Set to 256 MiB by default.
+    pub checkpoint_commit_cache_mib: usize,
 
     // Debug configs
     //
@@ -202,6 +212,7 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             delete_old_database: true,
+            checkpoint_commit_cache_mib: DEFAULT_CHECKPOINT_COMMIT_CACHE_MIB,
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
             debug_skip_non_finalized_state_backup_task: false,

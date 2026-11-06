@@ -67,6 +67,7 @@ pub(crate) use record_phase;
 
 pub mod column_family;
 
+mod commit_overlay;
 mod disk_db;
 mod disk_format;
 mod zebra_db;
@@ -87,6 +88,9 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub use zebra_db::ZebraDb;
+
+pub use commit_overlay::DEFAULT_CHECKPOINT_COMMIT_CACHE_MIB;
+pub(crate) use commit_overlay::{CheckpointCommitOverlay, OverlayLookups};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
@@ -159,6 +163,10 @@ pub(crate) struct CheckpointTipCache {
 
     /// The chain value pools at the finalized tip.
     pub(crate) value_pool: ValueBalance<NonNegative>,
+
+    /// Recently written transparent outputs and address balances, or `None` if the overlay is
+    /// disabled.
+    pub(crate) overlay: Option<CheckpointCommitOverlay>,
 }
 
 impl CheckpointTipCache {
@@ -184,6 +192,37 @@ impl CheckpointTipCache {
             "cached finalized value pool is stale",
         );
     }
+
+    /// Panics if any output or address balance in the overlay doesn't match `db`.
+    ///
+    /// Reads every overlay entry from the database, so it is only used in tests.
+    #[cfg(test)]
+    pub(crate) fn assert_overlay_matches_db(&self, db: &ZebraDb) {
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+
+        for (outpoint, (location, utxo)) in overlay.outputs() {
+            assert_eq!(
+                db.output_location(outpoint),
+                Some(*location),
+                "overlay output location is stale",
+            );
+            assert_eq!(
+                db.utxo_by_location(*location).map(|ordered| ordered.utxo),
+                Some(utxo.clone()),
+                "overlay output is stale or spent",
+            );
+        }
+
+        for (address, balance) in overlay.balances() {
+            assert_eq!(
+                db.address_balance_location(address),
+                Some(*balance),
+                "overlay address balance is stale",
+            );
+        }
+    }
 }
 
 /// The finalized part of the chain state, stored in the db.
@@ -205,6 +244,10 @@ pub struct FinalizedState {
     ///
     /// Commit blocks to the finalized state up to this height, then exit Zebra.
     debug_stop_at_height: Option<block::Height>,
+
+    /// The byte budget of the [`CheckpointCommitOverlay`] used by checkpoint commits, or zero to
+    /// disable it.
+    checkpoint_commit_cache_bytes: usize,
 
     // Owned State
     //
@@ -250,6 +293,9 @@ impl FinalizedState {
 
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
+            checkpoint_commit_cache_bytes: config
+                .checkpoint_commit_cache_mib
+                .saturating_mul(1024 * 1024),
             db,
         };
 
@@ -433,13 +479,23 @@ impl FinalizedState {
             tip_cache.assert_matches_db(&self.db);
         }
 
-        let (parent_tip, parent_history_tree, cached_value_pool) = match tip_cache {
+        let (parent_tip, parent_history_tree, cached_value_pool, mut overlay) = match tip_cache {
             Some(CheckpointTipCache {
                 tip,
                 history_tree,
                 value_pool,
-            }) => (Some(tip), Some(history_tree), Some(value_pool)),
-            None => (None, None, None),
+                overlay,
+            }) => (Some(tip), Some(history_tree), Some(value_pool), overlay),
+            // Start a new overlay when the checkpoint commit loop starts, or after a failed
+            // commit.
+            None => (
+                None,
+                None,
+                None,
+                use_tip_cache
+                    .then(|| CheckpointCommitOverlay::new(self.checkpoint_commit_cache_bytes))
+                    .flatten(),
+            ),
         };
 
         // Only checkpoint commits are timed, so the `checkpoint_*` phases don't mix in blocks
@@ -628,6 +684,7 @@ impl FinalizedState {
             &self.network(),
             source,
             phase_timer,
+            overlay.as_mut(),
         );
 
         if result.is_ok() {
@@ -657,6 +714,7 @@ impl FinalizedState {
                 tip: (height, hash),
                 history_tree,
                 value_pool,
+                overlay,
             });
 
             (hash, note_commitment_trees, tip_cache)

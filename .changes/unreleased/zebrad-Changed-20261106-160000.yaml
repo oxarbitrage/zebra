@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: 'Checkpoint sync keeps a bounded in-memory copy of recently created transparent outputs and recently changed address balances, so most spent outputs and address balances are read from memory instead of the database. The new `state.checkpoint_commit_cache_mib` config sets its memory budget (default 256 MiB, `0` disables it). The database stays authoritative and its format is unchanged. New metrics: `state.checkpoint.overlay.{output,balance}.{hit,miss}`, `state.checkpoint.overlay.output.same_block` (misses for outputs created by the same block), `state.checkpoint.overlay.evicted`, and the `state.checkpoint.overlay.{bytes,outputs,balances}` gauges.'
+time: 2026-11-06T16:00:00.000000000Z

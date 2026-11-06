@@ -191,6 +191,7 @@ async fn v28_cache_is_reused_with_legacy_value_pools() {
         )
         .unwrap(),
         debug_stop_at_height: None,
+        checkpoint_commit_cache_bytes: 0,
     };
     state
         .db
@@ -956,4 +957,77 @@ fn checkpoint_tip_cache_matches_database_for_mainnet_vectors() {
     let tip_cache = tip_cache.expect("there are continuous test vectors");
     assert!(tip_cache.tip.0 > Height(0));
     assert!(!tip_cache.value_pool.transparent_amount().is_zero());
+}
+
+/// Test that the overlay of recently written outputs and address balances carried between
+/// checkpoint commits of the continuous Mainnet test vectors always matches the database, with
+/// the default budget and with a budget small enough to evict entries every block.
+///
+/// Debug builds also check every overlay hit against the database during the commit.
+#[test]
+fn checkpoint_commit_overlay_matches_database_for_mainnet_vectors() {
+    use std::sync::Arc;
+
+    use tokio::sync::oneshot;
+    use zebra_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
+
+    use crate::{service::finalized_state::FinalizedState, CheckpointVerifiedBlock, Config};
+
+    let _init_guard = zebra_test::init();
+
+    // The default budget, and a budget that holds a few entries.
+    for budget_bytes in [None, Some(1_000)] {
+        let mut state =
+            FinalizedState::new_with_debug(&Config::ephemeral(), &Network::Mainnet, true, false)
+                .expect("opening an ephemeral database should succeed");
+        if let Some(budget_bytes) = budget_bytes {
+            state.checkpoint_commit_cache_bytes = budget_bytes;
+        }
+        state.db.mark_finished_format_upgrades();
+
+        let mut note_commitment_trees = None;
+        let mut tip_cache = None;
+
+        for (&height, block) in zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS.iter() {
+            let block: Arc<Block> = block.zcash_deserialize_into().expect("valid test vector");
+            let (rsp_tx, _rsp_rx) = oneshot::channel();
+
+            let (_tip, trees, new_tip_cache) = state
+                .commit_checkpoint_verified(
+                    (CheckpointVerifiedBlock::from(block), rsp_tx),
+                    note_commitment_trees.take(),
+                    tip_cache.take(),
+                )
+                .expect("test vectors are valid");
+            note_commitment_trees = Some(trees);
+
+            let new_tip_cache = new_tip_cache.expect("format upgrades have finished");
+            new_tip_cache.assert_overlay_matches_db(&state.db);
+
+            let overlay = new_tip_cache
+                .overlay
+                .as_ref()
+                .expect("the overlay is enabled");
+            assert!(
+                overlay.bytes() <= overlay.budget_bytes(),
+                "overlay must stay under its budget at height {height}",
+            );
+
+            tip_cache = Some(new_tip_cache);
+        }
+
+        let overlay = tip_cache
+            .expect("there are continuous test vectors")
+            .overlay
+            .expect("the overlay is enabled");
+        let lookups = overlay.lookups();
+
+        if budget_bytes.is_none() {
+            // Every block pays the founders' reward to the same address, and the default budget
+            // keeps every output and balance of the test vectors.
+            assert!(lookups.balance_hits > 0, "{lookups:?}");
+            assert!(overlay.output_count() > 0);
+            assert!(overlay.balance_count() > 0);
+        }
+    }
 }

@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: Added the `checkpoint_commit_cache_mib` field to `Config`, the memory budget of the in-memory copy of recent transparent outputs and address balances used by checkpoint commits. Code that builds a `Config` without `..Config::default()` must set it.
+time: 2026-11-06T16:00:00.000000000Z

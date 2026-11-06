@@ -500,8 +500,39 @@ impl DiskWriteBatch {
             transparent::OutPoint,
             OutputLocation,
         >,
-        mut address_balances: AddressBalanceLocationUpdates,
+        address_balances: AddressBalanceLocationUpdates,
     ) {
+        self.prepare_transparent_transaction_batch_with_balances(
+            zebra_db,
+            network,
+            finalized,
+            new_outputs_by_out_loc,
+            spent_utxos_by_outpoint,
+            spent_utxos_by_out_loc,
+            #[cfg(feature = "indexer")]
+            out_loc_by_outpoint,
+            address_balances,
+        );
+    }
+
+    /// Prepare a database batch containing `finalized.block`'s transparent transaction indexes,
+    /// like [`Self::prepare_transparent_transaction_batch`], and return the address balances
+    /// written to the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_transparent_transaction_batch_with_balances(
+        &mut self,
+        zebra_db: &ZebraDb,
+        network: &Network,
+        finalized: &FinalizedBlock,
+        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        #[cfg(feature = "indexer")] out_loc_by_outpoint: &HashMap<
+            transparent::OutPoint,
+            OutputLocation,
+        >,
+        mut address_balances: AddressBalanceLocationUpdates,
+    ) -> AddressBalanceLocationUpdates {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
 
@@ -549,7 +580,9 @@ impl DiskWriteBatch {
             );
         }
 
-        self.prepare_transparent_balances_batch(db, address_balances);
+        self.prepare_transparent_balances_batch_by_ref(db, &address_balances);
+
+        address_balances
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,
@@ -860,13 +893,24 @@ impl DiskWriteBatch {
         db: &DiskDb,
         address_balances: AddressBalanceLocationUpdates,
     ) {
+        self.prepare_transparent_balances_batch_by_ref(db, &address_balances);
+    }
+
+    /// Prepare a database batch containing the transparent address balance changes in
+    /// `address_balances`, like [`Self::prepare_transparent_balances_batch`].
+    #[allow(clippy::unwrap_in_result)]
+    fn prepare_transparent_balances_batch_by_ref(
+        &mut self,
+        db: &DiskDb,
+        address_balances: &AddressBalanceLocationUpdates,
+    ) {
         let balance_by_transparent_addr = db.cf_handle(BALANCE_BY_TRANSPARENT_ADDR).unwrap();
 
         // Update all the changed address balances in the database.
         // Some of these balances are new, and some are updates
         match address_balances {
             AddressBalanceLocationUpdates::Merge(balance_changes) => {
-                for (address, address_balance_location_change) in balance_changes.into_iter() {
+                for (address, address_balance_location_change) in balance_changes {
                     self.zs_merge(
                         &balance_by_transparent_addr,
                         address,
@@ -876,7 +920,7 @@ impl DiskWriteBatch {
             }
 
             AddressBalanceLocationUpdates::Insert(balances) => {
-                for (address, address_balance_location_change) in balances.into_iter() {
+                for (address, address_balance_location_change) in balances {
                     self.zs_insert(
                         &balance_by_transparent_addr,
                         address,
