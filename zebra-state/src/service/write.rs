@@ -19,7 +19,7 @@ use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
     service::{
         check,
-        finalized_state::{record_phase, FinalizedState, ZebraDb},
+        finalized_state::{record_phase, CheckpointTipCache, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -280,6 +280,11 @@ impl WriteBlockWorkerTask {
 
         let mut prev_finalized_note_commitment_trees = None;
 
+        // The finalized tip's data from the previous checkpoint commit, used instead of reading
+        // it from the database. Dropped after a failed commit, and when this loop ends, so blocks
+        // finalized by the non-finalized state never see it.
+        let mut checkpoint_tip_cache = None;
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         while let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() {
@@ -297,9 +302,11 @@ impl WriteBlockWorkerTask {
             // we need to drop all the descendants of that block,
             // until we receive a block at the required next height.
             let mut phase_timer = Some(Instant::now());
-            let next_valid_height = finalized_state
-                .db
-                .finalized_tip_height()
+            let finalized_tip_height = match &checkpoint_tip_cache {
+                Some(CheckpointTipCache { tip, .. }) => Some(tip.0),
+                None => finalized_state.db.finalized_tip_height(),
+            };
+            let next_valid_height = finalized_tip_height
                 .map(|height| (height + 1).expect("committed heights are valid"))
                 .unwrap_or(Height(0));
             record_phase!(phase_timer, "checkpoint_next_height");
@@ -319,11 +326,14 @@ impl WriteBlockWorkerTask {
             }
 
             // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
-            {
-                Ok((tip_block, note_commitment_trees)) => {
+            match finalized_state.commit_checkpoint_verified(
+                ordered_block,
+                prev_finalized_note_commitment_trees.take(),
+                checkpoint_tip_cache.take(),
+            ) {
+                Ok((tip_block, note_commitment_trees, tip_cache)) => {
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
+                    checkpoint_tip_cache = tip_cache;
 
                     phase_timer = Some(Instant::now());
                     chain_tip_sender.set_finalized_tip(tip_block);
