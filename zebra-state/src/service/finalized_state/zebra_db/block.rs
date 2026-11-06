@@ -495,6 +495,11 @@ impl ZebraDb {
             })
             .collect();
 
+        // The database locations of the transactions spent by this block, so a transaction with
+        // several spent outputs is only looked up once.
+        let mut spent_tx_locs: HashMap<transaction::Hash, Option<TransactionLocation>> =
+            HashMap::new();
+
         // Get a list of the spent UTXOs, before we delete any from the database
         let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
             finalized
@@ -529,22 +534,30 @@ impl ZebraDb {
                     }
                     lookups.output_misses += 1;
 
+                    // Read each spent transaction's location once per block, then each spent
+                    // output once. (This is what `Self::utxo()` reads.)
+                    let out_loc = spent_tx_locs
+                        .entry(outpoint.hash)
+                        .or_insert_with(|| self.transaction_location(outpoint.hash))
+                        .map(|tx_loc| OutputLocation::from_outpoint(tx_loc, &outpoint));
+                    let utxo = out_loc
+                        .and_then(|out_loc| self.utxo_by_location(out_loc))
+                        .map(|ordered_utxo| ordered_utxo.utxo);
+
                     (
                         outpoint,
                         // Some utxos are spent in the same block, so they will be in
                         // `tx_hash_indexes` and `new_outputs`
-                        self.output_location(&outpoint).unwrap_or_else(|| {
+                        out_loc.unwrap_or_else(|| {
                             lookup_out_loc(finalized.height, &outpoint, &tx_hash_indexes)
                         }),
-                        self.utxo(&outpoint)
-                            .map(|ordered_utxo| ordered_utxo.utxo)
-                            .or_else(|| {
-                                finalized
-                                    .new_outputs
-                                    .get(&outpoint)
-                                    .map(|ordered_utxo| ordered_utxo.utxo.clone())
-                            })
-                            .expect("already checked UTXO was in state or block"),
+                        utxo.or_else(|| {
+                            finalized
+                                .new_outputs
+                                .get(&outpoint)
+                                .map(|ordered_utxo| ordered_utxo.utxo.clone())
+                        })
+                        .expect("already checked UTXO was in state or block"),
                     )
                 })
                 .collect();

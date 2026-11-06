@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: 'Committing a block to the finalized state reads each spent transaction''s location once per block, and each spent output once, instead of reading the spent transaction''s location twice for every spent output.'
+time: 2026-11-06T16:30:00.000000000Z
