@@ -17,6 +17,7 @@
 use std::{
     io::{stderr, stdout, Write},
     sync::Arc,
+    time::Instant,
 };
 
 use zebra_chain::{
@@ -42,6 +43,26 @@ use crate::{
     service::{check, ChainTipBlock, QueuedCheckpointVerified},
     Config, StateInitError, ValidateContextError,
 };
+
+/// Records the time since the `Option<Instant>` in `$timer` as the block write task phase
+/// `$phase`, then resets `$timer` to now, so consecutive phases can share one timer.
+///
+/// Does nothing if `$timer` is `None`. `$phase` must be a literal, so the metric key is static and
+/// recording a sample doesn't allocate.
+macro_rules! record_phase {
+    ($timer:expr, $phase:literal) => {
+        if let Some(start) = $timer.as_mut() {
+            let now = std::time::Instant::now();
+            metrics::histogram!(
+                "state.block_writer.phase.duration_seconds",
+                "phase" => $phase
+            )
+            .record(now.duration_since(*start).as_secs_f64());
+            *start = now;
+        }
+    };
+}
+pub(crate) use record_phase;
 
 pub mod column_family;
 
@@ -293,6 +314,11 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        // Only checkpoint commits are timed, so the `checkpoint_*` phases don't mix in blocks
+        // finalized by the non-finalized state.
+        let mut phase_timer =
+            matches!(finalizable_block, FinalizableBlock::Checkpoint { .. }).then(Instant::now);
+
         let (height, hash, finalized, prev_note_commitment_trees) = match finalizable_block {
             FinalizableBlock::Checkpoint {
                 checkpoint_verified,
@@ -305,6 +331,8 @@ impl FinalizedState {
 
                 let block = checkpoint_verified.block.clone();
                 let mut history_tree = self.db.history_tree();
+                record_phase!(phase_timer, "checkpoint_history_tree_load");
+
                 let prev_note_commitment_trees = prev_note_commitment_trees
                     .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
@@ -313,6 +341,7 @@ impl FinalizedState {
                 note_commitment_trees
                     .update_trees_parallel(&block)
                     .map_err(ValidateContextError::from)?;
+                record_phase!(phase_timer, "checkpoint_note_commitment_trees");
 
                 // Check the block commitment if the history tree was not
                 // supplied by the non-finalized state. Note that we don't do
@@ -336,6 +365,7 @@ impl FinalizedState {
                     &self.network(),
                     &history_tree,
                 )?;
+                record_phase!(phase_timer, "checkpoint_block_commitment");
 
                 // Update the history tree.
                 //
@@ -357,6 +387,7 @@ impl FinalizedState {
                     )
                     .map_err(Arc::new)
                     .map_err(ValidateContextError::from)?;
+                record_phase!(phase_timer, "checkpoint_history_tree_push");
 
                 let treestate = Treestate {
                     note_commitment_trees,
@@ -374,6 +405,7 @@ impl FinalizedState {
                     height,
                     block_hash: checkpoint_verified.hash,
                 })?;
+                record_phase!(phase_timer, "checkpoint_value_pool");
 
                 (
                     height,
@@ -414,6 +446,7 @@ impl FinalizedState {
                 )
             }
         };
+        record_phase!(phase_timer, "checkpoint_finalized_block");
 
         let committed_tip_hash = self.db.finalized_tip_hash();
         let committed_tip_height = self.db.finalized_tip_height();
@@ -442,6 +475,8 @@ impl FinalizedState {
             );
         }
 
+        record_phase!(phase_timer, "checkpoint_tip_checks");
+
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
         let result = self.db.write_block(
@@ -449,6 +484,7 @@ impl FinalizedState {
             prev_note_commitment_trees,
             &self.network(),
             source,
+            phase_timer,
         );
 
         if result.is_ok() {
