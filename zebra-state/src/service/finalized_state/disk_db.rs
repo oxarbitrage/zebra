@@ -1362,6 +1362,17 @@ impl DiskDb {
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
 
+        // Perf experiment only: override each column family's memtable size, keeping the rest of
+        // the level-style tuning above.
+        if let Some(megabytes) = std::env::var("ZEBRA_PERF_MEMTABLE_MB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|megabytes| *megabytes > 0)
+        {
+            tracing::info!(megabytes, "perf experiment: overriding the memtable size");
+            opts.set_write_buffer_size(megabytes * ONE_MEGABYTE);
+        }
+
         // Flush older WALs during heavy sync to reduce restart replay work.
         opts.set_max_total_wal_size(Self::MAX_TOTAL_WAL_SIZE_BYTES);
 
