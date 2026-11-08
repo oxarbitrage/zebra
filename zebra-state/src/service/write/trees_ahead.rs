@@ -175,6 +175,14 @@ impl TreesAhead {
 fn run_worker(jobs: mpsc::Receiver<Job>) {
     let mut trees: Option<NoteCommitmentTrees> = None;
 
+    // Block parsing runs on the global rayon pool, and tree tasks queued behind it wait for whole
+    // blocks to parse, so tree updates get their own pool.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads())
+        .thread_name(|index| format!("trees-rayon-{index}"))
+        .build()
+        .ok();
+
     while let Ok(Job { block, base, reply }) = jobs.recv() {
         if base.is_some() {
             trees = base;
@@ -182,7 +190,12 @@ fn run_worker(jobs: mpsc::Receiver<Job>) {
 
         let result = trees.as_ref().cloned().map(|mut next| {
             let start = Instant::now();
-            let result = next.update_trees_parallel(&block).map(|()| next);
+            let mut update = || next.update_trees_parallel(&block);
+            let result = match &pool {
+                Some(pool) => pool.install(update),
+                None => update(),
+            }
+            .map(|()| next);
             metrics::histogram!(
                 "state.block_writer.phase.duration_seconds",
                 "phase" => "checkpoint_trees_ahead"
