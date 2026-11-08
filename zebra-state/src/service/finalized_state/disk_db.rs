@@ -1364,7 +1364,7 @@ impl DiskDb {
 
         // Perf experiment only: override each column family's memtable size, keeping the rest of
         // the level-style tuning above.
-        if let Some(megabytes) = std::env::var("ZEBRA_PERF_MEMTABLE_MB")
+        if let Some(megabytes) = std::env::var("PERF_MEMTABLE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|megabytes| *megabytes > 0)
