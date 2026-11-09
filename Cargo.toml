@@ -410,3 +410,9 @@ unwrap_in_result = "warn"
 
 # TODOs: fix this lint eventually
 result_large_err = "allow"
+
+# Perf experiment: lazy curve point decompression (proofs of concept reddsa#304, sapling-crypto#231, orchard#579).
+[patch.crates-io]
+reddsa = { git = "https://github.com/ZcashFoundation/reddsa", rev = "aefd47bd6bff8c069e9e8ba46c3fde9f8aa0d03a" }
+sapling-crypto = { git = "https://github.com/zcash/sapling-crypto", rev = "17be25e373c9f12346dc614761d9a335a3220fbb" }
+orchard = { git = "https://github.com/zcash/orchard", rev = "2eff6946dcc0e5e66c1ab5a8e666c904145f4057" }

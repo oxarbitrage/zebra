@@ -3585,8 +3585,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae7ceb7b5387bd76cf3c0712f57708795c925cecf097036cedb60b5c3706e8f"
+source = "git+https://github.com/zcash/orchard?rev=2eff6946dcc0e5e66c1ab5a8e666c904145f4057#2eff6946dcc0e5e66c1ab5a8e666c904145f4057"
 dependencies = [
  "aes",
  "bitvec",
@@ -4378,8 +4377,7 @@ dependencies = [
 [[package]]
 name = "reddsa"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a70b6dbd7b3277cbd4d89ee750a30bebab3b9951ee4e166ce15c00975fe410f"
+source = "git+https://github.com/ZcashFoundation/reddsa?rev=aefd47bd6bff8c069e9e8ba46c3fde9f8aa0d03a#aefd47bd6bff8c069e9e8ba46c3fde9f8aa0d03a"
 dependencies = [
  "blake2b_simd",
  "byteorder",
@@ -4797,8 +4795,7 @@ dependencies = [
 [[package]]
 name = "sapling-crypto"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a2cbdcfeef20006adf72699cd466f21fe349674277cc05d3fc9b7302db7b182"
+source = "git+https://github.com/zcash/sapling-crypto?rev=17be25e373c9f12346dc614761d9a335a3220fbb#17be25e373c9f12346dc614761d9a335a3220fbb"
 dependencies = [
  "aes",
  "bellman",
@@ -5520,7 +5517,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
